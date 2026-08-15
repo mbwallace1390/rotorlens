@@ -326,6 +326,16 @@ Sybil attacks. Every record still needs server-side schema, licence-version,
 replay, physical-range, configuration, controlled-trial, and safety validation,
 followed by quarantine and bounded per-aircraft influence.
 
+The Firebase client configuration embedded in an open-source app identifies a
+project; it is not submission authority. Production intake defaults to official
+RotorLens builds whose registered app identity is attested with Play Integrity
+on Android or App Attest on Apple platforms. A fork signed by another maintainer
+does not inherit that trust. A later federation policy may enroll a specific
+fork only through an explicit app registration plus accepted terms, schema,
+quotas, deletion behavior, and the same quarantine gates. A fork using its own
+backend remains a separate corpus and cannot silently influence the official
+RotorLens model.
+
 Plain `fetch` against the REST API. **No SDK.** The zero-dependency property in
 `src/`, `ui/`, `tools/` and `test/` is enforced by a provenance test, and an
 analytics SDK would also bring data behaviour nobody in this repo has read.

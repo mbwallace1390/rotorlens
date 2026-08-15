@@ -27,6 +27,14 @@ What it does **not** prove or enable:
 - no Android or iOS app caller, Firebase SDK, `INTERNET` permission, upload,
   analytics, raw-log intake, model build, advice, or public counter is added;
 - App Check emulator behavior is not device attestation proof;
+- a public Firebase client configuration is routing metadata, not permission to
+  submit; a production service must default to registered official RotorLens
+  builds attested with Play Integrity on Android and App Attest on Apple
+  platforms;
+- a separately signed modified build must remain closed unless its maintainer is
+  explicitly enrolled with a reviewed app identity, terms, schema, quotas, and
+  quarantine policy; pointing a fork at its own backend does not contribute to
+  the RotorLens corpus;
 - no production terms, complete configuration schema, accepted contribution,
   production receipt, validated flight, or training corpus exists;
 - the Functions source imports the shared app contract from outside the
@@ -45,5 +53,5 @@ The first emulator run downloads the official Firestore emulator. Java 21 and
 Node.js 22 are the supported CI toolchain. A later production phase must adopt
 reviewed data terms, complete the configuration contract, choose a dedicated
 Firebase project, add IAM and retention controls, test real Play Integrity and
-App Attest flows, publish correct privacy/store declarations, and obtain an
-explicit deployment review.
+App Attest flows, keep release-signing and debug credentials private, publish
+correct privacy/store declarations, and obtain an explicit deployment review.
