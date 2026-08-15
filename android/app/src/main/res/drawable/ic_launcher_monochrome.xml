@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Rotor, optical reticle, and tuning trace for Android 13 themed launchers. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Lens and measurement rings. -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M54,25 a29,29 0,1 1,0,58 a29,29 0,1 1,0,-58"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="4" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M54,36 a18,18 0,1 1,0,36 a18,18 0,1 1,0,-36"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="3" />
+
+    <!-- Tuning waveform, behind the rotor. -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M25,56 L30,56 L34,50 L38,63 L42,52 L47,59 L51,54 L56,58 L61,48 L66,63 L71,52 L77,56 L83,56"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="3.5" />
+
+    <!-- Broad two-blade helicopter rotor. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M50,48 L46,53 L26,39 C23,37 23,34 26,32 L28,30 L53,45 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M58,60 L62,55 L82,69 C85,71 85,74 82,76 L80,78 L55,63 Z" />
+
+    <!-- Compact flybarless hub at the optical center. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,48 a6,6 0,1 1,0,12 a6,6 0,1 1,0,-12" />
+</vector>

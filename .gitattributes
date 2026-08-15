@@ -1,0 +1,28 @@
+# Normalize source to LF in the repository, whatever the checkout platform.
+* text=auto eol=lf
+
+# Flight logs are binary, whatever their extension says.
+#
+# Git's text heuristics see ".TXT" and rewrite line endings on a Windows
+# checkout. For a log that is fatal rather than cosmetic: every 0x0A inside
+# encoded frame data becomes 0x0D 0x0A, which changes the file's length and
+# desynchronizes the frame stream. This was caught by a fixture whose committed
+# length was 1224 bytes and whose Windows checkout was 1241 — exactly the 17
+# newlines in its header.
+fixtures/** -text
+*.TXT -text
+*.bbl -text
+*.bfl -text
+*.BBL -text
+*.BFL -text
+
+# The Gradle wrapper. gradlew.bat is run by cmd.exe, which needs CRLF line
+# endings for its label/goto handling; the global `* text=auto eol=lf` above
+# would otherwise strip them on checkout and break the script on Windows.
+*.bat        text eol=crlf
+gradlew      text eol=lf
+*.jar        binary
+
+# Patch artifacts preserve upstream diff context byte-for-byte. Check their
+# applied result with `git apply --whitespace=error-all`, not the outer diff.
+integration/rotorflight-firmware/**/*.patch -whitespace

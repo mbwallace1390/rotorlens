@@ -1,0 +1,18 @@
+H Product:Blackbox flight data recorder by Nicholas Sherlock
+H Data version:2
+H Field I name:loopIteration,time,setpoint[0],setpoint[1],setpoint[2],setpoint[3],rcCommand[0],rcCommand[1],rcCommand[2],rcCommand[3],axisP[0],axisP[1],axisP[2],axisI[0],axisI[1],axisI[2],axisD[0],axisD[1],axisD[2],gyroADC[0],gyroADC[1],gyroADC[2],gyroRAW[0],gyroRAW[1],gyroRAW[2],Vbat,headspeed,tailspeed,motor[0],debug[0],debug[1],debug[2],debug[3],debug[4],debug[5],debug[6],debug[7]
+H Field I signed:0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,1,1,1,1,1,1,1,1
+H Field I predictor:0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9,0,0,0,0,0,0,0,0,0,0,0
+H Field I encoding:1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0
+H Field P predictor:6,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,3,3,1,1,1,1,1,1,1,1,1
+H Field P encoding:9,0,8,8,8,8,8,8,8,8,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,0,0,0,0,6,6,6,6,6,6,6,6
+H Field S name:flightModeFlags,stateFlags,failsafePhase
+H Field S signed:0,0,0
+H Field S predictor:0,0,0
+H Field S encoding:1,1,1
+H Firmware type:Rotorflight
+H Firmware revision:Rotorflight 4.3.0 (synthetic) STM32F411
+H Firmware date:Jan  1 2026 00:00:00
+H Board information:ROTORLENS SYNTHETIC
+H Log start datetime:0000-01-01T00:00:00.000+00:00
+H Craft nam

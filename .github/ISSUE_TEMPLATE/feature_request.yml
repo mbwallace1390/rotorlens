@@ -1,0 +1,63 @@
+name: Feature request
+description: Propose a focused improvement without submitting private flight or configuration data.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Explain the user problem before proposing an implementation. This issue is public.
+
+        **Do not attach, paste, or link raw flight logs, configuration dumps, GPS/home coordinates, timestamps, serials, device/aircraft/account identifiers, private paths or filenames, credentials, signing material, or personal data.**
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I have not included or linked prohibited flight, configuration, location, identifier, credential, or personal data.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Who is affected, and what can they not safely or efficiently do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: Describe observable behavior, not only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: true
+  - type: textarea
+    id: safety_privacy
+    attributes:
+      label: Safety, privacy, and licensing effects
+      description: Consider tuning claims, failure behavior, data collection, network access, new dependencies, and third-party material.
+    validations:
+      required: true
+  - type: dropdown
+    id: platforms
+    attributes:
+      label: Intended platform scope
+      multiple: true
+      options:
+        - Shared application behavior
+        - Android
+        - iOS or iPadOS (experimental)
+        - Development tools or documentation
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Synthetic evidence or references
+      description: Link public specifications or identify committed synthetic fixtures. Do not link personal logs or private dumps.

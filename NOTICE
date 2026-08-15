@@ -1,0 +1,25 @@
+RotorLens
+Copyright © 2026 Michael Wallace and contributors.
+
+RotorLens was founded and originally created by Michael Wallace
+(@mbwallace1390), who serves as its lead maintainer.
+
+The official application icon was created specifically for RotorLens through an
+AI-assisted design workflow directed, selected, and integrated by Michael
+Wallace. Its exact asset hash and licensing boundary are recorded in
+`docs/ICON_PROVENANCE.md`.
+
+Official source repository:
+https://github.com/mbwallace1390/rotorlens
+
+Some project work has used AI-assisted tools under human direction and review.
+Historical Git metadata includes technical `Author`, `Committer`, and
+`Co-Authored-By` entries that name Claude or other AI-assisted tooling. Those
+entries are retained as tooling provenance; they do not make an AI system a
+legal or copyright author, contributor, signatory, or copyright holder. The
+human maintainer who accepts and distributes the resulting work remains
+responsible for its provenance, licensing, safety, and correctness.
+
+This notice does not replace the LICENSE file or the notices for third-party
+components. The open-source license does not grant permission to use the
+RotorLens name, logos, icons, or other project branding. See TRADEMARKS.md.

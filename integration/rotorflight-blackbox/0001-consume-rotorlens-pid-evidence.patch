@@ -1,0 +1,285 @@
+diff --git a/index.html b/index.html
+index 5c04fc6..c081936 100644
+--- a/index.html
++++ b/index.html
+@@ -3801,6 +3801,7 @@
+     <script src="js/advisor/flightlog_adapter.js?v=124"></script>
+     <script src="js/advisor/mechanical_analysis.js?v=124"></script>
+     <script src="js/advisor/ai_contract.js?v=124"></script>
++    <script src="js/advisor/pid_evidence.js?v=124"></script>
+     <script src="js/advisor/cyclic_pid_analysis.js?v=124"></script>
+     <script src="js/advisor/advisor_ui.js?v=124"></script>
+     <script src="js/main.js?v=124"></script>
+diff --git a/js/advisor/advisor_ui.js b/js/advisor/advisor_ui.js
+index 3f34510..7e61008 100644
+--- a/js/advisor/advisor_ui.js
++++ b/js/advisor/advisor_ui.js
+@@ -120,8 +120,23 @@
+         COLLECTIVE_LOAD_MISMATCH: "Baseline and test collective/load conditions are not comparable.",
+         COLLECTIVE_SOURCE_MISMATCH: "Baseline and test use different collective/load sources.",
+         BATTERY_LOAD_MISMATCH: "Baseline and test battery/load conditions are not comparable.",
+-        I_TERM_HOLD_EVIDENCE_UNSUPPORTED: "I-term comparison needs a dedicated sustained-hold maneuver and is withheld in this release.",
+-        YAW_DIRECTIONAL_EVIDENCE_UNSUPPORTED: "Yaw comparison needs separately validated clockwise and counter-clockwise evidence and is withheld in this release.",
++        INSUFFICIENT_HOLD_SEGMENTS: "I-term evidence needs at least two steady holds in the selected range. Fly a sustained hold on this axis and select it.",
++        HOLD_TOO_SHORT_AFTER_SETTLE: "A hold was found but was too short once the initial transient was discarded. Hold longer.",
++        HOLD_OFF_AXIS_INPUT: "A hold was discarded because another axis was being commanded during it.",
++        HOLD_HEADSPEED_UNSTABLE: "A hold was discarded because headspeed moved during it; governor activity would be read as a tune change.",
++        HOLD_BATTERY_UNSTABLE: "A hold was discarded because pack voltage moved during it.",
++        HOLD_KIND_MISMATCH: "One capture holds heading and the other holds a turn rate. Those are different tests and are not compared.",
++        HOLD_EVIDENCE_MISSING: "I-term comparison needs hold evidence in both captures.",
++        INSUFFICIENT_POSITIVE_DIRECTION_STOPS: "Not enough stops in the positive direction. Each direction is measured separately.",
++        INSUFFICIENT_NEGATIVE_DIRECTION_STOPS: "Not enough stops in the negative direction. Each direction is measured separately.",
++        YAW_DIRECTIONAL_ASYMMETRY_DETECTED: "Yaw responds differently in each direction. That is usually tail authority or headspeed, not a gain, and raising a gain will not fix it.",
++        DIRECTIONAL_ASYMMETRY_DETECTED: "This axis responds differently in each direction; the two directions are reported separately.",
++        DIRECTIONAL_RESULT_CONFLICT: "The change helped one direction and hurt the other, so it is not an improvement to this gain.",
++        PARTIAL_DIRECTION_COVERAGE: "Only one direction could be compared; fly stops both ways for a full result.",
++        NO_DIRECTION_COMPARABLE: "Neither direction had enough stops to compare.",
++        DIRECTION_UNKNOWN_EVENTS_DISCARDED: "Some stops had no identifiable direction and were discarded.",
++        CONFLICTING_HOLD_SIGNATURES: "The hold shows both a standing error and hunting. Something outside the I term is moving the aircraft; check mechanics before changing a gain.",
++        PID_EVIDENCE_MODULE_UNAVAILABLE: "The PID evidence module failed to load, so directional and hold evidence are unavailable.",
+         SELECTED_TERM_EVIDENCE_UNCHANGED: "The selected logged PID-term evidence did not change measurably between captures.",
+         COMPARISON_METRIC_MISSING: "A required comparison metric is unavailable.",
+         CAPTURE_SCHEMA_INVALID: "Captured evidence failed its integrity check. Capture it again."
+@@ -818,8 +833,9 @@
+             && hasExactObjectKeys(capture, [
+                 "schemaVersion", "kind", "status", "codes", "axis", "term",
+                 "range", "firmware", "gainValue", "configuration",
+-                "availability", "quality", "maneuver", "selectedFingerprint",
+-                "integrityKey"
++                "availability", "quality", "maneuver",
++                "directionalEvidence", "holdEvidence",
++                "selectedFingerprint", "integrityKey"
+             ])
+             && !cyclicPayloadContainsForbiddenKey(capture, 0)
+             && capture.schemaVersion === 1
+@@ -938,7 +954,7 @@
+         if (!result || typeof result !== "object" || Array.isArray(result)
+                 || !hasExactObjectKeys(result, [
+                     "schemaVersion", "kind", "status", "codes", "axis",
+-                    "term", "gainValues", "evidence"
++                    "term", "gainValues", "evidence", "directional", "hold"
+                 ])
+                 || result.schemaVersion !== 1
+                 || result.kind !== "rotorlens-cyclic-pid-comparison"
+diff --git a/js/advisor/cyclic_pid_analysis.js b/js/advisor/cyclic_pid_analysis.js
+index a3b4142..8ed67eb 100644
+--- a/js/advisor/cyclic_pid_analysis.js
++++ b/js/advisor/cyclic_pid_analysis.js
+@@ -13,6 +13,20 @@
+     }
+ }(typeof globalThis !== "undefined" ? globalThis : this,
+ function(enableNodeTestSeam) {
++    // Directional stop evidence and steady-state hold evidence are maintained in
++    // RotorLens (MPL-2.0) and built into js/advisor/pid_evidence.js; MPL section
++    // 3.3 permits that bundle in this GPL-3.0 Larger Work. This surrounding viewer
++    // integration remains GPL-covered. Keeping one implementation stops the viewer
++    // and the app from disagreeing about whether a tune change helped.
++    var PidEvidence = (function() {
++        if (typeof module === "object" && module.exports
++                && typeof require === "function") {
++            return require("./pid_evidence");
++        }
++        return typeof globalThis !== "undefined"
++            ? globalThis.RotorLensPidEvidence
++            : null;
++    }());
++
+     var SCHEMA_VERSION = 1;
+     var CAPTURE_KIND = "rotorlens-cyclic-pid-capture";
+     var COMPARISON_KIND = "rotorlens-cyclic-pid-comparison";
+@@ -1505,11 +1519,41 @@ function(enableNodeTestSeam) {
+                     > MAX_BATTERY_VARIATION_RATIO) {
+             addCode(codes, "BATTERY_EVIDENCE_INVALID");
+         }
+-        if (selection.term === "I") {
+-            addCode(codes, "I_TERM_HOLD_EVIDENCE_UNSUPPORTED");
+-        }
+-        if (selection.axis === "yaw") {
+-            addCode(codes, "YAW_DIRECTIONAL_EVIDENCE_UNSUPPORTED");
++        // Stops are summarized per command direction rather than pooled. On yaw
++        // the two directions are genuinely different measurements, so pooling
++        // them produced a number describing neither — which is why yaw evidence
++        // used to be withheld instead of reported.
++        var directionalEvidence = null;
++        var holdEvidence = null;
++        if (!PidEvidence) {
++            addCode(codes, "PID_EVIDENCE_MODULE_UNAVAILABLE");
++        } else {
++            directionalEvidence = PidEvidence.buildDirectionalStopEvidence(
++                detected.events,
++                { axis: selection.axis }
++            );
++            // Findings such as asymmetry describe the aircraft and must not
++            // invalidate the capture; insufficiency means there is nothing to
++            // describe, and that does.
++            if (directionalEvidence.status !== "captured") {
++                directionalEvidence.codes.forEach(function(code) {
++                    addCode(codes, code);
++                });
++            }
++
++            if (selection.term === "I") {
++                // The I term acts on sustained error, which the post-stop windows
++                // cannot see. Hold segments are its evidence.
++                holdEvidence = PidEvidence.buildHoldEvidence(
++                    records,
++                    { axis: selection.axis, term: "I" }
++                );
++                if (holdEvidence.status !== "captured") {
++                    holdEvidence.codes.forEach(function(code) {
++                        addCode(codes, code);
++                    });
++                }
++            }
+         }
+         var pidForAxis = configuration.pid[selection.axis];
+         var gainValue = pidForAxis ? pidForAxis[termIndex] : null;
+@@ -1547,6 +1591,8 @@ function(enableNodeTestSeam) {
+                 airborneTransitionCount: counters.airborneTransitions
+             },
+             maneuver: maneuver,
++            directionalEvidence: directionalEvidence,
++            holdEvidence: holdEvidence,
+             selectedFingerprint: selectedFingerprint(records),
+             integrityKey: null
+         };
+@@ -1836,7 +1882,11 @@ function(enableNodeTestSeam) {
+             term: captureValid(baseline) ? baseline.term : null,
+             gainValues: captureValid(baseline) && captureValid(test)
+                 ? { baseline: baseline.gainValue, test: test.gainValue } : null,
+-            evidence: []
++            evidence: [],
++            // Same shape as a conclusive comparison: a result that changes shape
++            // depending on its outcome cannot be schema-checked at the boundary.
++            directional: null,
++            hold: null
+         });
+     }
+ 
+@@ -1881,10 +1931,51 @@ function(enableNodeTestSeam) {
+             addCode(codes, "COMPARISON_METRIC_MISSING");
+             return inconclusiveComparison(codes, baseline, test);
+         }
++
++        // Directional comparison happens within each direction. A gain that helps
++        // one direction and hurts the other is not a better gain — it is usually
++        // tail authority or a mechanical limit, and the comparison says so rather
++        // than averaging the two into a verdict.
++        var directional = null;
++        if (PidEvidence && baseline.directionalEvidence && test.directionalEvidence) {
++            directional = PidEvidence.compareDirectionalStopEvidence(
++                baseline.directionalEvidence,
++                test.directionalEvidence
++            );
++            if (directional.status !== "captured") {
++                directional.codes.forEach(function(code) { addCode(codes, code); });
++            }
++        }
++
++        var hold = null;
++        if (baseline.term === "I") {
++            if (PidEvidence && baseline.holdEvidence && test.holdEvidence) {
++                hold = PidEvidence.compareHoldEvidence(
++                    baseline.holdEvidence,
++                    test.holdEvidence
++                );
++                if (hold.status !== "captured") {
++                    hold.codes.forEach(function(code) { addCode(codes, code); });
++                }
++            } else {
++                addCode(codes, "HOLD_EVIDENCE_MISSING");
++            }
++        }
++        if (codes.length > 0) {
++            return inconclusiveComparison(codes, baseline, test);
++        }
++
+         var improved = evidence.some(function(item) { return item.state === "improved"; });
+         var worse = evidence.some(function(item) { return item.state === "worse"; });
+         var status = improved && worse ? "mixed"
+             : (improved ? "improved" : (worse ? "worse" : "comparable"));
++
++        // Post-stop windows measure P and D. For the I term the hold comparison is
++        // the measurement, so it decides the verdict rather than decorating it.
++        if (hold) {
++            status = hold.verdict === "improved" ? "improved"
++                : (hold.verdict === "worsened" ? "worse" : "comparable");
++        }
+         return seal({
+             schemaVersion: SCHEMA_VERSION,
+             kind: COMPARISON_KIND,
+@@ -1896,7 +1987,9 @@ function(enableNodeTestSeam) {
+                 baseline: baseline.gainValue,
+                 test: test.gainValue
+             },
+-            evidence: evidence
++            evidence: evidence,
++            directional: directional,
++            hold: hold
+         });
+     }
+ 
+diff --git a/test/advisor_cyclic_pid.js b/test/advisor_cyclic_pid.js
+index c10e495..a25d602 100644
+--- a/test/advisor_cyclic_pid.js
++++ b/test/advisor_cyclic_pid.js
+@@ -844,12 +844,32 @@ async function assertManeuverCompatibilityAndSemanticScope() {
+     assertHasCode(cyclic.compareCaptures(baseline, countTest),
+         "MANEUVER_SIGN_COUNT_MISMATCH");
+ 
++    // I-term evidence comes from steady holds. The stop-only synthetic log has
++    // none, so the capture must say which evidence is missing rather than
++    // declaring the whole term unsupported.
+     const iTerm = await capture(makeSyntheticFlightLog(), "roll", "I");
+     assert.strictEqual(iTerm.status, "inconclusive");
+-    assertHasCode(iTerm, "I_TERM_HOLD_EVIDENCE_UNSUPPORTED");
++    assertHasCode(iTerm, "INSUFFICIENT_HOLD_SEGMENTS");
++    assert.ok(iTerm.holdEvidence, "an I-term capture must carry hold evidence");
++    assert.strictEqual(iTerm.holdEvidence.kind, "rotorlens-hold-evidence");
++
++    // Yaw is measured per direction now instead of being withheld.
+     const yaw = await capture(makeSyntheticFlightLog({ axis: "yaw" }), "yaw", "P");
+-    assert.strictEqual(yaw.status, "inconclusive");
+-    assertHasCode(yaw, "YAW_DIRECTIONAL_EVIDENCE_UNSUPPORTED");
++    assert.ok(yaw.directionalEvidence, "yaw must carry directional evidence");
++    assert.strictEqual(
++        yaw.directionalEvidence.kind,
++        "rotorlens-directional-stop-evidence"
++    );
++    assert.ok(
++        !yaw.codes.includes("YAW_DIRECTIONAL_EVIDENCE_UNSUPPORTED"),
++        "yaw evidence is no longer withheld"
++    );
++    ["positive", "negative"].forEach(function(direction) {
++        assert.ok(
++            yaw.directionalEvidence.directions[direction],
++            direction + " direction must be summarized independently"
++        );
++    });
+ 
+     const coupled = await capture(makeSyntheticFlightLog({ offAxisGyroDps: 80 }));
+     assertHasCode(coupled, "OFF_AXIS_GYRO_RESPONSE_EXCESSIVE");
+diff --git a/test/mobile_compatibility_smoke.js b/test/mobile_compatibility_smoke.js
+index 48e0988..73865b9 100644
+--- a/test/mobile_compatibility_smoke.js
++++ b/test/mobile_compatibility_smoke.js
+@@ -471,6 +471,8 @@ function assertTuneAdvisorAIBridgeRuntime() {
+             negativeStopCount: 2
+         }),
+         quality: Object.freeze({ measuredSampleRateHz: 1000 }),
++        directionalEvidence: null,
++        holdEvidence: null,
+         selectedFingerprint: "sel-deadbeef-6001",
+         integrityKey: "cap-deadbeef"
+     });
+@@ -553,7 +555,9 @@ function assertTuneAdvisorAIBridgeRuntime() {
+             { metric: "fastRingingRmsDps", baselineValue: 4, testValue: 4, testToBaselineRatio: 1, state: "stable" },
+             { metric: "slowOscillationRmsDps", baselineValue: 3, testValue: 3, testToBaselineRatio: 1, state: "stable" },
+             { metric: "rawNoiseStepRmsDps", baselineValue: 2, testValue: 2, testToBaselineRatio: 1, state: "stable" }
+-        ]
++        ],
++        directional: null,
++        hold: null
+     };
+     const normalizedComparison = hooks.normalizeCyclicComparisonState(validComparison);
+     assert.strictEqual(normalizedComparison.status, "improved");

@@ -1,0 +1,486 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RotorLens partial Rotorflight binding candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "kind",
+    "protocolVersion",
+    "status",
+    "firmwareRepository",
+    "gitObjectFormat",
+    "firmwarePatchLicense",
+    "license",
+    "baseCommit",
+    "baseTree",
+    "implementationCommit",
+    "resultTree",
+    "patch",
+    "targets",
+    "toolchain",
+    "manifestIds",
+    "candidateEncoding",
+    "candidateMutationEpoch",
+    "acceptanceBlockers",
+    "evidence",
+    "runtimeAcceptance"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "./artifact-manifest.schema.json"
+    },
+    "schemaVersion": {
+      "const": 4
+    },
+    "kind": {
+      "const": "rotorlens-rotorflight-firmware-binding-artifact"
+    },
+    "protocolVersion": {
+      "const": 1
+    },
+    "status": {
+      "const": "partial-candidate"
+    },
+    "firmwareRepository": {
+      "const": "https://github.com/rotorflight/rotorflight-firmware"
+    },
+    "gitObjectFormat": {
+      "const": "sha1"
+    },
+    "firmwarePatchLicense": {
+      "const": "GPL-3.0-or-later"
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "basis",
+        "upstreamDeclaredSpdx",
+        "path",
+        "upstreamBlob",
+        "sha256",
+        "byteLength"
+      ],
+      "properties": {
+        "basis": {
+          "const": "source-file-headers"
+        },
+        "upstreamDeclaredSpdx": {
+          "type": "null"
+        },
+        "path": {
+          "const": "LICENSES/GPL-3.0.txt"
+        },
+        "upstreamBlob": {
+          "const": "f288702d2fa16d3cdf0035b15a9fcbc552cd88e7"
+        },
+        "sha256": {
+          "const": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        "byteLength": {
+          "const": 35149
+        }
+      }
+    },
+    "baseCommit": {
+      "const": "118e9120260bb33f46df4f92052fb0e9fd4e9ebc"
+    },
+    "baseTree": {
+      "const": "7821f5ac9c18da9fb31844b3a9be4b1a77caac11"
+    },
+    "implementationCommit": {
+      "type": "null"
+    },
+    "resultTree": {
+      "const": "635c01e76fad457114bfbc8a11a7a42e2e115518"
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "format",
+        "sha256",
+        "byteLength",
+        "files"
+      ],
+      "properties": {
+        "path": {
+          "const": "patches/rotorflight-4.6.0-binding-v1-partial.patch"
+        },
+        "format": {
+          "const": "git-diff-full-index-binary"
+        },
+        "sha256": {
+          "const": "0bcb2f89bc9b6af3b2953952a3e015954511c71a8c718fd0b022cde47594cb6f"
+        },
+        "byteLength": {
+          "const": 89537
+        },
+        "files": {
+          "const": [
+            {
+              "path": "src/main/common/sha256.c",
+              "baseBlob": null,
+              "resultBlob": "ac0299274879ee74ffaa6acaaf6b7537588a4ee5"
+            },
+            {
+              "path": "src/main/common/sha256.h",
+              "baseBlob": null,
+              "resultBlob": "d1da8af90cceface9c1ad581e87acc9d0dacc58f"
+            },
+            {
+              "path": "src/main/config/rotorlens_binding_manifest.c",
+              "baseBlob": null,
+              "resultBlob": "fe438684e5dd1698f91baa4958a8ce345478d869"
+            },
+            {
+              "path": "src/main/config/rotorlens_binding_manifest.h",
+              "baseBlob": null,
+              "resultBlob": "fc657d27052de149a97f49b13193641e5af7a320"
+            },
+            {
+              "path": "src/main/config/rotorlens_config_mutation_epoch.c",
+              "baseBlob": null,
+              "resultBlob": "edbeff8a1c76196521d269e37523a0257c262a49"
+            },
+            {
+              "path": "src/main/config/rotorlens_config_mutation_epoch.h",
+              "baseBlob": null,
+              "resultBlob": "3a17a517c30cce54362eb233064112574a6a9390"
+            },
+            {
+              "path": "src/test/Makefile",
+              "baseBlob": "bf02df27aece87a8d2782d5cb3bff2eddceb4ed9",
+              "resultBlob": "9cd87bb4a6be3726e6d8086b8a04a505b47e8a8a"
+            },
+            {
+              "path": "src/test/unit/rotorlens_binding_manifest_unittest.cc",
+              "baseBlob": null,
+              "resultBlob": "629be440b438107c59db57269a530e9d37e15db7"
+            },
+            {
+              "path": "src/test/unit/rotorlens_config_mutation_epoch_unittest.cc",
+              "baseBlob": null,
+              "resultBlob": "a95bac4258511709f9a71703f9dc4e711a514677"
+            },
+            {
+              "path": "src/test/unit/sha256_unittest.cc",
+              "baseBlob": null,
+              "resultBlob": "29a13f2f7911d06aebbe0034fb98504f3a77740c"
+            }
+          ]
+        }
+      }
+    },
+    "targets": {
+      "type": "array",
+      "maxItems": 0
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "firmwareTarget",
+        "hostConformance"
+      ],
+      "properties": {
+        "firmwareTarget": {
+          "type": "null"
+        },
+        "hostConformance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "runner",
+            "cc",
+            "cxx",
+            "ldflagsOverride",
+            "makeTargets"
+          ],
+          "properties": {
+            "runner": {
+              "const": "ubuntu-24.04"
+            },
+            "cc": {
+              "const": "clang-18"
+            },
+            "cxx": {
+              "const": "clang++-18"
+            },
+            "ldflagsOverride": {
+              "const": ""
+            },
+            "makeTargets": {
+              "const": [
+                "test_sha256_unittest",
+                "test_rotorlens_binding_manifest_unittest",
+                "test_rotorlens_config_mutation_epoch_unittest"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "manifestIds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate",
+        "runtimeAccepted"
+      ],
+      "properties": {
+        "candidate": {
+          "const": [
+            "rotorlens-rf460-config-r1"
+          ]
+        },
+        "runtimeAccepted": {
+          "type": "array",
+          "maxItems": 0
+        }
+      }
+    },
+    "candidateEncoding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "rowCount",
+        "firstFieldId",
+        "lastFieldId",
+        "valueBytes",
+        "rowTlvBytes",
+        "maxWriterChunkBytes",
+        "fullPreimage",
+        "semanticValidation",
+        "liveFirmwareRead"
+      ],
+      "properties": {
+        "scope": {
+          "const": "row-tlv-only"
+        },
+        "rowCount": {
+          "const": 90
+        },
+        "firstFieldId": {
+          "const": 1
+        },
+        "lastFieldId": {
+          "const": 90
+        },
+        "valueBytes": {
+          "const": 103
+        },
+        "rowTlvBytes": {
+          "const": 463
+        },
+        "maxWriterChunkBytes": {
+          "const": 6
+        },
+        "fullPreimage": {
+          "const": false
+        },
+        "semanticValidation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scope",
+            "registeredScalarDomains",
+            "crossFieldRules",
+            "normalizesValues",
+            "rejectsBeforeWriter",
+            "provesLiveOrigin",
+            "provesStableCapture"
+          ],
+          "properties": {
+            "scope": {
+              "const": "caller-provided-immutable-value-buffer"
+            },
+            "registeredScalarDomains": {
+              "const": true
+            },
+            "crossFieldRules": {
+              "const": [
+                "rates-type-limits-roll-pitch-yaw",
+                "governor-mode-throttle-type",
+                "governor-idle-auto-handover-order",
+                "governor-mode-flag-allowlist",
+                "governor-active-throttle-order",
+                "mixer-collective-min-max-order"
+              ]
+            },
+            "normalizesValues": {
+              "const": false
+            },
+            "rejectsBeforeWriter": {
+              "const": true
+            },
+            "provesLiveOrigin": {
+              "const": false
+            },
+            "provesStableCapture": {
+              "const": false
+            }
+          }
+        },
+        "liveFirmwareRead": {
+          "const": false
+        }
+      }
+    },
+    "candidateMutationEpoch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "generationBits",
+        "nestingDepthBits",
+        "stableParity",
+        "mutationParity",
+        "faultSentinel",
+        "wrapPolicy",
+        "nestedTransitions",
+        "failClosedOn",
+        "faultPersistence",
+        "productionCallers",
+        "writerHookCoverage",
+        "captureIntegration",
+        "provesStableCapture"
+      ],
+      "properties": {
+        "scope": {
+          "const": "isolated-task-context-primitive"
+        },
+        "generationBits": {
+          "const": 32
+        },
+        "nestingDepthBits": {
+          "const": 16
+        },
+        "stableParity": {
+          "const": "even"
+        },
+        "mutationParity": {
+          "const": "odd"
+        },
+        "faultSentinel": {
+          "const": 4294967295
+        },
+        "wrapPolicy": {
+          "const": "latch-fault-sentinel-before-wrap"
+        },
+        "nestedTransitions": {
+          "const": "outermost-only"
+        },
+        "failClosedOn": {
+          "const": [
+            "generation-exhaustion",
+            "depth-overflow",
+            "unmatched-end",
+            "impossible-state-shape",
+            "interrupt-context-call"
+          ]
+        },
+        "faultPersistence": {
+          "const": "sticky-source-state-with-modeled-nmi-stale-write-defense"
+        },
+        "productionCallers": {
+          "type": "array",
+          "maxItems": 0
+        },
+        "writerHookCoverage": {
+          "type": "array",
+          "maxItems": 0
+        },
+        "captureIntegration": {
+          "const": false
+        },
+        "provesStableCapture": {
+          "const": false
+        }
+      }
+    },
+    "acceptanceBlockers": {
+      "const": [
+        "no-public-full-implementation-commit",
+        "no-full-preimage-or-commitment",
+        "no-live-capture-or-snapshot-stability-proof",
+        "no-scoped-writer-hooks-or-pending-token",
+        "no-start-headers",
+        "no-terminal-atomic-seal",
+        "no-target-build-or-resource-bounds",
+        "no-independent-wire-captures"
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceConformance",
+        "resourceBounds",
+        "terminalAtomicity",
+        "wireCaptures"
+      ],
+      "properties": {
+        "sourceConformance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "covers",
+            "hostTestTargets"
+          ],
+          "properties": {
+            "status": {
+              "const": "partial-host-only"
+            },
+            "covers": {
+              "const": [
+                "sha256-known-vectors",
+                "immutable-90-row-registry",
+                "row-tlv-independent-vector",
+                "structural-rejection-before-write",
+                "registered-90-row-domain-mapping",
+                "scalar-domain-class-boundaries",
+                "rate-type-cyclic-axis-cross-field-validation",
+                "governor-cross-field-allowlist",
+                "signed-mixer-domain-and-order-validation",
+                "semantic-rejection-before-write",
+                "input-buffer-nonmutation",
+                "partial-writer-failure",
+                "isolated-nested-task-context-epoch",
+                "epoch-no-op-generation-advance-and-saturation",
+                "epoch-fail-closed-depth-generation-and-api-boundaries",
+                "host-mode-primask-ipsr-and-publication-model",
+                "modeled-nmi-stale-write-fault-persistence"
+              ]
+            },
+            "hostTestTargets": {
+              "const": [
+                "test_sha256_unittest",
+                "test_rotorlens_binding_manifest_unittest",
+                "test_rotorlens_config_mutation_epoch_unittest"
+              ]
+            }
+          }
+        },
+        "resourceBounds": {
+          "type": "null"
+        },
+        "terminalAtomicity": {
+          "type": "null"
+        },
+        "wireCaptures": {
+          "type": "array",
+          "maxItems": 0
+        }
+      }
+    },
+    "runtimeAcceptance": {
+      "const": false
+    }
+  }
+}

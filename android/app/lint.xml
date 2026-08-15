@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!--
+      Adaptive-icon resources require a v26-qualified directory even when the
+      app's minSdk is 26. AAPT omits them from mipmap-anydpi and then cannot
+      resolve the manifest's icon references, so this one qualifier is not
+      obsolete. Keep this exception path-scoped instead of disabling the check.
+    -->
+    <issue id="ObsoleteSdkInt">
+        <ignore path="src/main/res/mipmap-anydpi-v26" />
+    </issue>
+</lint>

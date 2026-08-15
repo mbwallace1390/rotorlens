@@ -1,0 +1,2282 @@
+diff --git a/src/main/common/sha256.c b/src/main/common/sha256.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac0299274879ee74ffaa6acaaf6b7537588a4ee5
+--- /dev/null
++++ b/src/main/common/sha256.c
+@@ -0,0 +1,193 @@
++/*
++ * This file is part of Rotorflight.
++ *
++ * Rotorflight is free software. You can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Rotorflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#include <string.h>
++
++#include "common/sha256.h"
++
++static const uint32_t roundConstants[64] = {
++    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
++    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
++    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
++    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
++    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
++    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
++    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
++    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
++    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++};
++
++static uint32_t rotateRight(uint32_t value, unsigned shift)
++{
++    return (value >> shift) | (value << (32 - shift));
++}
++
++static uint32_t readBigEndianU32(const uint8_t *bytes)
++{
++    return ((uint32_t)bytes[0] << 24)
++        | ((uint32_t)bytes[1] << 16)
++        | ((uint32_t)bytes[2] << 8)
++        | bytes[3];
++}
++
++static void writeBigEndianU32(uint8_t *bytes, uint32_t value)
++{
++    bytes[0] = (uint8_t)(value >> 24);
++    bytes[1] = (uint8_t)(value >> 16);
++    bytes[2] = (uint8_t)(value >> 8);
++    bytes[3] = (uint8_t)value;
++}
++
++static void sha256Transform(sha256Context_t *context, const uint8_t block[SHA256_BLOCK_SIZE])
++{
++    uint32_t words[16];
++    for (unsigned i = 0; i < 16; i++) {
++        words[i] = readBigEndianU32(block + (i * 4));
++    }
++
++    uint32_t a = context->state[0];
++    uint32_t b = context->state[1];
++    uint32_t c = context->state[2];
++    uint32_t d = context->state[3];
++    uint32_t e = context->state[4];
++    uint32_t f = context->state[5];
++    uint32_t g = context->state[6];
++    uint32_t h = context->state[7];
++
++    for (unsigned i = 0; i < 64; i++) {
++        const unsigned index = i & 15;
++        if (i >= 16) {
++            const uint32_t word15 = words[(index + 1) & 15];
++            const uint32_t word2 = words[(index + 14) & 15];
++            const uint32_t sigma0 = rotateRight(word15, 7)
++                ^ rotateRight(word15, 18) ^ (word15 >> 3);
++            const uint32_t sigma1 = rotateRight(word2, 17)
++                ^ rotateRight(word2, 19) ^ (word2 >> 10);
++            words[index] += sigma0 + words[(index + 9) & 15] + sigma1;
++        }
++
++        const uint32_t sum1 = rotateRight(e, 6)
++            ^ rotateRight(e, 11) ^ rotateRight(e, 25);
++        const uint32_t choose = (e & f) ^ ((~e) & g);
++        const uint32_t temp1 = h + sum1 + choose
++            + roundConstants[i] + words[index];
++        const uint32_t sum0 = rotateRight(a, 2)
++            ^ rotateRight(a, 13) ^ rotateRight(a, 22);
++        const uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
++        const uint32_t temp2 = sum0 + majority;
++
++        h = g;
++        g = f;
++        f = e;
++        e = d + temp1;
++        d = c;
++        c = b;
++        b = a;
++        a = temp1 + temp2;
++    }
++
++    context->state[0] += a;
++    context->state[1] += b;
++    context->state[2] += c;
++    context->state[3] += d;
++    context->state[4] += e;
++    context->state[5] += f;
++    context->state[6] += g;
++    context->state[7] += h;
++}
++
++void sha256Init(sha256Context_t *context)
++{
++    context->state[0] = 0x6a09e667;
++    context->state[1] = 0xbb67ae85;
++    context->state[2] = 0x3c6ef372;
++    context->state[3] = 0xa54ff53a;
++    context->state[4] = 0x510e527f;
++    context->state[5] = 0x9b05688c;
++    context->state[6] = 0x1f83d9ab;
++    context->state[7] = 0x5be0cd19;
++    context->totalLength = 0;
++    context->bufferLength = 0;
++}
++
++void sha256Update(sha256Context_t *context, const void *data, size_t length)
++{
++    if (length == 0) {
++        return;
++    }
++
++    const uint8_t *bytes = data;
++    context->totalLength += length;
++
++    if (context->bufferLength != 0) {
++        const size_t available = SHA256_BLOCK_SIZE - context->bufferLength;
++        const size_t copied = length < available ? length : available;
++        memcpy(context->buffer + context->bufferLength, bytes, copied);
++        context->bufferLength += (uint32_t)copied;
++        bytes += copied;
++        length -= copied;
++
++        if (context->bufferLength == SHA256_BLOCK_SIZE) {
++            sha256Transform(context, context->buffer);
++            context->bufferLength = 0;
++        }
++    }
++
++    while (length >= SHA256_BLOCK_SIZE) {
++        sha256Transform(context, bytes);
++        bytes += SHA256_BLOCK_SIZE;
++        length -= SHA256_BLOCK_SIZE;
++    }
++
++    if (length != 0) {
++        memcpy(context->buffer, bytes, length);
++        context->bufferLength = (uint32_t)length;
++    }
++}
++
++void sha256Final(sha256Context_t *context, uint8_t digest[SHA256_DIGEST_SIZE])
++{
++    const uint64_t bitLength = context->totalLength * 8;
++
++    context->buffer[context->bufferLength++] = 0x80;
++    if (context->bufferLength > SHA256_BLOCK_SIZE - sizeof(bitLength)) {
++        memset(context->buffer + context->bufferLength, 0,
++            SHA256_BLOCK_SIZE - context->bufferLength);
++        sha256Transform(context, context->buffer);
++        context->bufferLength = 0;
++    }
++
++    memset(context->buffer + context->bufferLength, 0,
++        SHA256_BLOCK_SIZE - sizeof(bitLength) - context->bufferLength);
++    for (unsigned i = 0; i < sizeof(bitLength); i++) {
++        context->buffer[SHA256_BLOCK_SIZE - 1 - i] =
++            (uint8_t)(bitLength >> (i * 8));
++    }
++    sha256Transform(context, context->buffer);
++
++    for (unsigned i = 0; i < 8; i++) {
++        writeBigEndianU32(digest + (i * 4), context->state[i]);
++    }
++    context->bufferLength = 0;
++}
+diff --git a/src/main/common/sha256.h b/src/main/common/sha256.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1da8af90cceface9c1ad581e87acc9d0dacc58f
+--- /dev/null
++++ b/src/main/common/sha256.h
+@@ -0,0 +1,35 @@
++/*
++ * This file is part of Rotorflight.
++ *
++ * Rotorflight is free software. You can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Rotorflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define SHA256_BLOCK_SIZE  64
++#define SHA256_DIGEST_SIZE 32
++
++typedef struct sha256Context_s {
++    uint32_t state[8];
++    uint64_t totalLength;
++    uint8_t buffer[SHA256_BLOCK_SIZE];
++    uint32_t bufferLength;
++} sha256Context_t;
++
++void sha256Init(sha256Context_t *context);
++void sha256Update(sha256Context_t *context, const void *data, size_t length);
++void sha256Final(sha256Context_t *context, uint8_t digest[SHA256_DIGEST_SIZE]);
+diff --git a/src/main/config/rotorlens_binding_manifest.c b/src/main/config/rotorlens_binding_manifest.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe438684e5dd1698f91baa4958a8ce345478d869
+--- /dev/null
++++ b/src/main/config/rotorlens_binding_manifest.c
+@@ -0,0 +1,373 @@
++/*
++ * This file is part of Rotorflight.
++ *
++ * Rotorflight is free software. You can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Rotorflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#include <string.h>
++
++#include "config/rotorlens_binding_manifest.h"
++
++/*
++ * RF 4.6 Phase 2B declaration order with six meta fields removed and all
++ * vectors expanded in ascending component order. The declaration and scalar
++ * types were reviewed against the RF 4.6.0 baseline at
++ * 118e9120260bb33f46df4f92052fb0e9fd4e9ebc; that baseline is not a clean
++ * implementation-support pin for this uncommitted slice. Array indexes are
++ * field-id minus one. Names remain comments so the firmware registry stores no
++ * strings. The compact domain registry defines both wire shape and the strict
++ * semantic allowlist without reading live configuration.
++ */
++typedef enum {
++    FIELD_DOMAIN_BOOL,
++    FIELD_DOMAIN_RATES_TYPE,
++    FIELD_DOMAIN_U8_1_255,
++    FIELD_DOMAIN_U8_0_100,
++    FIELD_DOMAIN_U8_0_255,
++    FIELD_DOMAIN_U16_0_50000,
++    FIELD_DOMAIN_U8_0_250,
++    FIELD_DOMAIN_GOV_MODE,
++    FIELD_DOMAIN_GOV_THROTTLE_TYPE,
++    FIELD_DOMAIN_U16_0_600,
++    FIELD_DOMAIN_U8_10_100,
++    FIELD_DOMAIN_U8_0_50,
++    FIELD_DOMAIN_U8_5_40,
++    FIELD_DOMAIN_I16_NEG2500_2500,
++    FIELD_DOMAIN_I16_NEG10000_10000,
++    FIELD_DOMAIN_COUNT,
++} fieldDomainId_e;
++
++typedef struct fieldDomain_s {
++    int16_t minimum;
++    uint16_t maximum;
++    uint8_t type;
++} fieldDomain_t;
++
++static const fieldDomain_t fieldDomainTable[FIELD_DOMAIN_COUNT] = {
++    [FIELD_DOMAIN_BOOL] = { 0, 1, ROTORLENS_BINDING_SCALAR_BOOL },
++    [FIELD_DOMAIN_RATES_TYPE] = { 1, 6, ROTORLENS_BINDING_SCALAR_U8 },
++    [FIELD_DOMAIN_U8_1_255] = { 1, 255, ROTORLENS_BINDING_SCALAR_U8 },
++    [FIELD_DOMAIN_U8_0_100] = { 0, 100, ROTORLENS_BINDING_SCALAR_U8 },
++    [FIELD_DOMAIN_U8_0_255] = { 0, 255, ROTORLENS_BINDING_SCALAR_U8 },
++    [FIELD_DOMAIN_U16_0_50000] = { 0, 50000, ROTORLENS_BINDING_SCALAR_U16 },
++    [FIELD_DOMAIN_U8_0_250] = { 0, 250, ROTORLENS_BINDING_SCALAR_U8 },
++    [FIELD_DOMAIN_GOV_MODE] = { 0, 4, ROTORLENS_BINDING_SCALAR_U8 },
++    [FIELD_DOMAIN_GOV_THROTTLE_TYPE] = { 0, 2, ROTORLENS_BINDING_SCALAR_U8 },
++    [FIELD_DOMAIN_U16_0_600] = { 0, 600, ROTORLENS_BINDING_SCALAR_U16 },
++    [FIELD_DOMAIN_U8_10_100] = { 10, 100, ROTORLENS_BINDING_SCALAR_U8 },
++    [FIELD_DOMAIN_U8_0_50] = { 0, 50, ROTORLENS_BINDING_SCALAR_U8 },
++    [FIELD_DOMAIN_U8_5_40] = { 5, 40, ROTORLENS_BINDING_SCALAR_U8 },
++    [FIELD_DOMAIN_I16_NEG2500_2500] = { -2500, 2500, ROTORLENS_BINDING_SCALAR_I16 },
++    [FIELD_DOMAIN_I16_NEG10000_10000] = { -10000, 10000, ROTORLENS_BINDING_SCALAR_I16 },
++};
++
++static const uint8_t fieldDomains[ROTORLENS_BINDING_MANIFEST_ROW_COUNT] = {
++    FIELD_DOMAIN_RATES_TYPE,          // 1  rates:rates_type
++    FIELD_DOMAIN_U8_1_255,            // 2  rates:roll_rc_rate
++    FIELD_DOMAIN_U8_0_100,            // 3  rates:roll_expo
++    FIELD_DOMAIN_U8_0_255,            // 4  rates:roll_srate
++    FIELD_DOMAIN_U16_0_50000,         // 5  rates:roll_accel_limit
++    FIELD_DOMAIN_U8_0_250,            // 6  rates:roll_response
++    FIELD_DOMAIN_U8_1_255,            // 7  rates:pitch_rc_rate
++    FIELD_DOMAIN_U8_0_100,            // 8  rates:pitch_expo
++    FIELD_DOMAIN_U8_0_255,            // 9  rates:pitch_srate
++    FIELD_DOMAIN_U16_0_50000,         // 10 rates:pitch_accel_limit
++    FIELD_DOMAIN_U8_0_250,            // 11 rates:pitch_response
++    FIELD_DOMAIN_U8_1_255,            // 12 rates:yaw_rc_rate
++    FIELD_DOMAIN_U8_0_100,            // 13 rates:yaw_expo
++    FIELD_DOMAIN_U8_0_255,            // 14 rates:yaw_srate
++    FIELD_DOMAIN_U16_0_50000,         // 15 rates:yaw_accel_limit
++    FIELD_DOMAIN_U8_0_250,            // 16 rates:yaw_response
++    FIELD_DOMAIN_U8_1_255,            // 17 rates:collective_rc_rate
++    FIELD_DOMAIN_U8_0_100,            // 18 rates:collective_expo
++    FIELD_DOMAIN_U8_0_255,            // 19 rates:collective_srate
++    FIELD_DOMAIN_U16_0_50000,         // 20 rates:collective_accel_limit
++    FIELD_DOMAIN_U8_0_250,            // 21 rates:collective_response
++    FIELD_DOMAIN_U8_0_100,            // 22 rates:roll_level_expo
++    FIELD_DOMAIN_U8_0_100,            // 23 rates:pitch_level_expo
++    FIELD_DOMAIN_U8_0_250,            // 24 rates:cyclic_ring
++    FIELD_DOMAIN_U8_0_255,            // 25 rates:setpoint_boost_gain[0]
++    FIELD_DOMAIN_U8_0_255,            // 26 rates:setpoint_boost_gain[1]
++    FIELD_DOMAIN_U8_0_255,            // 27 rates:setpoint_boost_gain[2]
++    FIELD_DOMAIN_U8_0_255,            // 28 rates:setpoint_boost_gain[3]
++    FIELD_DOMAIN_U8_0_255,            // 29 rates:setpoint_boost_cutoff[0]
++    FIELD_DOMAIN_U8_0_255,            // 30 rates:setpoint_boost_cutoff[1]
++    FIELD_DOMAIN_U8_0_255,            // 31 rates:setpoint_boost_cutoff[2]
++    FIELD_DOMAIN_U8_0_255,            // 32 rates:setpoint_boost_cutoff[3]
++    FIELD_DOMAIN_U8_0_250,            // 33 rates:yaw_dynamic_ceiling_gain
++    FIELD_DOMAIN_U8_0_250,            // 34 rates:yaw_dynamic_deadband_gain
++    FIELD_DOMAIN_U8_0_250,            // 35 rates:yaw_dynamic_deadband_filter
++    FIELD_DOMAIN_U8_0_250,            // 36 rates:yaw_dynamic_deadband_cutoff
++    FIELD_DOMAIN_BOOL,                // 37 rates:cyclic_polar
++    FIELD_DOMAIN_GOV_MODE,            // 38 governor-master:gov_mode
++    FIELD_DOMAIN_GOV_THROTTLE_TYPE,   // 39 governor-master:gov_throttle_type
++    FIELD_DOMAIN_U16_0_600,           // 40 governor-master:gov_startup_time
++    FIELD_DOMAIN_U16_0_600,           // 41 governor-master:gov_spoolup_time
++    FIELD_DOMAIN_U16_0_600,           // 42 governor-master:gov_tracking_time
++    FIELD_DOMAIN_U16_0_600,           // 43 governor-master:gov_recovery_time
++    FIELD_DOMAIN_U16_0_600,           // 44 governor-master:gov_spooldown_time
++    FIELD_DOMAIN_U8_0_250,            // 45 governor-master:gov_throttle_hold_timeout
++    FIELD_DOMAIN_U8_0_250,            // 46 governor-master:gov_autorotation_timeout
++    FIELD_DOMAIN_U8_10_100,           // 47 governor-master:gov_handover_throttle
++    FIELD_DOMAIN_U8_0_250,            // 48 governor-master:gov_idle_throttle
++    FIELD_DOMAIN_U8_0_250,            // 49 governor-master:gov_auto_throttle
++    FIELD_DOMAIN_U8_0_255,            // 50 governor-master:gov_bypass_throttle[0]
++    FIELD_DOMAIN_U8_0_255,            // 51 governor-master:gov_bypass_throttle[1]
++    FIELD_DOMAIN_U8_0_255,            // 52 governor-master:gov_bypass_throttle[2]
++    FIELD_DOMAIN_U8_0_255,            // 53 governor-master:gov_bypass_throttle[3]
++    FIELD_DOMAIN_U8_0_255,            // 54 governor-master:gov_bypass_throttle[4]
++    FIELD_DOMAIN_U8_0_255,            // 55 governor-master:gov_bypass_throttle[5]
++    FIELD_DOMAIN_U8_0_255,            // 56 governor-master:gov_bypass_throttle[6]
++    FIELD_DOMAIN_U8_0_255,            // 57 governor-master:gov_bypass_throttle[7]
++    FIELD_DOMAIN_U8_0_255,            // 58 governor-master:gov_bypass_throttle[8]
++    FIELD_DOMAIN_U8_0_250,            // 59 governor-master:gov_pwr_filter
++    FIELD_DOMAIN_U8_0_250,            // 60 governor-master:gov_rpm_filter
++    FIELD_DOMAIN_U8_0_250,            // 61 governor-master:gov_tta_filter
++    FIELD_DOMAIN_U8_0_250,            // 62 governor-master:gov_ff_filter
++    FIELD_DOMAIN_U8_0_250,            // 63 governor-master:gov_d_filter
++    FIELD_DOMAIN_BOOL,                // 64 governor-profile:gov_use_fallback_precomp
++    FIELD_DOMAIN_BOOL,                // 65 governor-profile:gov_use_pid_spoolup
++    FIELD_DOMAIN_BOOL,                // 66 governor-profile:gov_use_voltage_comp
++    FIELD_DOMAIN_BOOL,                // 67 governor-profile:gov_use_dyn_min_throttle
++    FIELD_DOMAIN_U16_0_50000,         // 68 governor-profile:gov_headspeed
++    FIELD_DOMAIN_U8_0_250,            // 69 governor-profile:gov_gain
++    FIELD_DOMAIN_U8_0_250,            // 70 governor-profile:gov_p_gain
++    FIELD_DOMAIN_U8_0_250,            // 71 governor-profile:gov_i_gain
++    FIELD_DOMAIN_U8_0_250,            // 72 governor-profile:gov_d_gain
++    FIELD_DOMAIN_U8_0_250,            // 73 governor-profile:gov_f_gain
++    FIELD_DOMAIN_U8_0_100,            // 74 governor-profile:gov_p_limit
++    FIELD_DOMAIN_U8_0_100,            // 75 governor-profile:gov_i_limit
++    FIELD_DOMAIN_U8_0_100,            // 76 governor-profile:gov_d_limit
++    FIELD_DOMAIN_U8_0_100,            // 77 governor-profile:gov_f_limit
++    FIELD_DOMAIN_U8_0_250,            // 78 governor-profile:gov_tta_gain
++    FIELD_DOMAIN_U8_0_250,            // 79 governor-profile:gov_tta_limit
++    FIELD_DOMAIN_U8_0_250,            // 80 governor-profile:gov_yaw_ff_weight
++    FIELD_DOMAIN_U8_0_250,            // 81 governor-profile:gov_cyclic_ff_weight
++    FIELD_DOMAIN_U8_0_250,            // 82 governor-profile:gov_collective_ff_weight
++    FIELD_DOMAIN_U8_10_100,           // 83 governor-profile:gov_max_throttle
++    FIELD_DOMAIN_U8_10_100,           // 84 governor-profile:gov_min_throttle
++    FIELD_DOMAIN_U8_0_50,             // 85 governor-profile:gov_fallback_drop
++    FIELD_DOMAIN_U8_5_40,             // 86 governor-profile:gov_collective_curve
++    FIELD_DOMAIN_U8_0_100,            // 87 governor-profile:gov_dyn_min_throttle
++    FIELD_DOMAIN_I16_NEG2500_2500,    // 88 mixer:sc_min
++    FIELD_DOMAIN_I16_NEG2500_2500,    // 89 mixer:sc_max
++    FIELD_DOMAIN_I16_NEG10000_10000,  // 90 mixer:sc_rate
++};
++
++_Static_assert(
++    sizeof(fieldDomains) / sizeof(fieldDomains[0]) == ROTORLENS_BINDING_MANIFEST_ROW_COUNT,
++    "RotorLens binding manifest row count mismatch");
++_Static_assert(
++    sizeof(ROTORLENS_BINDING_MANIFEST_ID) - 1 == ROTORLENS_BINDING_MANIFEST_ID_LENGTH,
++    "RotorLens binding manifest identifier length mismatch");
++_Static_assert(
++    ROTORLENS_BINDING_MANIFEST_ROW_TLV_SIZE
++        == ROTORLENS_BINDING_MANIFEST_ROW_COUNT * 4
++            + ROTORLENS_BINDING_MANIFEST_VALUE_SIZE,
++    "RotorLens binding manifest encoded size mismatch");
++
++static uint8_t scalarWidth(uint8_t type)
++{
++    switch (type) {
++    case ROTORLENS_BINDING_SCALAR_BOOL:
++    case ROTORLENS_BINDING_SCALAR_U8:
++        return 1;
++    case ROTORLENS_BINDING_SCALAR_U16:
++    case ROTORLENS_BINDING_SCALAR_I16:
++        return 2;
++    default:
++        return 0;
++    }
++}
++
++static int32_t decodeScalar(const uint8_t *value, uint8_t type)
++{
++    if (type == ROTORLENS_BINDING_SCALAR_BOOL ||
++        type == ROTORLENS_BINDING_SCALAR_U8) {
++        return value[0];
++    }
++
++    const uint16_t raw = (uint16_t)((uint16_t)value[0] << 8) | value[1];
++    if (type == ROTORLENS_BINDING_SCALAR_I16 && (raw & 0x8000u) != 0) {
++        return (int32_t)raw - 65536;
++    }
++    return raw;
++}
++
++typedef struct rateLimits_s {
++    uint8_t rcRate;
++    uint8_t sRate;
++    uint8_t expo;
++} rateLimits_t;
++
++static const rateLimits_t rateLimits[] = {
++    { 255, 90, 100 },
++    { 200, 255, 100 },
++    { 255, 90, 100 },
++    { 200, 200, 100 },
++    { 255, 200, 100 },
++    { 200, 100, 100 },
++};
++
++_Static_assert(
++    sizeof(rateLimits) / sizeof(rateLimits[0]) == 6,
++    "RotorLens rates type limit count mismatch");
++
++enum {
++    VALUE_OFFSET_RATES_TYPE = 0,
++    VALUE_OFFSET_GOV_MODE = 41,
++    VALUE_OFFSET_GOV_THROTTLE_TYPE = 42,
++    VALUE_OFFSET_GOV_HANDOVER_THROTTLE = 55,
++    VALUE_OFFSET_GOV_IDLE_THROTTLE = 56,
++    VALUE_OFFSET_GOV_AUTO_THROTTLE = 57,
++    VALUE_OFFSET_GOV_FIRST_FLAG = 72,
++    VALUE_OFFSET_GOV_LAST_FLAG = 75,
++    VALUE_OFFSET_GOV_MAX_THROTTLE = 92,
++    VALUE_OFFSET_GOV_MIN_THROTTLE = 93,
++    VALUE_OFFSET_MIXER_SC_MIN = 97,
++    VALUE_OFFSET_MIXER_SC_MAX = 99,
++};
++
++static bool crossFieldsValid(const uint8_t *values)
++{
++    static const uint8_t rateAxisOffsets[] = { 1, 7, 13 };
++    const uint8_t ratesType = values[VALUE_OFFSET_RATES_TYPE];
++    const rateLimits_t *limits = &rateLimits[ratesType - 1];
++    for (size_t index = 0;
++         index < sizeof(rateAxisOffsets) / sizeof(rateAxisOffsets[0]);
++         index++) {
++        const size_t offset = rateAxisOffsets[index];
++        if (values[offset] > limits->rcRate ||
++            values[offset + 1] > limits->expo ||
++            values[offset + 2] > limits->sRate) {
++            return false;
++        }
++    }
++
++    if (decodeScalar(values + VALUE_OFFSET_MIXER_SC_MIN,
++            ROTORLENS_BINDING_SCALAR_I16) >
++        decodeScalar(values + VALUE_OFFSET_MIXER_SC_MAX,
++            ROTORLENS_BINDING_SCALAR_I16)) {
++        return false;
++    }
++
++    const uint8_t mode = values[VALUE_OFFSET_GOV_MODE];
++    const uint8_t throttleType = values[VALUE_OFFSET_GOV_THROTTLE_TYPE];
++    const uint8_t handover = values[VALUE_OFFSET_GOV_HANDOVER_THROTTLE];
++    const uint8_t idle = values[VALUE_OFFSET_GOV_IDLE_THROTTLE];
++    const uint8_t automatic = values[VALUE_OFFSET_GOV_AUTO_THROTTLE];
++    const uint16_t handoverIdleLimit = (uint16_t)handover * 10u - 1u;
++    const uint8_t maximumIdle = handoverIdleLimit < 250u
++        ? (uint8_t)handoverIdleLimit
++        : 250u;
++
++    if ((mode < 3 && throttleType == 1) ||
++        idle > automatic || automatic > maximumIdle) {
++        return false;
++    }
++
++    /* Mode 0 skips governor profile validation in RF 4.6. */
++    if (mode == 1 || mode == 2) {
++        for (size_t offset = VALUE_OFFSET_GOV_FIRST_FLAG;
++             offset <= VALUE_OFFSET_GOV_LAST_FLAG;
++             offset++) {
++            if (values[offset] != 0) {
++                return false;
++            }
++        }
++    }
++
++    if (mode != 0) {
++        const uint8_t maximum = values[VALUE_OFFSET_GOV_MAX_THROTTLE];
++        const uint8_t minimum = values[VALUE_OFFSET_GOV_MIN_THROTTLE];
++        if (maximum < handover || minimum > maximum) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++static rotorlensBindingManifestResult_e validateValues(
++    const uint8_t *values,
++    size_t valueLength)
++{
++    if (values == NULL) {
++        return ROTORLENS_BINDING_MANIFEST_INVALID_ARGUMENT;
++    }
++    if (valueLength != ROTORLENS_BINDING_MANIFEST_VALUE_SIZE) {
++        return ROTORLENS_BINDING_MANIFEST_INVALID_LENGTH;
++    }
++
++    size_t valueOffset = 0;
++    for (size_t index = 0; index < ROTORLENS_BINDING_MANIFEST_ROW_COUNT; index++) {
++        const uint8_t domainId = fieldDomains[index];
++        if (domainId >= FIELD_DOMAIN_COUNT) {
++            return ROTORLENS_BINDING_MANIFEST_INVALID_VALUE;
++        }
++        const fieldDomain_t *domain = &fieldDomainTable[domainId];
++        const uint8_t type = domain->type;
++        const uint8_t width = scalarWidth(type);
++        if (width == 0 || valueOffset > valueLength || width > valueLength - valueOffset) {
++            return ROTORLENS_BINDING_MANIFEST_INVALID_VALUE;
++        }
++        const int32_t value = decodeScalar(values + valueOffset, type);
++        if (value < (int32_t)domain->minimum || value > (int32_t)domain->maximum) {
++            return ROTORLENS_BINDING_MANIFEST_INVALID_VALUE;
++        }
++        valueOffset += width;
++    }
++
++    if (valueOffset != valueLength || !crossFieldsValid(values)) {
++        return ROTORLENS_BINDING_MANIFEST_INVALID_VALUE;
++    }
++    return ROTORLENS_BINDING_MANIFEST_OK;
++}
++
++rotorlensBindingManifestResult_e rotorlensBindingManifestEncodeRowsV1(
++    const uint8_t *values,
++    size_t valueLength,
++    rotorlensBindingManifestWriterFn writer,
++    void *writerContext)
++{
++    if (writer == NULL) {
++        return ROTORLENS_BINDING_MANIFEST_INVALID_ARGUMENT;
++    }
++
++    const rotorlensBindingManifestResult_e validationResult =
++        validateValues(values, valueLength);
++    if (validationResult != ROTORLENS_BINDING_MANIFEST_OK) {
++        return validationResult;
++    }
++
++    size_t valueOffset = 0;
++    for (size_t index = 0; index < ROTORLENS_BINDING_MANIFEST_ROW_COUNT; index++) {
++        const uint16_t fieldId = (uint16_t)(index + 1);
++        const uint8_t type = fieldDomainTable[fieldDomains[index]].type;
++        const uint8_t width = scalarWidth(type);
++        uint8_t row[ROTORLENS_BINDING_MANIFEST_MAX_ROW_WRITE_SIZE];
++        row[0] = (uint8_t)(fieldId >> 8);
++        row[1] = (uint8_t)fieldId;
++        row[2] = type;
++        row[3] = width;
++        memcpy(row + 4, values + valueOffset, width);
++
++        if (!writer(writerContext, row, 4 + width)) {
++            return ROTORLENS_BINDING_MANIFEST_WRITE_FAILED;
++        }
++        valueOffset += width;
++    }
++
++    return ROTORLENS_BINDING_MANIFEST_OK;
++}
+diff --git a/src/main/config/rotorlens_binding_manifest.h b/src/main/config/rotorlens_binding_manifest.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc657d27052de149a97f49b13193641e5af7a320
+--- /dev/null
++++ b/src/main/config/rotorlens_binding_manifest.h
+@@ -0,0 +1,71 @@
++/*
++ * This file is part of Rotorflight.
++ *
++ * Rotorflight is free software. You can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Rotorflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define ROTORLENS_BINDING_MANIFEST_ID                 "rotorlens-rf460-config-r1"
++#define ROTORLENS_BINDING_MANIFEST_ID_LENGTH          25
++#define ROTORLENS_BINDING_MANIFEST_ROW_COUNT          90
++#define ROTORLENS_BINDING_MANIFEST_VALUE_SIZE         103
++#define ROTORLENS_BINDING_MANIFEST_ROW_TLV_SIZE       463
++#define ROTORLENS_BINDING_MANIFEST_MAX_ROW_WRITE_SIZE 6
++
++typedef enum {
++    ROTORLENS_BINDING_SCALAR_BOOL = 1,
++    ROTORLENS_BINDING_SCALAR_U8 = 2,
++    ROTORLENS_BINDING_SCALAR_U16 = 3,
++    ROTORLENS_BINDING_SCALAR_I16 = 5,
++} rotorlensBindingScalarType_e;
++
++typedef enum {
++    ROTORLENS_BINDING_MANIFEST_OK = 0,
++    ROTORLENS_BINDING_MANIFEST_INVALID_ARGUMENT,
++    ROTORLENS_BINDING_MANIFEST_INVALID_LENGTH,
++    ROTORLENS_BINDING_MANIFEST_INVALID_VALUE,
++    ROTORLENS_BINDING_MANIFEST_WRITE_FAILED,
++} rotorlensBindingManifestResult_e;
++
++typedef bool (*rotorlensBindingManifestWriterFn)(
++    void *context, const uint8_t *data, size_t length);
++
++/*
++ * Validate, then encode an immutable canonical-value snapshot as binding-v1
++ * row TLVs. Values are concatenated in field-id order and 16-bit values are
++ * big-endian. Validation is fail-closed over the exact byte length, every
++ * scalar domain, and the deterministic source-reviewed cross-field safe
++ * allowlist. Semantic rejection occurs before the writer is called.
++ *
++ * This function does not read live configuration or prove capture origin,
++ * atomicity, target identity, or runtime-effective governor state. A future
++ * capture layer remains responsible for those properties and must keep the
++ * snapshot immutable until this function returns.
++ *
++ * The writer receives one complete row of at most
++ * ROTORLENS_BINDING_MANIFEST_MAX_ROW_WRITE_SIZE bytes and must synchronously
++ * consume or copy it before returning. A writer failure can leave a partial
++ * sink; callers must discard the entire sink unless this function returns
++ * ROTORLENS_BINDING_MANIFEST_OK.
++ */
++rotorlensBindingManifestResult_e rotorlensBindingManifestEncodeRowsV1(
++    const uint8_t *values,
++    size_t valueLength,
++    rotorlensBindingManifestWriterFn writer,
++    void *writerContext);
+diff --git a/src/main/config/rotorlens_config_mutation_epoch.c b/src/main/config/rotorlens_config_mutation_epoch.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..edbeff8a1c76196521d269e37523a0257c262a49
+--- /dev/null
++++ b/src/main/config/rotorlens_config_mutation_epoch.c
+@@ -0,0 +1,364 @@
++/*
++ * This file is part of Rotorflight.
++ *
++ * Rotorflight is free software. You can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Rotorflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#include "platform.h"
++
++#include <limits.h>
++
++#include "config/rotorlens_config_mutation_epoch.h"
++
++typedef struct rotorlensConfigMutationEpochState_s {
++    volatile uint32_t generation;
++    volatile uint16_t depth;
++    volatile uint16_t faultLatched;
++} rotorlensConfigMutationEpochState_t;
++
++_Static_assert(sizeof(rotorlensConfigMutationEpochState_t) == 8,
++    "RotorLens mutation epoch state must remain eight bytes");
++
++/* Zero initialization is the first stable generation with no active writer. */
++static rotorlensConfigMutationEpochState_t epochState;
++
++#if defined(UNIT_TEST)
++static uint32_t testInterruptContext;
++static uint32_t testPrimask;
++static bool testInjectInterruptFaultAfterStateRead;
++static uint32_t testBarrierCount;
++static uint32_t testStateWriteCount;
++static bool testCriticalSectionActive;
++static bool testHadUnprotectedStateWrite;
++static bool testLastStateWriteWasPublished;
++#endif
++
++static inline void compilerBarrier(void)
++{
++    __asm__ volatile ("" ::: "memory");
++}
++
++static inline void publicationBarrier(void)
++{
++    compilerBarrier();
++#if defined(UNIT_TEST)
++    /* Make host tests observe publication points without emulating a CPU DMB. */
++    testBarrierCount++;
++    testLastStateWriteWasPublished = true;
++#elif defined(SIMULATOR_BUILD)
++    /* The simulator has no CMSIS DMB intrinsic but still needs a host fence. */
++    __sync_synchronize();
++#else
++    __DMB();
++#endif
++    compilerBarrier();
++}
++
++static inline bool calledFromInterrupt(void)
++{
++#if defined(UNIT_TEST)
++    return testInterruptContext != 0;
++#elif defined(SIMULATOR_BUILD)
++    /* Compile-only shim: worker context is not detectable; there are no callers. */
++    return false;
++#else
++    return __get_IPSR() != 0;
++#endif
++}
++
++static uint32_t enterCriticalSection(void)
++{
++#if defined(UNIT_TEST)
++    const uint32_t savedPrimask = testPrimask;
++    /* Model PRIMASK=1 while the state pair is updated. */
++    testPrimask = 1;
++    testCriticalSectionActive = true;
++#elif defined(SIMULATOR_BUILD)
++    /* Compile-only shim: not a SITL mutex or trusted-capture guard. */
++    const uint32_t savedPrimask = 0;
++#else
++    const uint32_t savedPrimask = __get_PRIMASK();
++    __disable_irq();
++#endif
++    compilerBarrier();
++    return savedPrimask;
++}
++
++static void leaveCriticalSection(uint32_t savedPrimask)
++{
++    compilerBarrier();
++#if defined(UNIT_TEST)
++    testCriticalSectionActive = false;
++    /* Restore the caller's exact simulated interrupt-mask state. */
++    testPrimask = savedPrimask;
++#elif defined(SIMULATOR_BUILD)
++    (void)savedPrimask;
++#else
++    __set_PRIMASK(savedPrimask);
++#endif
++}
++
++static void writeGenerationLocked(uint32_t generation)
++{
++#if defined(UNIT_TEST)
++    testStateWriteCount++;
++    testLastStateWriteWasPublished = false;
++    if (!testCriticalSectionActive || testPrimask == 0) {
++        testHadUnprotectedStateWrite = true;
++    }
++#endif
++    /* Publish one aligned generation word while interrupts are masked. */
++    epochState.generation = generation;
++}
++
++static void writeDepthLocked(uint16_t depth)
++{
++#if defined(UNIT_TEST)
++    testStateWriteCount++;
++    testLastStateWriteWasPublished = false;
++    if (!testCriticalSectionActive || testPrimask == 0) {
++        testHadUnprotectedStateWrite = true;
++    }
++#endif
++    /* Publish the matching nested depth while interrupts are masked. */
++    epochState.depth = depth;
++}
++
++static void writeFaultLocked(void)
++{
++#if defined(UNIT_TEST)
++    testStateWriteCount++;
++    testLastStateWriteWasPublished = false;
++    if (!testCriticalSectionActive || testPrimask == 0) {
++        testHadUnprotectedStateWrite = true;
++    }
++#endif
++    /* Only host reset may clear this sticky NMI/HardFault-safe poison bit. */
++    epochState.faultLatched = 1u;
++}
++
++static void latchFaultLocked(void)
++{
++    /* Latch first so stale writes interrupted by NMI cannot erase the fault. */
++    writeFaultLocked();
++    /* The sentinel is never advanced or reset by a production API. */
++    writeGenerationLocked(ROTORLENS_CONFIG_MUTATION_EPOCH_FAULT);
++    /* Drop depth so a corrupted active state cannot appear recoverable. */
++    writeDepthLocked(0);
++}
++
++static void latchFault(void)
++{
++    const uint32_t savedPrimask = enterCriticalSection();
++    latchFaultLocked();
++    publicationBarrier();
++    leaveCriticalSection(savedPrimask);
++}
++
++static bool stateShapeIsValid(uint32_t generation, uint16_t depth)
++{
++    const bool generationIsOdd = (generation & 1u) != 0;
++    return generation != ROTORLENS_CONFIG_MUTATION_EPOCH_FAULT &&
++        ((depth == 0) != generationIsOdd);
++}
++
++#if defined(UNIT_TEST)
++static void injectInterruptFaultAfterStateRead(void)
++{
++    if (testInjectInterruptFaultAfterStateRead) {
++        /* Model an NMI latching fault after the task cached generation/depth. */
++        testInjectInterruptFaultAfterStateRead = false;
++        latchFaultLocked();
++        publicationBarrier();
++    }
++}
++#endif
++
++bool rotorlensConfigMutationEpochBegin(void)
++{
++    if (calledFromInterrupt()) {
++        latchFault();
++        return false;
++    }
++
++    const uint32_t savedPrimask = enterCriticalSection();
++    const uint32_t generation = epochState.generation;
++    const uint16_t depth = epochState.depth;
++
++    if (epochState.faultLatched != 0 ||
++        !stateShapeIsValid(generation, depth) ||
++        depth == UINT16_MAX ||
++        (depth == 0 && generation == UINT32_MAX - 1u)) {
++        latchFaultLocked();
++        publicationBarrier();
++        leaveCriticalSection(savedPrimask);
++        return false;
++    }
++
++#if defined(UNIT_TEST)
++    injectInterruptFaultAfterStateRead();
++#endif
++
++    if (depth == 0) {
++        /* Publish an odd generation before any outer mutation can execute. */
++        writeGenerationLocked(generation + 1u);
++    }
++    /* Record this matching begin after validating the 16-bit depth bound. */
++    writeDepthLocked((uint16_t)(depth + 1u));
++
++    publicationBarrier();
++    if (epochState.faultLatched != 0) {
++        /* Normalize stale task writes while retaining the sticky fault bit. */
++        latchFaultLocked();
++        publicationBarrier();
++        leaveCriticalSection(savedPrimask);
++        return false;
++    }
++    leaveCriticalSection(savedPrimask);
++    return true;
++}
++
++bool rotorlensConfigMutationEpochEnd(void)
++{
++    if (calledFromInterrupt()) {
++        latchFault();
++        return false;
++    }
++
++    /* Complete prior configuration stores before an outer end becomes stable. */
++    publicationBarrier();
++
++    const uint32_t savedPrimask = enterCriticalSection();
++    const uint32_t generation = epochState.generation;
++    const uint16_t depth = epochState.depth;
++
++    if (epochState.faultLatched != 0 ||
++        !stateShapeIsValid(generation, depth) || depth == 0) {
++        latchFaultLocked();
++        publicationBarrier();
++        leaveCriticalSection(savedPrimask);
++        return false;
++    }
++
++#if defined(UNIT_TEST)
++    injectInterruptFaultAfterStateRead();
++#endif
++
++    /* Consume exactly one matching begin. */
++    writeDepthLocked((uint16_t)(depth - 1u));
++    if (depth == 1) {
++        /* Publish the next even generation only when the outer mutation ends. */
++        writeGenerationLocked(generation + 1u);
++    }
++
++    publicationBarrier();
++    if (epochState.faultLatched != 0) {
++        /* Normalize stale task writes while retaining the sticky fault bit. */
++        latchFaultLocked();
++        publicationBarrier();
++        leaveCriticalSection(savedPrimask);
++        return false;
++    }
++    leaveCriticalSection(savedPrimask);
++    return true;
++}
++
++uint32_t rotorlensConfigMutationEpochGeneration(void)
++{
++    publicationBarrier();
++    const uint16_t faultBefore = epochState.faultLatched;
++    const uint32_t generation = epochState.generation;
++    const uint16_t faultAfter = epochState.faultLatched;
++    publicationBarrier();
++    return (faultBefore != 0 || faultAfter != 0)
++        ? ROTORLENS_CONFIG_MUTATION_EPOCH_FAULT
++        : generation;
++}
++
++#if defined(UNIT_TEST)
++void rotorlensConfigMutationEpochTestReset(void)
++{
++    /* Restore the only production initial state plus a task-context host. */
++    epochState.generation = 0;
++    epochState.depth = 0;
++    epochState.faultLatched = 0;
++    testInterruptContext = 0;
++    testPrimask = 0;
++    testInjectInterruptFaultAfterStateRead = false;
++    rotorlensConfigMutationEpochTestClearInstrumentation();
++}
++
++void rotorlensConfigMutationEpochTestSeed(uint32_t generation, uint16_t depth)
++{
++    /* Tests may inject valid boundaries and impossible corrupted state shapes. */
++    epochState.generation = generation;
++    epochState.depth = depth;
++}
++
++void rotorlensConfigMutationEpochTestSetInterruptContext(bool active)
++{
++    /* Model IPSR=1 for interrupt context and IPSR=0 for task context. */
++    testInterruptContext = active ? 1u : 0u;
++}
++
++void rotorlensConfigMutationEpochTestInjectInterruptFaultAfterStateRead(void)
++{
++    testInjectInterruptFaultAfterStateRead = true;
++}
++
++void rotorlensConfigMutationEpochTestSetPrimask(bool disabled)
++{
++    /* Model the caller's incoming PRIMASK bit. */
++    testPrimask = disabled ? 1u : 0u;
++}
++
++bool rotorlensConfigMutationEpochTestPrimask(void)
++{
++    return testPrimask != 0;
++}
++
++uint16_t rotorlensConfigMutationEpochTestDepth(void)
++{
++    return epochState.depth;
++}
++
++void rotorlensConfigMutationEpochTestClearInstrumentation(void)
++{
++    testBarrierCount = 0;
++    testStateWriteCount = 0;
++    testCriticalSectionActive = false;
++    testHadUnprotectedStateWrite = false;
++    testLastStateWriteWasPublished = true;
++}
++
++uint32_t rotorlensConfigMutationEpochTestBarrierCount(void)
++{
++    return testBarrierCount;
++}
++
++uint32_t rotorlensConfigMutationEpochTestStateWriteCount(void)
++{
++    return testStateWriteCount;
++}
++
++bool rotorlensConfigMutationEpochTestHadUnprotectedStateWrite(void)
++{
++    return testHadUnprotectedStateWrite;
++}
++
++bool rotorlensConfigMutationEpochTestLastStateWriteWasPublished(void)
++{
++    return testLastStateWriteWasPublished;
++}
++#endif
+diff --git a/src/main/config/rotorlens_config_mutation_epoch.h b/src/main/config/rotorlens_config_mutation_epoch.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a17a517c30cce54362eb233064112574a6a9390
+--- /dev/null
++++ b/src/main/config/rotorlens_config_mutation_epoch.h
+@@ -0,0 +1,67 @@
++/*
++ * This file is part of Rotorflight.
++ *
++ * Rotorflight is free software. You can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Rotorflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define ROTORLENS_CONFIG_MUTATION_EPOCH_FAULT UINT32_MAX
++
++/*
++ * Mark the task-context boundary around one configuration mutation. Calls may
++ * nest. The outer begin changes the generation from even to odd; the outer end
++ * changes it to the next even value. Even a no-op mutation therefore advances
++ * the generation by two and cannot be mistaken for an unchanged snapshot.
++ *
++ * Calling either function from interrupt context, ending without a matching
++ * begin, overflowing the nesting depth, or exhausting the generation latches
++ * ROTORLENS_CONFIG_MUTATION_EPOCH_FAULT permanently. False means the fault is
++ * latched. A fault disables RotorLens trusted capture, but must not abort,
++ * roll back, or otherwise change the user's normal configuration mutation.
++ *
++ * This Phase 2H-A primitive is intentionally not connected to configuration
++ * writers, capture, MSP, CLI, UI, or runtime acceptance yet.
++ */
++bool rotorlensConfigMutationEpochBegin(void);
++bool rotorlensConfigMutationEpochEnd(void);
++
++/*
++ * Return one aligned 32-bit generation sample. An even value is stable, an odd
++ * value has an active mutation, and UINT32_MAX is the permanent fault sentinel.
++ * A later capture layer must sample before and after copying and accept only
++ * identical, even, non-fault values after every relevant production writer is
++ * covered. In particular, generation zero proves nothing while this primitive
++ * has no production hooks. This function alone proves no snapshot.
++ */
++uint32_t rotorlensConfigMutationEpochGeneration(void);
++
++#if defined(UNIT_TEST)
++/* Host-only controls expose boundary states without production recovery APIs. */
++void rotorlensConfigMutationEpochTestReset(void);
++void rotorlensConfigMutationEpochTestSeed(uint32_t generation, uint16_t depth);
++void rotorlensConfigMutationEpochTestSetInterruptContext(bool active);
++void rotorlensConfigMutationEpochTestInjectInterruptFaultAfterStateRead(void);
++void rotorlensConfigMutationEpochTestSetPrimask(bool disabled);
++bool rotorlensConfigMutationEpochTestPrimask(void);
++uint16_t rotorlensConfigMutationEpochTestDepth(void);
++void rotorlensConfigMutationEpochTestClearInstrumentation(void);
++uint32_t rotorlensConfigMutationEpochTestBarrierCount(void);
++uint32_t rotorlensConfigMutationEpochTestStateWriteCount(void);
++bool rotorlensConfigMutationEpochTestHadUnprotectedStateWrite(void);
++bool rotorlensConfigMutationEpochTestLastStateWriteWasPublished(void);
++#endif
+diff --git a/src/test/Makefile b/src/test/Makefile
+index bf02df27aece87a8d2782d5cb3bff2eddceb4ed9..9cd87bb4a6be3726e6d8086b8a04a505b47e8a8a 100644
+--- a/src/test/Makefile
++++ b/src/test/Makefile
+@@ -140,6 +140,16 @@ blackbox_encoding_unittest_SRC :=  \
+ encoding_unittest_SRC := \
+ 		$(USER_DIR)/common/encoding.c
+ 
++sha256_unittest_SRC := \
++		$(USER_DIR)/common/sha256.c
++
++rotorlens_binding_manifest_unittest_SRC := \
++		$(USER_DIR)/config/rotorlens_binding_manifest.c \
++		$(USER_DIR)/common/sha256.c
++
++rotorlens_config_mutation_epoch_unittest_SRC := \
++		$(USER_DIR)/config/rotorlens_config_mutation_epoch.c
++
+ 
+ # This test is disabled due to build errors.
+ #flight_failsafe_unittest_SRC := \
+diff --git a/src/test/unit/rotorlens_binding_manifest_unittest.cc b/src/test/unit/rotorlens_binding_manifest_unittest.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..629be440b438107c59db57269a530e9d37e15db7
+--- /dev/null
++++ b/src/test/unit/rotorlens_binding_manifest_unittest.cc
+@@ -0,0 +1,680 @@
++/*
++ * This file is part of Rotorflight.
++ *
++ * Rotorflight is free software. You can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Rotorflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#include <stdint.h>
++#include <string.h>
++
++extern "C" {
++    #include "common/sha256.h"
++    #include "config/rotorlens_binding_manifest.h"
++}
++
++#include "unittest_macros.h"
++#include "gtest/gtest.h"
++
++/*
++ * Independent Phase 2B legal-range pattern:
++ * min + ((257 * fieldId + 0x5a) % (max - min + 1)), with four fixed
++ * cross-field overrides. This fixed byte array does not depend on the encoder.
++ */
++static const uint8_t canonicalValues[ROTORLENS_BINDING_MANIFEST_VALUE_SIZE] = {
++    0x05, 0x5f, 0x35, 0x5e, 0x05, 0x5f, 0x7e, 0x69, 0x19, 0x63, 0x0a, 0x64,
++    0x9c, 0x73, 0x62, 0x68, 0x0f, 0x69, 0xba, 0x7d, 0x46, 0x6d, 0x14, 0x6e,
++    0xd8, 0x58, 0x2a, 0xea, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a,
++    0x25, 0x2b, 0x31, 0x37, 0x01, 0x03, 0x00, 0x00, 0x99, 0x01, 0x9a, 0x00,
++    0x42, 0x01, 0x43, 0x02, 0x44, 0x6d, 0x73, 0x4c, 0x7f, 0x85, 0x8c, 0x8d,
++    0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94, 0xc1, 0xc7, 0xcd, 0xd3, 0xd9,
++    0x00, 0x01, 0x00, 0x01, 0x44, 0x9e, 0x02, 0x08, 0x0e, 0x14, 0x1a, 0x13,
++    0x4a, 0x1c, 0x53, 0x38, 0x3e, 0x44, 0x4a, 0x50, 0x5a, 0x14, 0x05, 0x15,
++    0x1b, 0x00, 0xca, 0x01, 0xcb, 0xe5, 0x83,
++};
++
++typedef struct scalarOracleRow_s {
++    uint8_t offset;
++    uint8_t width;
++    uint8_t type;
++    int32_t minimum;
++    int32_t maximum;
++} scalarOracleRow_t;
++
++#define ORACLE_BOOL(offset) \
++    { offset, 1, ROTORLENS_BINDING_SCALAR_BOOL, 0, 1 }
++#define ORACLE_U8(offset, minimum, maximum) \
++    { offset, 1, ROTORLENS_BINDING_SCALAR_U8, minimum, maximum }
++#define ORACLE_U16(offset, minimum, maximum) \
++    { offset, 2, ROTORLENS_BINDING_SCALAR_U16, minimum, maximum }
++#define ORACLE_I16(offset, minimum, maximum) \
++    { offset, 2, ROTORLENS_BINDING_SCALAR_I16, minimum, maximum }
++
++/*
++ * Independent RF 4.6 Phase 2B per-row oracle. Nothing in this table is read
++ * from the production registry, so a domain remap at one field is observable.
++ */
++static const scalarOracleRow_t scalarOracle[] = {
++    ORACLE_U8(0, 1, 6),          // 1  rates:rates_type
++    ORACLE_U8(1, 1, 255),        // 2  rates:roll_rc_rate
++    ORACLE_U8(2, 0, 100),        // 3  rates:roll_expo
++    ORACLE_U8(3, 0, 255),        // 4  rates:roll_srate
++    ORACLE_U16(4, 0, 50000),     // 5  rates:roll_accel_limit
++    ORACLE_U8(6, 0, 250),        // 6  rates:roll_response
++    ORACLE_U8(7, 1, 255),        // 7  rates:pitch_rc_rate
++    ORACLE_U8(8, 0, 100),        // 8  rates:pitch_expo
++    ORACLE_U8(9, 0, 255),        // 9  rates:pitch_srate
++    ORACLE_U16(10, 0, 50000),    // 10 rates:pitch_accel_limit
++    ORACLE_U8(12, 0, 250),       // 11 rates:pitch_response
++    ORACLE_U8(13, 1, 255),       // 12 rates:yaw_rc_rate
++    ORACLE_U8(14, 0, 100),       // 13 rates:yaw_expo
++    ORACLE_U8(15, 0, 255),       // 14 rates:yaw_srate
++    ORACLE_U16(16, 0, 50000),    // 15 rates:yaw_accel_limit
++    ORACLE_U8(18, 0, 250),       // 16 rates:yaw_response
++    ORACLE_U8(19, 1, 255),       // 17 rates:collective_rc_rate
++    ORACLE_U8(20, 0, 100),       // 18 rates:collective_expo
++    ORACLE_U8(21, 0, 255),       // 19 rates:collective_srate
++    ORACLE_U16(22, 0, 50000),    // 20 rates:collective_accel_limit
++    ORACLE_U8(24, 0, 250),       // 21 rates:collective_response
++    ORACLE_U8(25, 0, 100),       // 22 rates:roll_level_expo
++    ORACLE_U8(26, 0, 100),       // 23 rates:pitch_level_expo
++    ORACLE_U8(27, 0, 250),       // 24 rates:cyclic_ring
++    ORACLE_U8(28, 0, 255),       // 25 rates:setpoint_boost_gain[0]
++    ORACLE_U8(29, 0, 255),       // 26 rates:setpoint_boost_gain[1]
++    ORACLE_U8(30, 0, 255),       // 27 rates:setpoint_boost_gain[2]
++    ORACLE_U8(31, 0, 255),       // 28 rates:setpoint_boost_gain[3]
++    ORACLE_U8(32, 0, 255),       // 29 rates:setpoint_boost_cutoff[0]
++    ORACLE_U8(33, 0, 255),       // 30 rates:setpoint_boost_cutoff[1]
++    ORACLE_U8(34, 0, 255),       // 31 rates:setpoint_boost_cutoff[2]
++    ORACLE_U8(35, 0, 255),       // 32 rates:setpoint_boost_cutoff[3]
++    ORACLE_U8(36, 0, 250),       // 33 rates:yaw_dynamic_ceiling_gain
++    ORACLE_U8(37, 0, 250),       // 34 rates:yaw_dynamic_deadband_gain
++    ORACLE_U8(38, 0, 250),       // 35 rates:yaw_dynamic_deadband_filter
++    ORACLE_U8(39, 0, 250),       // 36 rates:yaw_dynamic_deadband_cutoff
++    ORACLE_BOOL(40),              // 37 rates:cyclic_polar
++    ORACLE_U8(41, 0, 4),         // 38 governor-master:gov_mode
++    ORACLE_U8(42, 0, 2),         // 39 governor-master:gov_throttle_type
++    ORACLE_U16(43, 0, 600),      // 40 governor-master:gov_startup_time
++    ORACLE_U16(45, 0, 600),      // 41 governor-master:gov_spoolup_time
++    ORACLE_U16(47, 0, 600),      // 42 governor-master:gov_tracking_time
++    ORACLE_U16(49, 0, 600),      // 43 governor-master:gov_recovery_time
++    ORACLE_U16(51, 0, 600),      // 44 governor-master:gov_spooldown_time
++    ORACLE_U8(53, 0, 250),       // 45 governor-master:gov_throttle_hold_timeout
++    ORACLE_U8(54, 0, 250),       // 46 governor-master:gov_autorotation_timeout
++    ORACLE_U8(55, 10, 100),      // 47 governor-master:gov_handover_throttle
++    ORACLE_U8(56, 0, 250),       // 48 governor-master:gov_idle_throttle
++    ORACLE_U8(57, 0, 250),       // 49 governor-master:gov_auto_throttle
++    ORACLE_U8(58, 0, 255),       // 50 governor-master:gov_bypass_throttle[0]
++    ORACLE_U8(59, 0, 255),       // 51 governor-master:gov_bypass_throttle[1]
++    ORACLE_U8(60, 0, 255),       // 52 governor-master:gov_bypass_throttle[2]
++    ORACLE_U8(61, 0, 255),       // 53 governor-master:gov_bypass_throttle[3]
++    ORACLE_U8(62, 0, 255),       // 54 governor-master:gov_bypass_throttle[4]
++    ORACLE_U8(63, 0, 255),       // 55 governor-master:gov_bypass_throttle[5]
++    ORACLE_U8(64, 0, 255),       // 56 governor-master:gov_bypass_throttle[6]
++    ORACLE_U8(65, 0, 255),       // 57 governor-master:gov_bypass_throttle[7]
++    ORACLE_U8(66, 0, 255),       // 58 governor-master:gov_bypass_throttle[8]
++    ORACLE_U8(67, 0, 250),       // 59 governor-master:gov_pwr_filter
++    ORACLE_U8(68, 0, 250),       // 60 governor-master:gov_rpm_filter
++    ORACLE_U8(69, 0, 250),       // 61 governor-master:gov_tta_filter
++    ORACLE_U8(70, 0, 250),       // 62 governor-master:gov_ff_filter
++    ORACLE_U8(71, 0, 250),       // 63 governor-master:gov_d_filter
++    ORACLE_BOOL(72),              // 64 governor-profile:gov_use_fallback_precomp
++    ORACLE_BOOL(73),              // 65 governor-profile:gov_use_pid_spoolup
++    ORACLE_BOOL(74),              // 66 governor-profile:gov_use_voltage_comp
++    ORACLE_BOOL(75),              // 67 governor-profile:gov_use_dyn_min_throttle
++    ORACLE_U16(76, 0, 50000),    // 68 governor-profile:gov_headspeed
++    ORACLE_U8(78, 0, 250),       // 69 governor-profile:gov_gain
++    ORACLE_U8(79, 0, 250),       // 70 governor-profile:gov_p_gain
++    ORACLE_U8(80, 0, 250),       // 71 governor-profile:gov_i_gain
++    ORACLE_U8(81, 0, 250),       // 72 governor-profile:gov_d_gain
++    ORACLE_U8(82, 0, 250),       // 73 governor-profile:gov_f_gain
++    ORACLE_U8(83, 0, 100),       // 74 governor-profile:gov_p_limit
++    ORACLE_U8(84, 0, 100),       // 75 governor-profile:gov_i_limit
++    ORACLE_U8(85, 0, 100),       // 76 governor-profile:gov_d_limit
++    ORACLE_U8(86, 0, 100),       // 77 governor-profile:gov_f_limit
++    ORACLE_U8(87, 0, 250),       // 78 governor-profile:gov_tta_gain
++    ORACLE_U8(88, 0, 250),       // 79 governor-profile:gov_tta_limit
++    ORACLE_U8(89, 0, 250),       // 80 governor-profile:gov_yaw_ff_weight
++    ORACLE_U8(90, 0, 250),       // 81 governor-profile:gov_cyclic_ff_weight
++    ORACLE_U8(91, 0, 250),       // 82 governor-profile:gov_collective_ff_weight
++    ORACLE_U8(92, 10, 100),      // 83 governor-profile:gov_max_throttle
++    ORACLE_U8(93, 10, 100),      // 84 governor-profile:gov_min_throttle
++    ORACLE_U8(94, 0, 50),        // 85 governor-profile:gov_fallback_drop
++    ORACLE_U8(95, 5, 40),        // 86 governor-profile:gov_collective_curve
++    ORACLE_U8(96, 0, 100),       // 87 governor-profile:gov_dyn_min_throttle
++    ORACLE_I16(97, -2500, 2500), // 88 mixer:sc_min
++    ORACLE_I16(99, -2500, 2500), // 89 mixer:sc_max
++    ORACLE_I16(101, -10000, 10000), // 90 mixer:sc_rate
++};
++
++#undef ORACLE_BOOL
++#undef ORACLE_U8
++#undef ORACLE_U16
++#undef ORACLE_I16
++
++static_assert(
++    sizeof(scalarOracle) / sizeof(scalarOracle[0]) ==
++        ROTORLENS_BINDING_MANIFEST_ROW_COUNT,
++    "RotorLens scalar oracle row count mismatch");
++
++static const uint8_t canonicalValuesDigest[SHA256_DIGEST_SIZE] = {
++    0xdf, 0xd9, 0x77, 0x53, 0x47, 0x0a, 0x7a, 0x9d,
++    0x73, 0x97, 0xdb, 0x40, 0xfb, 0x4b, 0x1c, 0x2a,
++    0x93, 0xc9, 0xa2, 0x1c, 0x19, 0x8e, 0x9c, 0xc3,
++    0xcb, 0xc8, 0x7b, 0xe3, 0x72, 0xca, 0x55, 0xa2,
++};
++
++static const uint8_t rowTlvDigest[SHA256_DIGEST_SIZE] = {
++    0xef, 0x45, 0x5b, 0xc8, 0xfa, 0x3f, 0x66, 0xb7,
++    0xbf, 0xf2, 0x8a, 0xa1, 0x68, 0x99, 0xce, 0x97,
++    0x44, 0x04, 0x90, 0x06, 0xde, 0xda, 0x02, 0x13,
++    0x71, 0xf2, 0x34, 0xd8, 0xf1, 0x43, 0xfc, 0x39,
++};
++
++static void expectDigestEquals(
++    const uint8_t expected[SHA256_DIGEST_SIZE],
++    const uint8_t actual[SHA256_DIGEST_SIZE])
++{
++    for (unsigned i = 0; i < SHA256_DIGEST_SIZE; i++) {
++        EXPECT_EQ(expected[i], actual[i]) << "digest byte " << i;
++    }
++}
++
++typedef struct hashWriterState_s {
++    sha256Context_t sha256;
++    size_t acceptedLength;
++    size_t maximumWriteLength;
++    unsigned callCount;
++    unsigned failCall;
++    uint8_t firstRow[ROTORLENS_BINDING_MANIFEST_MAX_ROW_WRITE_SIZE];
++    size_t firstRowLength;
++    uint8_t lastRow[ROTORLENS_BINDING_MANIFEST_MAX_ROW_WRITE_SIZE];
++    size_t lastRowLength;
++} hashWriterState_t;
++
++static bool hashWriter(void *context, const uint8_t *data, size_t length)
++{
++    hashWriterState_t *state = (hashWriterState_t *)context;
++    state->callCount++;
++    if (state->failCall != 0 && state->callCount == state->failCall) {
++        return false;
++    }
++
++    if (length > state->maximumWriteLength) {
++        state->maximumWriteLength = length;
++    }
++    if (state->firstRowLength == 0) {
++        memcpy(state->firstRow, data, length);
++        state->firstRowLength = length;
++    }
++    memcpy(state->lastRow, data, length);
++    state->lastRowLength = length;
++    sha256Update(&state->sha256, data, length);
++    state->acceptedLength += length;
++    return true;
++}
++
++typedef struct countWriterState_s {
++    unsigned callCount;
++    size_t acceptedLength;
++} countWriterState_t;
++
++static bool countWriter(void *context, const uint8_t *, size_t length)
++{
++    countWriterState_t *state = (countWriterState_t *)context;
++    state->callCount++;
++    state->acceptedLength += length;
++    return true;
++}
++
++static void setScalarBe(uint8_t *values, size_t offset, uint8_t width, int32_t value)
++{
++    if (width == 1) {
++        values[offset] = (uint8_t)value;
++        return;
++    }
++
++    const uint16_t encoded = (uint16_t)value;
++    values[offset] = (uint8_t)(encoded >> 8);
++    values[offset + 1] = (uint8_t)encoded;
++}
++
++static void prepareScalarOracleValues(uint8_t *values, unsigned fieldId)
++{
++    static const size_t cyclicAxisOffsets[] = { 1, 7, 13 };
++    memcpy(values, canonicalValues, sizeof(canonicalValues));
++
++    /* Keep all unrelated cyclic fields valid under the selected rate type. */
++    values[0] = 1;
++    for (size_t index = 0;
++         index < sizeof(cyclicAxisOffsets) / sizeof(cyclicAxisOffsets[0]);
++         index++) {
++        values[cyclicAxisOffsets[index]] = 1;
++        values[cyclicAxisOffsets[index] + 1] = 0;
++        values[cyclicAxisOffsets[index] + 2] = 0;
++    }
++    if (fieldId == 4 || fieldId == 9 || fieldId == 14) {
++        values[0] = 2; // Raceflight permits the full u8 cyclic srate domain.
++    }
++
++    /* Mode OFF isolates governor scalar domains from profile cross-rules. */
++    values[41] = 0;
++    values[42] = 0;
++    values[55] = 10;
++    values[56] = 0;
++    values[57] = 0;
++    memset(values + 72, 0, 4);
++    values[92] = 100;
++    values[93] = 10;
++    if (fieldId == 48) {
++        values[55] = 26;
++        values[57] = 250;
++    } else if (fieldId == 49) {
++        values[55] = 26;
++    }
++
++    /* Either signed collective endpoint remains valid when varied alone. */
++    setScalarBe(values, 97, 2, -2500);
++    setScalarBe(values, 99, 2, 2500);
++    setScalarBe(values, 101, 2, 0);
++}
++
++static void expectRejectedBeforeWriting(const uint8_t *values)
++{
++    uint8_t before[sizeof(canonicalValues)];
++    memcpy(before, values, sizeof(before));
++    countWriterState_t writerState = {};
++    EXPECT_EQ(
++        ROTORLENS_BINDING_MANIFEST_INVALID_VALUE,
++        rotorlensBindingManifestEncodeRowsV1(
++            values, sizeof(canonicalValues), countWriter, &writerState));
++    EXPECT_EQ(0u, writerState.callCount);
++    EXPECT_EQ(0u, writerState.acceptedLength);
++    EXPECT_EQ(0, memcmp(before, values, sizeof(before)));
++}
++
++static void expectAcceptedWithoutMutation(const uint8_t *values)
++{
++    uint8_t before[sizeof(canonicalValues)];
++    memcpy(before, values, sizeof(before));
++    countWriterState_t writerState = {};
++    EXPECT_EQ(
++        ROTORLENS_BINDING_MANIFEST_OK,
++        rotorlensBindingManifestEncodeRowsV1(
++            values, sizeof(canonicalValues), countWriter, &writerState));
++    EXPECT_EQ(ROTORLENS_BINDING_MANIFEST_ROW_COUNT, writerState.callCount);
++    EXPECT_EQ(ROTORLENS_BINDING_MANIFEST_ROW_TLV_SIZE, writerState.acceptedLength);
++    EXPECT_EQ(0, memcmp(before, values, sizeof(before)));
++}
++
++TEST(RotorlensBindingManifestUnittest, EncodesIndependentNinetyRowVector)
++{
++    EXPECT_STREQ("rotorlens-rf460-config-r1", ROTORLENS_BINDING_MANIFEST_ID);
++    EXPECT_EQ(25u, sizeof(ROTORLENS_BINDING_MANIFEST_ID) - 1);
++    EXPECT_EQ(90u, ROTORLENS_BINDING_MANIFEST_ROW_COUNT);
++    EXPECT_EQ(103u, sizeof(canonicalValues));
++
++    sha256Context_t valueHash;
++    uint8_t digest[SHA256_DIGEST_SIZE];
++    sha256Init(&valueHash);
++    sha256Update(&valueHash, canonicalValues, sizeof(canonicalValues));
++    sha256Final(&valueHash, digest);
++    expectDigestEquals(canonicalValuesDigest, digest);
++
++    hashWriterState_t writerState = {};
++    sha256Init(&writerState.sha256);
++    ASSERT_EQ(
++        ROTORLENS_BINDING_MANIFEST_OK,
++        rotorlensBindingManifestEncodeRowsV1(
++            canonicalValues, sizeof(canonicalValues), hashWriter, &writerState));
++
++    EXPECT_EQ(ROTORLENS_BINDING_MANIFEST_ROW_COUNT, writerState.callCount);
++    EXPECT_EQ(ROTORLENS_BINDING_MANIFEST_ROW_TLV_SIZE, writerState.acceptedLength);
++    EXPECT_EQ(ROTORLENS_BINDING_MANIFEST_MAX_ROW_WRITE_SIZE,
++        writerState.maximumWriteLength);
++
++    static const uint8_t expectedFirstRow[] = { 0x00, 0x01, 0x02, 0x01, 0x05 };
++    static const uint8_t expectedLastRow[] = { 0x00, 0x5a, 0x05, 0x02, 0xe5, 0x83 };
++    ASSERT_EQ(sizeof(expectedFirstRow), writerState.firstRowLength);
++    ASSERT_EQ(sizeof(expectedLastRow), writerState.lastRowLength);
++    EXPECT_EQ(0, memcmp(expectedFirstRow, writerState.firstRow, sizeof(expectedFirstRow)));
++    EXPECT_EQ(0, memcmp(expectedLastRow, writerState.lastRow, sizeof(expectedLastRow)));
++
++    sha256Final(&writerState.sha256, digest);
++    expectDigestEquals(rowTlvDigest, digest);
++}
++
++TEST(RotorlensBindingManifestUnittest, RejectsMalformedSnapshotsBeforeWriting)
++{
++    countWriterState_t writerState = {};
++    EXPECT_EQ(
++        ROTORLENS_BINDING_MANIFEST_INVALID_ARGUMENT,
++        rotorlensBindingManifestEncodeRowsV1(
++            nullptr, sizeof(canonicalValues), countWriter, &writerState));
++    EXPECT_EQ(
++        ROTORLENS_BINDING_MANIFEST_INVALID_ARGUMENT,
++        rotorlensBindingManifestEncodeRowsV1(
++            canonicalValues, sizeof(canonicalValues), nullptr, &writerState));
++    EXPECT_EQ(
++        ROTORLENS_BINDING_MANIFEST_INVALID_LENGTH,
++        rotorlensBindingManifestEncodeRowsV1(
++            canonicalValues, sizeof(canonicalValues) - 1, countWriter, &writerState));
++    EXPECT_EQ(
++        ROTORLENS_BINDING_MANIFEST_INVALID_LENGTH,
++        rotorlensBindingManifestEncodeRowsV1(
++            canonicalValues, sizeof(canonicalValues) + 1, countWriter, &writerState));
++
++    EXPECT_EQ(0u, writerState.callCount);
++    EXPECT_EQ(0u, writerState.acceptedLength);
++}
++
++TEST(RotorlensBindingManifestUnittest, ValidatesEveryRowAgainstIndependentScalarOracle)
++{
++    for (size_t index = 0;
++         index < sizeof(scalarOracle) / sizeof(scalarOracle[0]);
++         index++) {
++        const scalarOracleRow_t &row = scalarOracle[index];
++        const unsigned fieldId = (unsigned)index + 1;
++        SCOPED_TRACE(fieldId);
++        uint8_t values[sizeof(canonicalValues)];
++
++        prepareScalarOracleValues(values, fieldId);
++        setScalarBe(values, row.offset, row.width, row.minimum);
++        expectAcceptedWithoutMutation(values);
++
++        prepareScalarOracleValues(values, fieldId);
++        setScalarBe(values, row.offset, row.width, row.maximum);
++        expectAcceptedWithoutMutation(values);
++
++        const int32_t storageMinimum = row.type == ROTORLENS_BINDING_SCALAR_I16
++            ? -32768
++            : 0;
++        const int32_t storageMaximum = row.type == ROTORLENS_BINDING_SCALAR_I16
++            ? 32767
++            : (row.width == 1 ? 255 : 65535);
++
++        if (row.minimum > storageMinimum) {
++            prepareScalarOracleValues(values, fieldId);
++            setScalarBe(values, row.offset, row.width, row.minimum - 1);
++            expectRejectedBeforeWriting(values);
++        }
++        if (row.maximum < storageMaximum) {
++            prepareScalarOracleValues(values, fieldId);
++            setScalarBe(values, row.offset, row.width, row.maximum + 1);
++            expectRejectedBeforeWriting(values);
++        }
++    }
++}
++
++TEST(RotorlensBindingManifestUnittest, AcceptsLoadBearingScalarEndpoints)
++{
++    uint8_t values[sizeof(canonicalValues)];
++    memcpy(values, canonicalValues, sizeof(values));
++
++    values[0] = 6;       // rates_type maximum
++    values[1] = 1;       // roll_rc_rate minimum
++    values[2] = 100;     // roll_expo maximum
++    values[3] = 100;     // Rotorflight srate limit
++    setScalarBe(values, 4, 2, 0);
++    values[6] = 0;
++    values[7] = 200;
++    values[8] = 0;
++    values[9] = 100;
++    setScalarBe(values, 10, 2, 50000);
++    values[12] = 250;
++    values[13] = 200;
++    values[14] = 100;
++    values[15] = 100;
++    values[19] = 255;    // Collective is not rate-type clamped in RF 4.6.
++    values[20] = 100;
++    values[21] = 255;
++    values[28] = 0;      // Full-domain u8 endpoints.
++    values[29] = 255;
++    values[40] = 1;
++    values[41] = 4;
++    values[42] = 2;
++    setScalarBe(values, 43, 2, 0);
++    setScalarBe(values, 45, 2, 600);
++    values[53] = 0;
++    values[54] = 250;
++    values[55] = 100;
++    values[56] = 0;
++    values[57] = 250;
++    values[67] = 0;
++    values[71] = 250;
++    values[72] = 0;
++    values[75] = 1;
++    setScalarBe(values, 76, 2, 50000);
++    values[78] = 0;
++    values[82] = 250;
++    values[83] = 0;
++    values[86] = 100;
++    values[87] = 0;
++    values[91] = 250;
++    values[92] = 100;
++    values[93] = 10;
++    values[94] = 50;
++    values[95] = 40;
++    values[96] = 100;
++    setScalarBe(values, 97, 2, -2500);
++    setScalarBe(values, 99, 2, 2500);
++    setScalarBe(values, 101, 2, 10000);
++
++    expectAcceptedWithoutMutation(values);
++}
++
++TEST(RotorlensBindingManifestUnittest, EnforcesRateTypeLimitsForEveryCyclicAxis)
++{
++    static const uint8_t limits[][2] = {
++        { 255, 90 },
++        { 200, 255 },
++        { 255, 90 },
++        { 200, 200 },
++        { 255, 200 },
++        { 200, 100 },
++    };
++    static const size_t axisOffsets[] = { 1, 7, 13 };
++
++    for (unsigned ratesType = 1; ratesType <= 6; ratesType++) {
++        for (size_t axis = 0; axis < sizeof(axisOffsets) / sizeof(axisOffsets[0]); axis++) {
++            SCOPED_TRACE(ratesType);
++            SCOPED_TRACE(axis);
++            uint8_t values[sizeof(canonicalValues)];
++            memcpy(values, canonicalValues, sizeof(values));
++            values[0] = (uint8_t)ratesType;
++            for (size_t resetAxis = 0;
++                 resetAxis < sizeof(axisOffsets) / sizeof(axisOffsets[0]);
++                 resetAxis++) {
++                values[axisOffsets[resetAxis]] = 1;
++                values[axisOffsets[resetAxis] + 1] = 0;
++                values[axisOffsets[resetAxis] + 2] = 0;
++            }
++
++            const size_t offset = axisOffsets[axis];
++            values[offset] = limits[ratesType - 1][0];
++            values[offset + 1] = 100;
++            values[offset + 2] = limits[ratesType - 1][1];
++            expectAcceptedWithoutMutation(values);
++
++            if (limits[ratesType - 1][0] < 255) {
++                values[offset]++;
++                expectRejectedBeforeWriting(values);
++                values[offset]--;
++            }
++            if (limits[ratesType - 1][1] < 255) {
++                values[offset + 2]++;
++                expectRejectedBeforeWriting(values);
++            }
++        }
++    }
++}
++
++TEST(RotorlensBindingManifestUnittest, EnforcesGovernorConfigCrossFields)
++{
++    uint8_t values[sizeof(canonicalValues)];
++
++    for (uint8_t mode = 0; mode < 3; mode++) {
++        SCOPED_TRACE(mode);
++        memcpy(values, canonicalValues, sizeof(values));
++        values[41] = mode;
++        values[42] = 1;
++        if (mode != 0) {
++            memset(values + 72, 0, 4);
++        }
++        expectRejectedBeforeWriting(values);
++    }
++
++    for (uint8_t mode = 3; mode <= 4; mode++) {
++        SCOPED_TRACE(mode);
++        memcpy(values, canonicalValues, sizeof(values));
++        values[41] = mode;
++        values[42] = 1;
++        expectAcceptedWithoutMutation(values);
++    }
++
++    memcpy(values, canonicalValues, sizeof(values));
++    values[56] = 100;
++    values[57] = 99;
++    expectRejectedBeforeWriting(values);
++
++    memcpy(values, canonicalValues, sizeof(values));
++    values[55] = 10;
++    values[56] = 0;
++    values[57] = 100;
++    expectRejectedBeforeWriting(values);
++    values[56] = 99;
++    values[57] = 99;
++    expectAcceptedWithoutMutation(values);
++
++    values[55] = 26;
++    values[56] = 250;
++    values[57] = 250;
++    expectAcceptedWithoutMutation(values);
++}
++
++TEST(RotorlensBindingManifestUnittest, PreservesGovernorModeOffProfileNuance)
++{
++    for (uint8_t mode = 0; mode <= 4; mode++) {
++        SCOPED_TRACE(mode);
++        uint8_t values[sizeof(canonicalValues)];
++        memcpy(values, canonicalValues, sizeof(values));
++        values[41] = mode;
++        values[42] = 0;
++        memset(values + 72, 1, 4);
++        values[55] = 100;
++        values[92] = 10;
++        values[93] = 100;
++
++        if (mode == 0) {
++            expectAcceptedWithoutMutation(values);
++        } else {
++            expectRejectedBeforeWriting(values);
++        }
++    }
++
++    for (uint8_t mode = 1; mode <= 2; mode++) {
++        for (size_t flagOffset = 72; flagOffset <= 75; flagOffset++) {
++            SCOPED_TRACE(mode);
++            SCOPED_TRACE(flagOffset);
++            uint8_t values[sizeof(canonicalValues)];
++            memcpy(values, canonicalValues, sizeof(values));
++            values[41] = mode;
++            values[42] = 0;
++            memset(values + 72, 0, 4);
++            values[55] = 50;
++            values[92] = 50;
++            values[93] = 50;
++            values[flagOffset] = 1;
++            expectRejectedBeforeWriting(values);
++            values[flagOffset] = 0;
++            expectAcceptedWithoutMutation(values);
++        }
++    }
++
++    for (uint8_t mode = 3; mode <= 4; mode++) {
++        SCOPED_TRACE(mode);
++        uint8_t values[sizeof(canonicalValues)];
++        memcpy(values, canonicalValues, sizeof(values));
++        values[41] = mode;
++        memset(values + 72, 1, 4);
++        values[55] = 50;
++        values[92] = 50;
++        values[93] = 50;
++        expectAcceptedWithoutMutation(values);
++    }
++
++    for (uint8_t mode = 1; mode <= 4; mode++) {
++        SCOPED_TRACE(mode);
++        uint8_t values[sizeof(canonicalValues)];
++        memcpy(values, canonicalValues, sizeof(values));
++        values[41] = mode;
++        values[42] = 0;
++        memset(values + 72, 0, 4);
++        values[55] = 100;
++        values[92] = 99;
++        values[93] = 10;
++        expectRejectedBeforeWriting(values);
++
++        values[55] = 50;
++        values[92] = 50;
++        values[93] = 51;
++        expectRejectedBeforeWriting(values);
++    }
++}
++
++TEST(RotorlensBindingManifestUnittest, EnforcesSignedMixerBoundsAndOrdering)
++{
++    uint8_t values[sizeof(canonicalValues)];
++    memcpy(values, canonicalValues, sizeof(values));
++    setScalarBe(values, 97, 2, -2500);
++    setScalarBe(values, 99, 2, 2500);
++    setScalarBe(values, 101, 2, -10000);
++    expectAcceptedWithoutMutation(values);
++
++    setScalarBe(values, 101, 2, 10000);
++    expectAcceptedWithoutMutation(values);
++
++    setScalarBe(values, 97, 2, 2500);
++    setScalarBe(values, 99, 2, 2499);
++    expectRejectedBeforeWriting(values);
++}
++
++TEST(RotorlensBindingManifestUnittest, RejectsSemanticValuesBeforeWriting)
++{
++    uint8_t invalidValues[sizeof(canonicalValues)];
++    memcpy(invalidValues, canonicalValues, sizeof(invalidValues));
++    invalidValues[0] = 0xff;
++
++    countWriterState_t writerState = {};
++    EXPECT_EQ(
++        ROTORLENS_BINDING_MANIFEST_INVALID_VALUE,
++        rotorlensBindingManifestEncodeRowsV1(
++            invalidValues, sizeof(invalidValues), countWriter, &writerState));
++    EXPECT_EQ(0u, writerState.callCount);
++    EXPECT_EQ(0u, writerState.acceptedLength);
++}
++
++TEST(RotorlensBindingManifestUnittest, WriterFailureRequiresDiscardingPartialSink)
++{
++    hashWriterState_t writerState = {};
++    writerState.failCall = 45;
++    sha256Init(&writerState.sha256);
++
++    EXPECT_EQ(
++        ROTORLENS_BINDING_MANIFEST_WRITE_FAILED,
++        rotorlensBindingManifestEncodeRowsV1(
++            canonicalValues, sizeof(canonicalValues), hashWriter, &writerState));
++    EXPECT_EQ(45u, writerState.callCount);
++    EXPECT_GT(writerState.acceptedLength, 0u);
++    EXPECT_LT(writerState.acceptedLength, ROTORLENS_BINDING_MANIFEST_ROW_TLV_SIZE);
++}
+diff --git a/src/test/unit/rotorlens_config_mutation_epoch_unittest.cc b/src/test/unit/rotorlens_config_mutation_epoch_unittest.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..a95bac4258511709f9a71703f9dc4e711a514677
+--- /dev/null
++++ b/src/test/unit/rotorlens_config_mutation_epoch_unittest.cc
+@@ -0,0 +1,227 @@
++/*
++ * This file is part of Rotorflight.
++ *
++ * Rotorflight is free software. You can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Rotorflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#include <climits>
++#include <cstdint>
++
++#include "gtest/gtest.h"
++
++extern "C" {
++#include "config/rotorlens_config_mutation_epoch.h"
++}
++
++class RotorlensConfigMutationEpochTest : public ::testing::Test {
++protected:
++    void SetUp() override
++    {
++        rotorlensConfigMutationEpochTestReset();
++    }
++};
++
++TEST_F(RotorlensConfigMutationEpochTest, FreshStateIsStable)
++{
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), 0u);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 0u);
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, NoOpMutationAdvancesAndCannotAba)
++{
++    uint32_t previousStableGeneration = rotorlensConfigMutationEpochGeneration();
++
++    for (uint32_t mutation = 0; mutation < 1024; mutation++) {
++        ASSERT_TRUE(rotorlensConfigMutationEpochBegin());
++        EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), previousStableGeneration + 1u);
++        EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 1u);
++
++        ASSERT_TRUE(rotorlensConfigMutationEpochEnd());
++        const uint32_t nextStableGeneration = rotorlensConfigMutationEpochGeneration();
++        EXPECT_EQ(nextStableGeneration, previousStableGeneration + 2u);
++        EXPECT_NE(nextStableGeneration, previousStableGeneration);
++        previousStableGeneration = nextStableGeneration;
++    }
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, NestedBoundariesChangeOnlyOuterGeneration)
++{
++    ASSERT_TRUE(rotorlensConfigMutationEpochBegin());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), 1u);
++
++    ASSERT_TRUE(rotorlensConfigMutationEpochBegin());
++    ASSERT_TRUE(rotorlensConfigMutationEpochBegin());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), 1u);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 3u);
++
++    ASSERT_TRUE(rotorlensConfigMutationEpochEnd());
++    ASSERT_TRUE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), 1u);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 1u);
++
++    ASSERT_TRUE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), 2u);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 0u);
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, EveryRepresentableNestedDepthThenOverflowFaults)
++{
++    ASSERT_TRUE(rotorlensConfigMutationEpochBegin());
++    for (uint32_t depth = 2; depth <= static_cast<uint32_t>(UINT16_MAX); depth++) {
++        ASSERT_TRUE(rotorlensConfigMutationEpochBegin()) << "depth " << depth;
++    }
++
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), UINT16_MAX);
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), 1u);
++    EXPECT_FALSE(rotorlensConfigMutationEpochBegin());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 0u);
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, GenerationSaturatesWithoutWrapping)
++{
++    rotorlensConfigMutationEpochTestSeed(UINT32_MAX - 3u, 0);
++    ASSERT_TRUE(rotorlensConfigMutationEpochBegin());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX - 2u);
++    ASSERT_TRUE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX - 1u);
++
++    EXPECT_FALSE(rotorlensConfigMutationEpochBegin());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 0u);
++
++    EXPECT_FALSE(rotorlensConfigMutationEpochBegin());
++    EXPECT_FALSE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, LastActiveGenerationCanCloseButNotRestart)
++{
++    rotorlensConfigMutationEpochTestSeed(UINT32_MAX - 2u, 1);
++    ASSERT_TRUE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX - 1u);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 0u);
++
++    EXPECT_FALSE(rotorlensConfigMutationEpochBegin());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, UnmatchedEndLatchesPermanentFault)
++{
++    EXPECT_FALSE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++
++    EXPECT_FALSE(rotorlensConfigMutationEpochBegin());
++    EXPECT_FALSE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, ImpossibleStateShapesLatchFault)
++{
++    rotorlensConfigMutationEpochTestSeed(2u, 1u);
++    EXPECT_FALSE(rotorlensConfigMutationEpochBegin());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++
++    rotorlensConfigMutationEpochTestReset();
++    rotorlensConfigMutationEpochTestSeed(3u, 0u);
++    EXPECT_FALSE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, InterruptContextBeginLatchesFaultAndPreservesPrimask)
++{
++    rotorlensConfigMutationEpochTestSetInterruptContext(true);
++    rotorlensConfigMutationEpochTestSetPrimask(true);
++
++    EXPECT_FALSE(rotorlensConfigMutationEpochBegin());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 0u);
++    EXPECT_TRUE(rotorlensConfigMutationEpochTestPrimask());
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, InterruptContextEndLatchesFaultAndPreservesPrimask)
++{
++    rotorlensConfigMutationEpochTestSeed(1u, 1u);
++    rotorlensConfigMutationEpochTestSetInterruptContext(true);
++
++    EXPECT_FALSE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 0u);
++    EXPECT_FALSE(rotorlensConfigMutationEpochTestPrimask());
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, StickyFaultSurvivesStaleTaskWritesAfterInterrupt)
++{
++    rotorlensConfigMutationEpochTestClearInstrumentation();
++    rotorlensConfigMutationEpochTestInjectInterruptFaultAfterStateRead();
++
++    EXPECT_FALSE(rotorlensConfigMutationEpochBegin());
++    EXPECT_EQ(rotorlensConfigMutationEpochTestStateWriteCount(), 8u);
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 0u);
++    EXPECT_FALSE(rotorlensConfigMutationEpochBegin());
++    EXPECT_FALSE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++
++    rotorlensConfigMutationEpochTestReset();
++    ASSERT_TRUE(rotorlensConfigMutationEpochBegin());
++    rotorlensConfigMutationEpochTestClearInstrumentation();
++    rotorlensConfigMutationEpochTestInjectInterruptFaultAfterStateRead();
++
++    EXPECT_FALSE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochTestStateWriteCount(), 8u);
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestDepth(), 0u);
++    EXPECT_FALSE(rotorlensConfigMutationEpochBegin());
++    EXPECT_FALSE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, TaskCallsPreserveInitiallyDisabledPrimask)
++{
++    rotorlensConfigMutationEpochTestSetPrimask(true);
++
++    ASSERT_TRUE(rotorlensConfigMutationEpochBegin());
++    EXPECT_TRUE(rotorlensConfigMutationEpochTestPrimask());
++    ASSERT_TRUE(rotorlensConfigMutationEpochEnd());
++    EXPECT_TRUE(rotorlensConfigMutationEpochTestPrimask());
++
++    EXPECT_FALSE(rotorlensConfigMutationEpochEnd());
++    EXPECT_TRUE(rotorlensConfigMutationEpochTestPrimask());
++    EXPECT_EQ(rotorlensConfigMutationEpochGeneration(), UINT32_MAX);
++}
++
++TEST_F(RotorlensConfigMutationEpochTest, StateWritesAreMaskedAndPublished)
++{
++    rotorlensConfigMutationEpochTestClearInstrumentation();
++    ASSERT_TRUE(rotorlensConfigMutationEpochBegin());
++    EXPECT_EQ(rotorlensConfigMutationEpochTestStateWriteCount(), 2u);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestBarrierCount(), 1u);
++    EXPECT_FALSE(rotorlensConfigMutationEpochTestHadUnprotectedStateWrite());
++    EXPECT_TRUE(rotorlensConfigMutationEpochTestLastStateWriteWasPublished());
++
++    rotorlensConfigMutationEpochTestClearInstrumentation();
++    ASSERT_TRUE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochTestStateWriteCount(), 2u);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestBarrierCount(), 2u);
++    EXPECT_FALSE(rotorlensConfigMutationEpochTestHadUnprotectedStateWrite());
++    EXPECT_TRUE(rotorlensConfigMutationEpochTestLastStateWriteWasPublished());
++
++    rotorlensConfigMutationEpochTestClearInstrumentation();
++    EXPECT_FALSE(rotorlensConfigMutationEpochEnd());
++    EXPECT_EQ(rotorlensConfigMutationEpochTestStateWriteCount(), 3u);
++    EXPECT_EQ(rotorlensConfigMutationEpochTestBarrierCount(), 2u);
++    EXPECT_FALSE(rotorlensConfigMutationEpochTestHadUnprotectedStateWrite());
++    EXPECT_TRUE(rotorlensConfigMutationEpochTestLastStateWriteWasPublished());
++}
+diff --git a/src/test/unit/sha256_unittest.cc b/src/test/unit/sha256_unittest.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..29a13f2f7911d06aebbe0034fb98504f3a77740c
+--- /dev/null
++++ b/src/test/unit/sha256_unittest.cc
+@@ -0,0 +1,197 @@
++/*
++ * This file is part of Rotorflight.
++ *
++ * Rotorflight is free software. You can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Rotorflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software. If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#include <stdint.h>
++
++extern "C" {
++    #include "common/sha256.h"
++}
++
++#include "unittest_macros.h"
++#include "gtest/gtest.h"
++
++static void expectDigestEquals(
++    const uint8_t expected[SHA256_DIGEST_SIZE],
++    const uint8_t actual[SHA256_DIGEST_SIZE])
++{
++    for (unsigned i = 0; i < SHA256_DIGEST_SIZE; i++) {
++        EXPECT_EQ(expected[i], actual[i]) << "digest byte " << i;
++    }
++}
++
++TEST(Sha256Unittest, NistVectors)
++{
++    static const uint8_t emptyExpected[SHA256_DIGEST_SIZE] = {
++        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
++        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
++        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
++        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
++    };
++    static const uint8_t abcExpected[SHA256_DIGEST_SIZE] = {
++        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
++        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
++        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
++        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
++    };
++    static const uint8_t abc[] = { 'a', 'b', 'c' };
++
++    sha256Context_t context;
++    uint8_t digest[SHA256_DIGEST_SIZE];
++
++    sha256Init(&context);
++    sha256Final(&context, digest);
++    expectDigestEquals(emptyExpected, digest);
++
++    sha256Init(&context);
++    sha256Update(&context, abc, sizeof(abc));
++    sha256Final(&context, digest);
++    expectDigestEquals(abcExpected, digest);
++}
++
++TEST(Sha256Unittest, ZeroLengthNullUpdatePreservesPartialState)
++{
++    static const uint8_t expected[SHA256_DIGEST_SIZE] = {
++        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
++        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
++        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
++        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
++    };
++    static const uint8_t first[] = { 'a' };
++    static const uint8_t remainder[] = { 'b', 'c' };
++
++    sha256Context_t context;
++    sha256Init(&context);
++    sha256Update(&context, first, sizeof(first));
++    sha256Update(&context, nullptr, 0);
++    sha256Update(&context, remainder, sizeof(remainder));
++
++    uint8_t digest[SHA256_DIGEST_SIZE];
++    sha256Final(&context, digest);
++    expectDigestEquals(expected, digest);
++}
++
++TEST(Sha256Unittest, PaddingBoundariesAreChunkInvariant)
++{
++    struct boundaryVector_t {
++        size_t length;
++        uint8_t expected[SHA256_DIGEST_SIZE];
++    };
++    static const boundaryVector_t vectors[] = {
++        { 55, {
++            0x46, 0x3e, 0xb2, 0x8e, 0x72, 0xf8, 0x2e, 0x0a,
++            0x96, 0xc0, 0xa4, 0xcc, 0x53, 0x69, 0x0c, 0x57,
++            0x12, 0x81, 0x13, 0x1f, 0x67, 0x2a, 0xa2, 0x29,
++            0xe0, 0xd4, 0x5a, 0xe5, 0x9b, 0x59, 0x8b, 0x59,
++        } },
++        { 56, {
++            0xda, 0x2a, 0xe4, 0xd6, 0xb3, 0x67, 0x48, 0xf2,
++            0xa3, 0x18, 0xf2, 0x3e, 0x7a, 0xb1, 0xdf, 0xdf,
++            0x45, 0xac, 0xdc, 0x9d, 0x04, 0x9b, 0xd8, 0x0e,
++            0x59, 0xde, 0x82, 0xa6, 0x08, 0x95, 0xf5, 0x62,
++        } },
++        { 63, {
++            0x29, 0xaf, 0x26, 0x86, 0xfd, 0x53, 0x37, 0x4a,
++            0x36, 0xb0, 0x84, 0x66, 0x94, 0xcc, 0x34, 0x21,
++            0x77, 0xe4, 0x28, 0xd1, 0x64, 0x75, 0x15, 0xf0,
++            0x78, 0x78, 0x4d, 0x69, 0xcd, 0xb9, 0xe4, 0x88,
++        } },
++        { 64, {
++            0xfd, 0xea, 0xb9, 0xac, 0xf3, 0x71, 0x03, 0x62,
++            0xbd, 0x26, 0x58, 0xcd, 0xc9, 0xa2, 0x9e, 0x8f,
++            0x9c, 0x75, 0x7f, 0xcf, 0x98, 0x11, 0x60, 0x3a,
++            0x8c, 0x44, 0x7c, 0xd1, 0xd9, 0x15, 0x11, 0x08,
++        } },
++        { 65, {
++            0x4b, 0xfd, 0x2c, 0x8b, 0x6f, 0x1e, 0xec, 0x7a,
++            0x2a, 0xfe, 0xb4, 0x8b, 0x93, 0x4e, 0xe4, 0xb2,
++            0x69, 0x41, 0x82, 0x02, 0x7e, 0x6d, 0x0f, 0xc0,
++            0x75, 0x07, 0x4f, 0x2f, 0xab, 0xb3, 0x17, 0x81,
++        } },
++    };
++    uint8_t input[65];
++    for (unsigned i = 0; i < sizeof(input); i++) {
++        input[i] = (uint8_t)i;
++    }
++
++    for (unsigned i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++) {
++        const boundaryVector_t &vector = vectors[i];
++        SCOPED_TRACE(vector.length);
++
++        sha256Context_t context;
++        uint8_t digest[SHA256_DIGEST_SIZE];
++
++        sha256Init(&context);
++        sha256Update(&context, input, vector.length);
++        sha256Final(&context, digest);
++        expectDigestEquals(vector.expected, digest);
++
++        sha256Init(&context);
++        size_t offset = 0;
++        while (offset < vector.length) {
++            size_t chunkLength = (offset % 11) + 1;
++            if (chunkLength > vector.length - offset) {
++                chunkLength = vector.length - offset;
++            }
++            sha256Update(&context, input + offset, chunkLength);
++            offset += chunkLength;
++        }
++        sha256Final(&context, digest);
++        expectDigestEquals(vector.expected, digest);
++    }
++}
++
++TEST(Sha256Unittest, RotorLensBindingV1CanonicalVector)
++{
++    // Exact canonical preimage from RotorLens CONFIG_FLIGHT_BINDING_PROTOCOL.md.
++    static const uint8_t preimage[] = {
++        0x52, 0x6f, 0x74, 0x6f, 0x72, 0x4c, 0x65, 0x6e, 0x73, 0x20, 0x62, 0x69,
++        0x6e, 0x64, 0x69, 0x6e, 0x67, 0x20, 0x76, 0x31, 0x00, 0x01, 0x01, 0x00,
++        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
++        0x0d, 0x0e, 0x0f, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
++        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x09,
++        0x53, 0x54, 0x4d, 0x33, 0x32, 0x46, 0x37, 0x58, 0x32, 0x1b, 0x72, 0x6f,
++        0x74, 0x6f, 0x72, 0x6c, 0x65, 0x6e, 0x73, 0x2d, 0x62, 0x69, 0x6e, 0x64,
++        0x69, 0x6e, 0x67, 0x2d, 0x76, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x2d, 0x76,
++        0x31, 0x02, 0x04, 0x00, 0x06, 0x00, 0x01, 0x01, 0x01, 0x01, 0x00, 0x02,
++        0x02, 0x01, 0x06, 0x00, 0x03, 0x03, 0x02, 0x05, 0xdc, 0x00, 0x04, 0x04,
++        0x04, 0x00, 0x03, 0x0d, 0x40, 0x00, 0x05, 0x05, 0x02, 0xff, 0x88, 0x00,
++        0x06, 0x06, 0x04, 0xff, 0xff, 0x3c, 0xb0,
++    };
++    static const uint8_t expected[SHA256_DIGEST_SIZE] = {
++        0xfb, 0x7e, 0xef, 0x68, 0xa7, 0xf7, 0xb6, 0x89,
++        0x17, 0x65, 0x77, 0x26, 0xb3, 0x71, 0x29, 0xbb,
++        0xda, 0xbc, 0x37, 0x08, 0x80, 0x98, 0xeb, 0x1b,
++        0xf1, 0xcf, 0xf6, 0xe1, 0xb6, 0x3a, 0xe4, 0x94,
++    };
++    static const uint8_t chunkLengths[] = { 1, 19, 44, 3, 64, 8 };
++
++    sha256Context_t context;
++    sha256Init(&context);
++
++    size_t offset = 0;
++    for (unsigned i = 0; i < sizeof(chunkLengths); i++) {
++        const size_t chunkLength = chunkLengths[i];
++        ASSERT_LE(offset + chunkLength, sizeof(preimage));
++        sha256Update(&context, preimage + offset, chunkLength);
++        offset += chunkLength;
++    }
++    ASSERT_EQ(sizeof(preimage), offset);
++
++    uint8_t digest[SHA256_DIGEST_SIZE];
++    sha256Final(&context, digest);
++    expectDigestEquals(expected, digest);
++}

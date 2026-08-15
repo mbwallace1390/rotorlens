@@ -1,0 +1,60 @@
+version = 1
+
+# First-party project files that cannot consistently carry an inline comment
+# header (JSON, HTML, generated fixtures, platform resources, and documentation)
+# inherit this file-level MPL declaration. A closer inline SPDX declaration wins.
+[[annotations]]
+path = [
+  ".claude/**/*.md",
+  ".github/**/*.yml",
+  ".github/**/*.yaml",
+  ".github/CODEOWNERS",
+  ".github/pull_request_template.md",
+  "AUTHORS.md",
+  "CITATION.cff",
+  "CLAUDE.md",
+  "CONTRIBUTING.md",
+  "GOVERNANCE.md",
+  "NOTICE",
+  "README.md",
+  "SECURITY.md",
+  "SUPPORT.md",
+  "TRADEMARKS.md",
+  "android/app/**",
+  "android/build.gradle.kts",
+  "android/gradle.properties",
+  "android/gradle/gradle-daemon-jvm.properties",
+  "android/gradle/verification-metadata.xml",
+  "android/README.md",
+  "android/settings.gradle.kts",
+  "android/shipping-dependencies.json",
+  "bin/**",
+  "config/*.json",
+  "dist/**",
+  "docs/**",
+  "fixtures/synthetic/**",
+  "ios/**",
+  "package.json",
+  "package-lock.json",
+  "src/**",
+  "test/**",
+  "tools/**",
+  "ui/app.mjs",
+  "ui/host.mjs",
+  "ui/index.html",
+  "ui/legal-data.mjs",
+  "ui/legal.mjs"
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Michael Wallace and contributors to RotorLens"
+SPDX-License-Identifier = "MPL-2.0"
+
+# The adapted governance document declares its own non-MPL boundary in-file.
+[[annotations]]
+path = "CODE_OF_CONDUCT.md"
+precedence = "override"
+SPDX-FileCopyrightText = [
+  "2014 Coraline Ada Ehmke and Contributor Covenant contributors",
+  "2026 Michael Wallace and contributors to RotorLens"
+]
+SPDX-License-Identifier = "CC-BY-4.0"

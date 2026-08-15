@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What may leave this device: nothing.
+
+  android:allowBackup="false" is not enough on its own any more, and the gap is
+  exactly the kind that stays invisible because no code changes when it opens.
+  For apps targeting Android 12 (API 31) or higher, Android's own Auto Backup
+  documentation says that on devices from some manufacturers allowBackup="false"
+  disables cloud backup but does NOT disable device-to-device transfer, and that
+  when no <device-transfer> section is declared "all the application data will be
+  transferred during a D2D migration". This app targets 36.
+
+  The flight history lives in getFilesDir()/flight-history.json (HistoryStore.java).
+  Without the section below, setting up a new phone from this one would copy it
+  across — and docs/STORE_LISTING.md, the generated in-app disclaimer and
+  docs/PRIVACY_POLICY.md all say "Nothing leaves your phone". A phone migration is
+  a thing the owner does, not an attack, so the sentence has to be true through it.
+
+  Both sections exclude everything rather than naming the history file. An
+  allowlist that named one file would have to be revisited every time the app
+  stored something new, and the whole point is that there is nothing here worth
+  moving to another device: the imported log is cache and is purged, and the
+  history is a summary the pilot can rebuild by re-importing.
+
+  Rule semantics, because they are easy to get backwards: a section containing
+  only <exclude> rules excludes those and INCLUDES everything else. So each domain
+  has to be named. The device_* domains are the device-protected (direct-boot)
+  copies of the same directories; this app writes to neither today, and listing
+  them means a future direct-boot-aware write does not silently become copyable.
+
+  Below API 31 this file is ignored and android:allowBackup="false" governs, which
+  on those releases disables both backup and transfer. minSdk is 26, so the two
+  mechanisms together cover the whole supported range.
+-->
+<data-extraction-rules>
+
+    <!-- Google Drive / cloud backup. Belt to allowBackup="false"'s braces. -->
+    <cloud-backup>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+        <exclude domain="device_root" path="." />
+        <exclude domain="device_file" path="." />
+        <exclude domain="device_database" path="." />
+        <exclude domain="device_sharedpref" path="." />
+    </cloud-backup>
+
+    <!-- Phone-to-phone migration. This is the one allowBackup does not cover. -->
+    <device-transfer>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+        <exclude domain="device_root" path="." />
+        <exclude domain="device_file" path="." />
+        <exclude domain="device_database" path="." />
+        <exclude domain="device_sharedpref" path="." />
+    </device-transfer>
+
+</data-extraction-rules>

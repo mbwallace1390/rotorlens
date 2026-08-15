@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright 2026 Michael Wallace and contributors.
+#
+# Generate with the exact XcodeGen release in .xcodegen-version. The generated
+# project is intentionally not checked in; project.yml is the source of truth.
+
+name: RotorLens
+
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "16.0"
+
+fileGroups:
+  - ../LICENSE
+  - ../NOTICE
+  - ../docs/IOS_PORT.md
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+
+targets:
+  RotorLens:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: RotorLens
+        excludes:
+          - Info.plist
+          # XcodeGen intentionally assigns .xcprivacy no default phase; add the
+          # manifest explicitly below so it reaches the app bundle once.
+          - PrivacyInfo.xcprivacy
+      - path: RotorLens/Info.plist
+        buildPhase: none
+      - path: RotorLens/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      # Blue folder references make Copy Bundle Resources preserve the exact
+      # /ui and /src paths required by the ES-module import graph.
+      - path: ../ui
+        type: folder
+        buildPhase: resources
+      - path: ../src
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.rotorlens
+        PRODUCT_NAME: RotorLens
+        INFOPLIST_FILE: RotorLens/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: 0.1.0
+        CODE_SIGN_STYLE: Automatic
+    scheme:
+      gatherCoverageData: true
+      testTargets:
+        - RotorLensTests
+
+  RotorLensTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: RotorLensTests
+    dependencies:
+      - target: RotorLens
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.rotorlens.tests
+        GENERATE_INFOPLIST_FILE: YES

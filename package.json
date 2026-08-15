@@ -1,0 +1,43 @@
+{
+  "name": "rotorlens",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open-source mobile Rotorflight flight-log analysis and tuning advice",
+  "license": "MPL-2.0",
+  "author": {
+    "name": "Michael Wallace",
+    "url": "https://github.com/mbwallace1390"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mbwallace1390/rotorlens.git"
+  },
+  "homepage": "https://github.com/mbwallace1390/rotorlens#readme",
+  "bugs": {
+    "url": "https://github.com/mbwallace1390/rotorlens/issues"
+  },
+  "rotorlens": {
+    "releaseStatus": "development",
+    "sourceRef": null
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "ui": "node ./tools/serve-ui.mjs",
+    "build:advisor-bundle": "node ./tools/build-advisor-bundle.mjs",
+    "fixtures:generate": "node ./tools/generate-fixtures.mjs",
+    "legal:generate": "node ./tools/generate-legal.mjs",
+    "privacy:generate": "node ./tools/generate-privacy-page.mjs",
+    "inspect:fixture": "node ./bin/inspect-fixture.mjs",
+    "verify:log": "node ./bin/verify-log.mjs",
+    "corpus:report": "node ./tools/corpus-report.mjs",
+    "community:model": "node ./tools/build-community-model.mjs",
+    "check:donation": "node ./tools/check-donation.mjs",
+    "check:android-manifest": "node ./tools/check-android-manifest.mjs",
+    "check:dco": "node ./tools/check-dco.mjs",
+    "check:syntax": "node ./tools/check-syntax.mjs",
+    "test": "node --test"
+  }
+}
