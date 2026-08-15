@@ -1,8 +1,6 @@
 # RotorLens CI
 #
-# Six jobs, run on pushes to main, every pull request and on manual dispatch.
-# Feature branches are verified by their pull request so one commit does not
-# create a duplicate push run that gets cancelled and leaves false-red checks.
+# Six jobs, run on every push, every pull request and on manual dispatch.
 #
 # The compliance job is the one that earns its keep. `provenance`,
 # `privacy-claims`, `legal-disclaimer` and `check-donation` encode promises made
@@ -21,8 +19,6 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
 
@@ -31,11 +27,12 @@ on:
 permissions:
   contents: read
 
-# A second push to the same branch retires the first run rather than queueing
-# behind it. Private-repo Actions minutes are finite and the browser tests are
-# not fast.
+# A second event of the same kind on the same branch retires the first run
+# rather than queueing behind it. Keep push and pull-request groups distinct:
+# opening a PR for a just-pushed commit must not cancel either proof and leave
+# false-red checks attached to the commit.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
