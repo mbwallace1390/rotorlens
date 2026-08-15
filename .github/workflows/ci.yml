@@ -1,6 +1,8 @@
 # RotorLens CI
 #
-# Six jobs, run on every push, every pull request and on manual dispatch.
+# Six jobs, run on pushes to main, every pull request and on manual dispatch.
+# Feature branches are verified by their pull request so one commit does not
+# create a duplicate push run that gets cancelled and leaves false-red checks.
 #
 # The compliance job is the one that earns its keep. `provenance`,
 # `privacy-claims`, `legal-disclaimer` and `check-donation` encode promises made
@@ -19,6 +21,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
