@@ -337,6 +337,45 @@ model release, or privacy obligations a thirty-line feature.
 Whatever receives it, the write path must be **append-only for clients**. A client
 that can read the corpus can enumerate other people's aircraft.
 
+### The Firebase emulator stop
+
+`backend/firebase/` now implements the next boundary as a local Emulator Suite
+proof, using only the reserved `demo-rotorlens` project id. It has no
+`.firebaserc`, credentials, deploy command, Firebase account binding, mobile SDK,
+app caller, or Android `INTERNET` permission. The exported callables require App
+Check, the Functions emulator, the exact demo project, and the loopback
+Firestore emulator. An accidental cloud deployment or a Functions-only emulator
+remains closed.
+
+Submission is intentionally **zero-write**. The endpoint applies the canonical
+community audit and checks a separate exact-pair terms receipt, but the only
+registered terms are still engineering drafts. A well-formed draft therefore
+returns `PRODUCTION_INGESTION_CLOSED`, malformed or invented terms fail closed,
+and privileged emulator inspection proves no document was created. This does
+not turn the draft into consent by calling the destination quarantine.
+
+The emulator tests seed synthetic records through the Admin test boundary only
+to prove deletion and statistics mechanics. Deletion requires a separate
+256-bit capability, gives unknown aircraft and wrong capabilities the same
+answer, removes records and replay claims, and retains a capability-hash
+tombstone so an old retry cannot resurrect an erased aircraft. Direct
+authenticated and unauthenticated Firestore reads and writes are denied.
+
+Public statistics are not a user counter. With no account or analytics,
+installations cannot be equated with people. The callable counts only active,
+validated aircraft and flights, withholds everything below five aircraft, and
+then returns rounded-down lower bounds (5, 10, 25, 50, 100, 250, 500, or 1000).
+Rejected, draft, quarantined, deleted, and test records are not learning data.
+The response remains `closed-no-production-corpus` because there is no accepted
+corpus or model.
+
+The proof has two isolated npm lockfiles because the emulator and Functions
+tooling are not app dependencies. CI starts Firestore and Functions with Node 22
+and Java 21, verifies the blanket-deny rules, hostile input, zero-write
+submission, deletion tombstone, privacy floor, and missing-App-Check refusal,
+then tears the emulators down. A real debug-token test is not device attestation
+proof and belongs to a later, account-backed phase.
+
 ---
 
 ## 7. What this costs, stated plainly

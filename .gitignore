@@ -1,6 +1,9 @@
 # Dependencies and generated output
 node_modules/
 coverage/
+.firebase/
+firebase-debug.log
+firebase-debug.*.log
 dist/*
 # The PID evidence build is a published interchange artifact, not scratch output:
 # the Blackbox viewer consumes this exact file, and a test asserts it matches the

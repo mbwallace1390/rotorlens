@@ -419,10 +419,20 @@ Android shell bundles the permissively licensed components pinned by Gradle;
 in-app Legal screen enumerate the resolved distribution rather than pretending
 the transitive runtime is absent.
 
-Adopting anything requires a license and provenance review, an entry in
-`THIRD_PARTY_NOTICES.md`, and a pin to a full commit hash — never a branch or a
-floating tag. `test/provenance.test.mjs` fails the build if a component is
-adopted without its notice.
+The Firebase emulator proof is intentionally separate. Its two package locks
+live under `backend/firebase/`, its dependencies run only in local development
+and CI, and no Firebase module is reachable from the shared engine or either
+mobile shell. The Functions adapter is emulator-latched and submission remains
+zero-write while production terms and complete configuration evidence are
+absent. This is backend architecture evidence, not a deployed service or a
+change to the application's no-upload behavior.
+
+Adopting anything requires a license and provenance review plus an entry in
+`THIRD_PARTY_NOTICES.md`. Source integrations pin a full commit hash; package
+dependencies pin an exact version and a committed integrity-bearing lock graph.
+Neither boundary may rely on a branch, range, or floating tag.
+`test/provenance.test.mjs` fails the build if a component is adopted without its
+notice.
 
 ## Safety boundary
 

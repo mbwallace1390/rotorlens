@@ -230,6 +230,33 @@ Each entry states which boundary applies.
   it in the app's legal screen, which is how the Apache-2.0 section 4 duty to
   hand every recipient the license text is discharged.
 
+## Non-shipping Firebase emulator and Functions tooling
+
+`backend/firebase/` is a separate local/CI dependency boundary. None of these
+packages is imported by `src/`, `ui/`, Android, or iOS, and none is packaged in
+the application. The two committed lockfiles are the authority for their full
+transitive build/test graphs.
+
+- **Firebase CLI** `firebase-tools` 15.27.0 —
+  <https://github.com/firebase/firebase-tools/tree/v15.27.0> — MIT —
+  Copyright (c) 2015 Firebase.
+- **Firebase JavaScript SDK** `firebase` 12.17.1 and
+  `@firebase/rules-unit-testing` 5.0.1 —
+  <https://github.com/firebase/firebase-js-sdk> — Apache-2.0.
+- **Firebase Admin Node.js SDK** `firebase-admin` 14.2.0 —
+  <https://github.com/firebase/firebase-admin-node/releases/tag/v14.2.0> —
+  Apache-2.0.
+- **Cloud Functions for Firebase SDK** `firebase-functions` 7.3.2 —
+  <https://github.com/firebase/firebase-functions/releases/tag/v7.3.2> — MIT —
+  Copyright (c) 2017 Firebase.
+
+The complete Apache-2.0 text is committed at
+`config/licenses/apache-2.0.txt`. The two MIT packages carry the standard MIT
+permission, notice-retention, no-warranty, and liability-disclaimer terms with
+the copyright lines above. These tools are fetched only to run a local demo
+project and CI; there is no Firebase project selection, login, deployment, or
+mobile runtime dependency in this phase.
+
 ## The decoder is ours
 
 `src/blackbox/` is RotorLens' own Blackbox decoder, written from the log format.

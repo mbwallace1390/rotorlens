@@ -1,0 +1,21 @@
+{
+  "name": "@rotorlens/firebase-emulator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-only Firebase emulator proof for the RotorLens community backend",
+  "license": "MPL-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "npm run test:static && npm run test:emulator",
+    "test:static": "node --test emulator-tests/static-contract.mjs",
+    "test:emulator": "node scripts/run-emulator-tests.mjs"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "5.0.1",
+    "firebase": "12.17.1",
+    "firebase-tools": "15.27.0"
+  }
+}
