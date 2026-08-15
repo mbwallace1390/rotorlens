@@ -15,3 +15,19 @@ updates:
     groups:
       android-runtime:
         patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /backend/firebase
+    schedule:
+      interval: monthly
+    groups:
+      firebase-emulator:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /backend/firebase/functions
+    schedule:
+      interval: monthly
+    groups:
+      firebase-functions:
+        patterns: ["*"]

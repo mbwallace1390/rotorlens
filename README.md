@@ -67,7 +67,9 @@ adding any dependency, asset, or log file.
 
 ## Run offline
 
-Requirements: Node.js 22 or newer. There are no npm dependencies.
+Requirements: Node.js 22 or newer. The shared/mobile app root has no npm
+dependencies. The optional Firebase emulator proof has its own locked,
+non-shipping dependency boundary under `backend/firebase/`.
 
 ```text
 npm run ui                # open http://127.0.0.1:8173/
@@ -79,6 +81,12 @@ npm run fixtures:generate # regenerate the corpus (must be byte-identical)
 The shell loads `src/` directly as ES modules — the same code the tests run,
 with no second implementation to drift. It needs the dev server rather than
 `file://` because browsers refuse module imports from disk.
+
+The community backend remains local-only and accepts no contribution. Its
+Firestore/Functions proof runs against the reserved `demo-rotorlens` emulator
+project; see [`backend/firebase/README.md`](backend/firebase/README.md). It does
+not select or deploy to the maintainer's Firebase account and adds no app
+network permission or SDK.
 
 Both tools accept a path, so they work on any log you own:
 

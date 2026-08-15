@@ -28,6 +28,7 @@ path = [
   "android/README.md",
   "android/settings.gradle.kts",
   "android/shipping-dependencies.json",
+  "backend/**",
   "bin/**",
   "config/*.json",
   "dist/**",
