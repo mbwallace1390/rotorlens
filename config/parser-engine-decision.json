@@ -1,0 +1,49 @@
+{
+  "decision": "own decoder adopted",
+  "decidedAt": "2026-08-11",
+  "adopted": {
+    "name": "rotorlens-blackbox",
+    "location": "src/blackbox/",
+    "thirdParty": false,
+    "license": "MPL-2.0",
+    "copyright": "Copyright (c) 2026 Michael Wallace",
+    "rationale": "Written from the log format rather than from any existing decoder. There is no third-party decoder attribution or upstream to track, and the helicopter-specific implementation remains ours to extend under MPL-2.0.",
+    "conformance": {
+      "roundTrip": "validated against tools/blackbox-writer.mjs over every encoding and predictor implemented",
+      "realFirmware": "validated locally against private Rotorflight 4.6 firmware logs; the published quantified claim is Rotorflight 4.6.0, one board, one flight, 134429 samples with zero body decode errors; see docs/BLACKBOX_FORMAT_NOTES.md for the exact limits",
+      "assumptions": "docs/BLACKBOX_FORMAT_NOTES.md"
+    }
+  },
+  "rejected": [
+    {
+      "name": "propwash-core",
+      "repository": "https://github.com/Iteratrix/propwash",
+      "license": "MIT",
+      "reason": "Permissive and usable, but multirotor-first: Rotorflight governor, tail, and servo metrics would need independent validation anyway. Adopting it would have added an attribution obligation without removing the work.",
+      "verifiedAt": "2026-08-11"
+    },
+    {
+      "name": "blackbox-log",
+      "repository": "https://github.com/blackbox-log/blackbox-log",
+      "license": "MIT OR Apache-2.0",
+      "reason": "Betaflight/INAV focused; Rotorflight field coverage unverified. Same trade-off as above.",
+      "verifiedAt": "2026-08-11"
+    }
+  ],
+  "excluded": [
+    {
+      "name": "rotorflight-blackbox",
+      "repository": "https://github.com/rotorflight/rotorflight-blackbox",
+      "license": "GPL-3.0",
+      "reason": "Separate GPL implementation intentionally excluded to preserve independent authorship, provenance, and the iOS distribution path; do not copy, port, or link it into the shipped product without a deliberate license review.",
+      "verifiedAt": "2026-08-11"
+    },
+    {
+      "name": "betaflight-blackbox-log-viewer",
+      "repository": "https://github.com/betaflight/blackbox-log-viewer",
+      "license": "GPL-3.0",
+      "reason": "Separate GPL implementation; the same independent-authorship, provenance, and mobile-distribution boundary applies.",
+      "verifiedAt": "2026-08-11"
+    }
+  ]
+}

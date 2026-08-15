@@ -1,0 +1,102 @@
+{
+  "origin": "generated",
+  "generator": "tools/generate-fixtures.mjs",
+  "reproducible": true,
+  "copyright": "Copyright (c) 2026 Michael Wallace",
+  "license": "MPL-2.0",
+  "thirdPartyMaterial": "none",
+  "containsRealFlightData": false,
+  "payloadNote": "Frames are real encoded Blackbox frames written by tools/blackbox-writer.mjs. They validate the decoder against our own encoder, which proves internal consistency but not conformance with flight-controller output. Use `npm run verify:log` against a real log for that.",
+  "fixtures": [
+    {
+      "file": "rf43-single-session.TXT",
+      "description": "One Rotorflight 4.3 session, 320 frames, all encodings exercised.",
+      "byteLength": 11925,
+      "sha256": "ab261110e80cab34a3abd2cee570ca6826cf2938f873809955b0dc813947d1fe"
+    },
+    {
+      "file": "rf46-two-sessions.TXT",
+      "description": "Two concatenated Rotorflight 4.6 sessions with different field data.",
+      "byteLength": 14578,
+      "sha256": "c1866df6b48e0bedf128eae87132ae6d688a31f7473e7dbf2cc15114c0f849cf"
+    },
+    {
+      "file": "rf46-gps-declared.TXT",
+      "description": "Declares a GPS frame group but emits no coordinates.",
+      "byteLength": 4846,
+      "sha256": "a9ffe4bc57e29a1ab927b26f0f006d487b04e646db250dbfd53148d20bda7871"
+    },
+    {
+      "file": "rf46-stop-manoeuvres.TXT",
+      "description": "Twelve deliberate stops — two per direction on roll, pitch and yaw — flown to the gates in STOP_DETECTION_DEFAULTS, at 500 Hz over 18.4 s, carrying a known directional asymmetry in tracking error and post-release ringing.",
+      "byteLength": 205450,
+      "sha256": "d2c4c9948099b5b48df203d819634e510cb12642b0de95a78d8d55f0b7a5441f"
+    },
+    {
+      "file": "rf46-gain-fault.TXT",
+      "description": "The same twelve stops, but symmetric and ringing on: equal tracking error and equal post-release oscillation both ways, an envelope that barely falls across the response window, and a quiet plateau. What too much D looks like, and the only fixture that can put a gain recommendation on a screen.",
+      "byteLength": 455920,
+      "sha256": "d652351cc37ce471d3f1d82b60bfe9b48bbd07dd9a7000643729a0ad3bc3eb26"
+    },
+    {
+      "file": "rf46-p-too-high.TXT",
+      "description": "The gain-fault flight with ONE term changed: the axis also oscillates while the command is held, at half the post-release amplitude. That is what separates too much P from too much D, and it is the only difference between this file and rf46-gain-fault.TXT.",
+      "byteLength": 477301,
+      "sha256": "257630543fa537bd6981d5c75546f72b7f2715df55ae1afac2b8b4ad9832765e"
+    },
+    {
+      "file": "rf46-ringing-source-unknown.TXT",
+      "description": "The same flight with the plateau oscillation at a QUARTER of the ringing — inside the range the stability sweep explores, so the sweep disagrees with itself about whether the axis was already oscillating. The engine must decline rather than pick a side.",
+      "byteLength": 463495,
+      "sha256": "6c886053e4b763fef299c00b3464fc298ec221f165e21b0514a9269fe17c45f2"
+    },
+    {
+      "file": "rf46-governor-droop.TXT",
+      "description": "The gain-fault flight with the head speed sagging 200 rpm under collective and recovering as it comes off. Every other column is identical, so the three gain adjustments it would otherwise earn must be suppressed by the head-speed rung above them and by nothing else.",
+      "byteLength": 455921,
+      "sha256": "2336c1c44cd6b73ea85b1506e159da249a638f2e5172f3b6f878aa2ad08afaab"
+    },
+    {
+      "file": "rf46-tone-off-rotor-order.TXT",
+      "description": "A too-much-D ring at 25 Hz with a persistent 6 deg/s airframe tone at the same frequency, at 2050 rpm — where 25 Hz is on no rotor order. The gain is named.",
+      "byteLength": 456403,
+      "sha256": "8cc7800de2d4f2c39594ec678728bc4357d47e3365ba588f94ed588ee2318efa"
+    },
+    {
+      "file": "rf46-tone-on-rotor-order.TXT",
+      "description": "Its twin at 1500 rpm, where 25 Hz is exactly 1/rev. Every gyro, setpoint and PID sample is identical to rf46-tone-off-rotor-order.TXT; only the head speed differs. The gain must be refused and the coincidence named instead.",
+      "byteLength": 456402,
+      "sha256": "2731664c79ab263b94be836b3ea1c41a373ef5b81331a566271f39a4289de185"
+    },
+    {
+      "file": "rf46-p-too-low.TXT",
+      "description": "A standing rate shortfall of 19% of the commanded rate, no ringing, and a residual in the commanded direction after the release. Too little P, and one gain step from following.",
+      "byteLength": 438932,
+      "sha256": "fbeb0baea51f5728580301640981c7e1d542f270e7a2b24b8c9d260ced5ab089"
+    },
+    {
+      "file": "rf46-travel-limit.TXT",
+      "description": "The same shape short by 50% instead of 19% — past what a gain step can close. What a control at its travel limit looks like from inside a log, and the fixture that stops \"raise P\" being aimed at a mechanical stop.",
+      "byteLength": 439177,
+      "sha256": "689a0c94041af1b6803aa53ddc2c17220c4923c301af394b33ae5e9cf93e4281"
+    },
+    {
+      "file": "rf46-hostile-strings.TXT",
+      "description": "Craft name and firmware revision contain HTML and script; the viewer must render them as text.",
+      "byteLength": 3716,
+      "sha256": "14f7ba274319608a04c53b93c318202a497438a542698d570c1f5784c006be8e"
+    },
+    {
+      "file": "rf46-truncated-header.TXT",
+      "description": "Header block cut mid-line; exercises fail-closed header handling.",
+      "byteLength": 1287,
+      "sha256": "8b887b9672be39f7c0ece0f0072e9ddd058ad6e16da3ed3ee2901e58cdc7a176"
+    },
+    {
+      "file": "rf46-corrupt-frames.TXT",
+      "description": "Valid log with a damaged 64-byte span; exercises resync and error reporting.",
+      "byteLength": 11925,
+      "sha256": "806b74008c647a9c0d7c5d98724048a7c5076fdfdb079be8cc7989ae89b83e3d"
+    }
+  ]
+}

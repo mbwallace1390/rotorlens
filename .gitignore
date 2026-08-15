@@ -1,0 +1,72 @@
+# Dependencies and generated output
+node_modules/
+coverage/
+dist/*
+# The PID evidence build is a published interchange artifact, not scratch output:
+# the Blackbox viewer consumes this exact file, and a test asserts it matches the
+# source. It has to be committed.
+!dist/rotorlens-pid-evidence.js
+!dist/package.json
+target/
+
+# Flight logs and capture directories are private by default. Rotorflight
+# commonly records Blackbox data as .TXT, so text log files are ignored unless
+# they are a specifically reviewed license text or committed synthetic fixture.
+*.[bB][bB][lL]
+*.[bB][fF][lL]
+*.[cC][fF][lL]
+*.[lL][oO][gG]
+*.[tT][xX][tT]
+/captures/
+/flight-logs/
+/logs/
+/fixtures/real/**
+!/fixtures/real/
+!/fixtures/real/README.md
+
+# Reviewed text licenses and generated synthetic fixtures are publishable.
+!/config/licenses/*.txt
+!/integration/rotorflight-firmware/binding-v1/LICENSES/*.txt
+!/fixtures/synthetic/
+!/fixtures/synthetic/**
+
+# Never commit Android or Apple signing keys, provisioning profiles, or local
+# signing configuration.
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.p8
+*.pem
+*.key
+*.mobileprovision
+*.provisionprofile
+**/key.properties
+**/keystore.properties
+**/signing.properties
+**/secrets.properties
+
+# Xcode/Swift output and per-developer state. Shared project/workspace files and
+# Package.resolved remain trackable; only generated products and user state are
+# excluded.
+DerivedData/
+.build/
+xcuserdata/
+*.xcuserstate
+*.ipa
+*.dSYM
+*.dSYM.zip
+.DS_Store
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Android build output, and machine-local paths. local.properties holds an
+# absolute SDK path for whoever opened the project — it must never be committed.
+build/
+.gradle/
+local.properties
+.idea/
+*.iml

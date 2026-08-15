@@ -1,0 +1,14 @@
+# Default review ownership for the official RotorLens repository.
+* @mbwallace1390
+
+# Safety, privacy, licensing, release, and community policy remain explicit.
+/LICENSE @mbwallace1390
+/NOTICE @mbwallace1390
+/TRADEMARKS.md @mbwallace1390
+/SECURITY.md @mbwallace1390
+/GOVERNANCE.md @mbwallace1390
+/.github/ @mbwallace1390
+/docs/PRIVACY_POLICY.md @mbwallace1390
+/docs/COMMUNITY_CONTRIBUTION_TERMS.md @mbwallace1390
+/android/ @mbwallace1390
+/ios/ @mbwallace1390

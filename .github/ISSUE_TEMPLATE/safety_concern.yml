@@ -1,0 +1,54 @@
+name: Safety or analysis concern
+description: Report potentially misleading analysis or advice without publishing sensitive flight data.
+title: "[Safety]: "
+labels:
+  - safety
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this public form for non-exploitable analysis or advice concerns that can be explained with synthetic data. If the issue could be deliberately exploited, bypass a safety gate, expose data, or require confidential details, use GitHub private vulnerability reporting instead.
+
+        **Never post raw flight logs, configuration dumps, GPS/home coordinates, timestamps, serials, device/aircraft/account identifiers, private paths or filenames, credentials, signing material, or personal data.**
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirm before continuing
+      options:
+        - label: I have not included or linked prohibited flight, configuration, location, identifier, credential, or personal data.
+          required: true
+        - label: This concern can be discussed publicly without helping someone bypass a safety or privacy control.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: RotorLens version or commit
+      placeholder: "0.1.0 or abc1234"
+    validations:
+      required: true
+  - type: textarea
+    id: concern
+    attributes:
+      label: Analysis or advice concern
+      description: State the output, why it may be misleading, and the plausible harm.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Synthetic reproduction
+      description: Identify a committed fixture or provide steps to generate the smallest synthetic reproduction.
+    validations:
+      required: true
+  - type: textarea
+    id: safer_behavior
+    attributes:
+      label: Expected safer behavior
+      description: Describe the refusal, uncertainty statement, evidence threshold, or corrected result you expect.
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional public references
+      description: Link specifications or public documentation only; do not link personal logs or configuration files.

@@ -1,0 +1,5 @@
+# Generated locally from project.yml by XcodeGen 2.46.0.
+RotorLens.xcodeproj/
+DerivedData/
+*.xcuserstate
+xcuserdata/

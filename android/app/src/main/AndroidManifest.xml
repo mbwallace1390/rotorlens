@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      This source manifest declares no permissions. AndroidX may add its own
+      package-signature permission to the merged manifest; it is not a sensitive
+      runtime permission and does not grant network access.
+
+      RotorLens needs no INTERNET permission because it never contacts a network:
+      the viewer is served from the APK and the log is decoded on the device. An
+      app that cannot reach the internet cannot upload somebody's flight, and the
+      absence of this line is the strongest form that promise can take.
+    -->
+
+    <!--
+      Nothing leaves the device, including to another device the owner owns.
+
+      android:allowBackup="false" covers cloud backup, and on releases before
+      Android 12 it covered device-to-device transfer as well. It no longer does:
+      for apps targeting API 31+, Android's Auto Backup documentation states that
+      on devices from some manufacturers allowBackup="false" "doesn't disable
+      device-to-device transfers for the app", and that with no <device-transfer>
+      section "all the application data will be transferred during a D2D
+      migration". targetSdk is 36, so this app is squarely in that case.
+
+      That mattered the moment the flight history started living in
+      getFilesDir()/flight-history.json: setting up a new phone from this one
+      would have carried it over, and the store listing, the in-app disclaimer and
+      the privacy policy all say "Nothing leaves your phone". The rules file
+      excludes everything from both cloud backup and device transfer.
+    -->
+
+    <!--
+      USB host, so a flight controller in mass-storage mode can offer to open
+      RotorLens and save the pilot a step. android:required="false" because
+      nothing else in this app needs USB, and a phone without host support must
+      still be able to install it.
+
+      THIS IS A FEATURE, NOT A PERMISSION, and that distinction is exactly the
+      kind of technically-true that lets a safety claim rot, so it is written
+      down rather than left to be discovered. Declaring the USB_DEVICE_ATTACHED
+      filter below grants this app permission to COMMUNICATE with the device that
+      launched it. RotorLens never does, and never should: the log is still
+      chosen by the pilot through the system picker, exactly as before.
+
+      Before this line, "RotorLens never connects to or writes to a flight
+      controller" was true because no USB code existed in the binary. It is still
+      true for the same reason, and test/provenance.test.mjs now asserts the
+      absence rather than trusting it. The day a UsbManager, a UsbDeviceConnection
+      or an MSP command encoder appears, that test fails — and the store listing
+      and the in-app disclaimer have to change with it.
+    -->
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.RotorLens">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+              Opening a log from the mass-storage drive or a file manager. Blackbox
+              logs have no registered MIME type and arrive as octet-stream or
+              text/plain depending on the provider, so the extension is matched.
+            -->
+            <intent-filter android:label="@string/open_with">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="*/*" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.bbl" />
+                <data android:pathPattern=".*\\.BBL" />
+                <data android:pathPattern=".*\\.bfl" />
+                <data android:pathPattern=".*\\.BFL" />
+                <data android:pathPattern=".*\\.txt" />
+                <data android:pathPattern=".*\\.TXT" />
+                <data android:pathPattern=".*\\.log" />
+                <data android:pathPattern=".*\\.LOG" />
+            </intent-filter>
+
+            <!--
+              The same match for a VIEW intent that carries no MIME type.
+
+              A filter declaring any mimeType matches ONLY intents that have one,
+              so the filter above cannot see the typeless intents many file
+              managers send for an extension the system has no mapping for — and
+              .bbl has none. A filter with no mimeType matches only typeless
+              intents, so the two are complementary rather than overlapping.
+
+              android:host="*" is required, not decoration: IntentFilter nests the
+              path test inside the authority branch, so with no host the
+              pathPatterns below would never be evaluated at all.
+            -->
+            <intent-filter android:label="@string/open_with">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.bbl" />
+                <data android:pathPattern=".*\\.BBL" />
+                <data android:pathPattern=".*\\.bfl" />
+                <data android:pathPattern=".*\\.BFL" />
+                <data android:pathPattern=".*\\.txt" />
+                <data android:pathPattern=".*\\.TXT" />
+                <data android:pathPattern=".*\\.log" />
+                <data android:pathPattern=".*\\.LOG" />
+            </intent-filter>
+
+            <!-- Sharing a log into RotorLens from any app. -->
+            <intent-filter android:label="@string/share_to">
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+
+            <!--
+              A flight controller entering mass-storage mode offers to open here.
+
+              The sequence today is: connect the board, open the Rotorflight
+              configurator, tap the mass storage button, leave that app, find
+              RotorLens, open it, pick the file. This removes one of those steps —
+              Android offers RotorLens the moment the board mounts, and the "always"
+              checkbox makes it automatic from then on.
+
+              Matched by device CLASS rather than vendor ID; see
+              res/xml/usb_mass_storage.xml for why. It fires for USB storage
+              generally, which is deliberate: a card reader is the import path for
+              pilots whose controller logs to a removable card rather than to
+              onboard dataflash, and both of the boards this was measured against
+              are dataflash-only.
+
+              This intent carries a UsbDevice and grants permission to talk to it.
+              RotorLens reads neither: handleIntent has no branch for
+              ACTION_USB_DEVICE_ATTACHED, so the activity simply comes to the
+              foreground and the pilot picks the log exactly as before.
+            -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_mass_storage" />
+        </activity>
+    </application>
+</manifest>

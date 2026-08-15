@@ -1,0 +1,85 @@
+name: Bug report
+description: Report a reproducible RotorLens defect using only synthetic or non-sensitive evidence.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. This issue is public.
+
+        **Do not attach, paste, or link raw flight logs, configuration dumps, GPS/home coordinates, timestamps, serials, device/aircraft/account identifiers, private paths or filenames, credentials, signing material, or personal data.** Use a committed synthetic fixture or describe a minimal synthetic reproduction. Report vulnerabilities privately through the Security Advisory link.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I have not included or linked any prohibited flight, configuration, location, identifier, credential, or personal data.
+          required: true
+        - label: My reproduction uses committed or generated synthetic data, or requires no data file.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: RotorLens version or commit
+      description: Give the release version or commit hash. Do not include a device serial or private path.
+      placeholder: "0.1.0 or abc1234"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Android
+        - iOS or iPadOS (experimental)
+        - Development CLI or browser
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Device model and OS version are enough; omit serials and account identifiers.
+      placeholder: "Pixel 8, Android 16"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use a committed fixture name or explain how to generate synthetic input.
+      placeholder: |
+        1. Open ...
+        2. Select synthetic fixture ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Sanitize console output and screenshots before posting them.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and privacy impact
+      description: Explain whether parsing, tuning advice, stored data, or privacy claims are affected. For an exploitable issue, stop and report privately.
+      placeholder: "No known safety/privacy impact, because ..."
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional sanitized context
+      description: Optional. Do not upload a real log or configuration even if you think it is sanitized.

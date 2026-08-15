@@ -1,0 +1,193 @@
+{
+  "$schema": "./artifact-manifest.schema.json",
+  "schemaVersion": 4,
+  "kind": "rotorlens-rotorflight-firmware-binding-artifact",
+  "protocolVersion": 1,
+  "status": "partial-candidate",
+  "firmwareRepository": "https://github.com/rotorflight/rotorflight-firmware",
+  "gitObjectFormat": "sha1",
+  "firmwarePatchLicense": "GPL-3.0-or-later",
+  "license": {
+    "basis": "source-file-headers",
+    "upstreamDeclaredSpdx": null,
+    "path": "LICENSES/GPL-3.0.txt",
+    "upstreamBlob": "f288702d2fa16d3cdf0035b15a9fcbc552cd88e7",
+    "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+    "byteLength": 35149
+  },
+  "baseCommit": "118e9120260bb33f46df4f92052fb0e9fd4e9ebc",
+  "baseTree": "7821f5ac9c18da9fb31844b3a9be4b1a77caac11",
+  "implementationCommit": null,
+  "resultTree": "635c01e76fad457114bfbc8a11a7a42e2e115518",
+  "patch": {
+    "path": "patches/rotorflight-4.6.0-binding-v1-partial.patch",
+    "format": "git-diff-full-index-binary",
+    "sha256": "0bcb2f89bc9b6af3b2953952a3e015954511c71a8c718fd0b022cde47594cb6f",
+    "byteLength": 89537,
+    "files": [
+      {
+        "path": "src/main/common/sha256.c",
+        "baseBlob": null,
+        "resultBlob": "ac0299274879ee74ffaa6acaaf6b7537588a4ee5"
+      },
+      {
+        "path": "src/main/common/sha256.h",
+        "baseBlob": null,
+        "resultBlob": "d1da8af90cceface9c1ad581e87acc9d0dacc58f"
+      },
+      {
+        "path": "src/main/config/rotorlens_binding_manifest.c",
+        "baseBlob": null,
+        "resultBlob": "fe438684e5dd1698f91baa4958a8ce345478d869"
+      },
+      {
+        "path": "src/main/config/rotorlens_binding_manifest.h",
+        "baseBlob": null,
+        "resultBlob": "fc657d27052de149a97f49b13193641e5af7a320"
+      },
+      {
+        "path": "src/main/config/rotorlens_config_mutation_epoch.c",
+        "baseBlob": null,
+        "resultBlob": "edbeff8a1c76196521d269e37523a0257c262a49"
+      },
+      {
+        "path": "src/main/config/rotorlens_config_mutation_epoch.h",
+        "baseBlob": null,
+        "resultBlob": "3a17a517c30cce54362eb233064112574a6a9390"
+      },
+      {
+        "path": "src/test/Makefile",
+        "baseBlob": "bf02df27aece87a8d2782d5cb3bff2eddceb4ed9",
+        "resultBlob": "9cd87bb4a6be3726e6d8086b8a04a505b47e8a8a"
+      },
+      {
+        "path": "src/test/unit/rotorlens_binding_manifest_unittest.cc",
+        "baseBlob": null,
+        "resultBlob": "629be440b438107c59db57269a530e9d37e15db7"
+      },
+      {
+        "path": "src/test/unit/rotorlens_config_mutation_epoch_unittest.cc",
+        "baseBlob": null,
+        "resultBlob": "a95bac4258511709f9a71703f9dc4e711a514677"
+      },
+      {
+        "path": "src/test/unit/sha256_unittest.cc",
+        "baseBlob": null,
+        "resultBlob": "29a13f2f7911d06aebbe0034fb98504f3a77740c"
+      }
+    ]
+  },
+  "targets": [],
+  "toolchain": {
+    "firmwareTarget": null,
+    "hostConformance": {
+      "runner": "ubuntu-24.04",
+      "cc": "clang-18",
+      "cxx": "clang++-18",
+      "ldflagsOverride": "",
+      "makeTargets": [
+        "test_sha256_unittest",
+        "test_rotorlens_binding_manifest_unittest",
+        "test_rotorlens_config_mutation_epoch_unittest"
+      ]
+    }
+  },
+  "manifestIds": {
+    "candidate": [
+      "rotorlens-rf460-config-r1"
+    ],
+    "runtimeAccepted": []
+  },
+  "candidateEncoding": {
+    "scope": "row-tlv-only",
+    "rowCount": 90,
+    "firstFieldId": 1,
+    "lastFieldId": 90,
+    "valueBytes": 103,
+    "rowTlvBytes": 463,
+    "maxWriterChunkBytes": 6,
+    "fullPreimage": false,
+    "semanticValidation": {
+      "scope": "caller-provided-immutable-value-buffer",
+      "registeredScalarDomains": true,
+      "crossFieldRules": [
+        "rates-type-limits-roll-pitch-yaw",
+        "governor-mode-throttle-type",
+        "governor-idle-auto-handover-order",
+        "governor-mode-flag-allowlist",
+        "governor-active-throttle-order",
+        "mixer-collective-min-max-order"
+      ],
+      "normalizesValues": false,
+      "rejectsBeforeWriter": true,
+      "provesLiveOrigin": false,
+      "provesStableCapture": false
+    },
+    "liveFirmwareRead": false
+  },
+  "candidateMutationEpoch": {
+    "scope": "isolated-task-context-primitive",
+    "generationBits": 32,
+    "nestingDepthBits": 16,
+    "stableParity": "even",
+    "mutationParity": "odd",
+    "faultSentinel": 4294967295,
+    "wrapPolicy": "latch-fault-sentinel-before-wrap",
+    "nestedTransitions": "outermost-only",
+    "failClosedOn": [
+      "generation-exhaustion",
+      "depth-overflow",
+      "unmatched-end",
+      "impossible-state-shape",
+      "interrupt-context-call"
+    ],
+    "faultPersistence": "sticky-source-state-with-modeled-nmi-stale-write-defense",
+    "productionCallers": [],
+    "writerHookCoverage": [],
+    "captureIntegration": false,
+    "provesStableCapture": false
+  },
+  "acceptanceBlockers": [
+    "no-public-full-implementation-commit",
+    "no-full-preimage-or-commitment",
+    "no-live-capture-or-snapshot-stability-proof",
+    "no-scoped-writer-hooks-or-pending-token",
+    "no-start-headers",
+    "no-terminal-atomic-seal",
+    "no-target-build-or-resource-bounds",
+    "no-independent-wire-captures"
+  ],
+  "evidence": {
+    "sourceConformance": {
+      "status": "partial-host-only",
+      "covers": [
+        "sha256-known-vectors",
+        "immutable-90-row-registry",
+        "row-tlv-independent-vector",
+        "structural-rejection-before-write",
+        "registered-90-row-domain-mapping",
+        "scalar-domain-class-boundaries",
+        "rate-type-cyclic-axis-cross-field-validation",
+        "governor-cross-field-allowlist",
+        "signed-mixer-domain-and-order-validation",
+        "semantic-rejection-before-write",
+        "input-buffer-nonmutation",
+        "partial-writer-failure",
+        "isolated-nested-task-context-epoch",
+        "epoch-no-op-generation-advance-and-saturation",
+        "epoch-fail-closed-depth-generation-and-api-boundaries",
+        "host-mode-primask-ipsr-and-publication-model",
+        "modeled-nmi-stale-write-fault-persistence"
+      ],
+      "hostTestTargets": [
+        "test_sha256_unittest",
+        "test_rotorlens_binding_manifest_unittest",
+        "test_rotorlens_config_mutation_epoch_unittest"
+      ]
+    },
+    "resourceBounds": null,
+    "terminalAtomicity": null,
+    "wireCaptures": []
+  },
+  "runtimeAcceptance": false
+}

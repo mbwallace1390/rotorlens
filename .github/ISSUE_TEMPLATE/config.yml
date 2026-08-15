@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security or safety vulnerability report
+    url: https://github.com/mbwallace1390/rotorlens/security/advisories/new
+    about: Report vulnerabilities, privacy bypasses, exposed secrets, or exploitable unsafe-advice flaws privately.
+  - name: Support and data-safety rules
+    url: https://github.com/mbwallace1390/rotorlens/blob/main/SUPPORT.md
+    about: Read support boundaries and never post raw logs, configuration dumps, GPS data, or identifiers.

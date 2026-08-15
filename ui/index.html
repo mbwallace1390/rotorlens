@@ -1,0 +1,924 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RotorLens</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel-2: #1c232c;
+    --line: #2a323d;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #4aa8ff;
+    /* The second trace has to be told apart from the first by someone with
+       red-green colour blindness and in sunlight, so the pair is separated by
+       hue *and* by lightness rather than by hue alone. */
+    --trace-gyro: #f0a33c;
+    --good: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+    --radius: 10px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    /* Phone shell: never let content slide under the notch or home indicator.
+       The top inset deliberately lives on the sticky header instead — see there. */
+    padding: 0 env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    /* At 384px the title, the tag line and the Legal button do not fit on one
+       row, and without this the tag is squeezed to a column of single letters. */
+    flex-wrap: wrap;
+    /* The top safe-area inset belongs here, not on body. A sticky element sticks
+       to the scrollport, so body padding scrolls away and the header ends up
+       under the status bar the moment the page moves. Owning the inset means the
+       header always paints the strip behind the clock, docked or not. */
+    padding: calc(16px + env(safe-area-inset-top)) 20px 16px;
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+    z-index: 5;
+  }
+  header h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
+  header .tag { color: var(--muted); font-size: 12px; }
+  header button { margin-left: auto; font-size: 12.5px; padding: 5px 10px; }
+
+  main { max-width: 900px; margin: 0 auto; padding: 20px; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 18px;
+    margin-bottom: 18px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 12px; letter-spacing: 0.01em; }
+  .panel h3 { font-size: 13px; margin: 18px 0 8px; color: var(--muted); font-weight: 600; }
+
+  #drop {
+    border: 2px dashed var(--line);
+    border-radius: var(--radius);
+    padding: 34px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  #drop.over { border-color: var(--accent); background: rgba(74,168,255,.07); }
+  #drop strong { display: block; font-size: 16px; margin-bottom: 6px; }
+  #drop span { color: var(--muted); font-size: 13px; }
+  #file { display: none; }
+
+  .privacy {
+    margin-top: 12px;
+    font-size: 12.5px;
+    color: var(--muted);
+    text-align: center;
+  }
+  .privacy b { color: var(--good); font-weight: 600; }
+
+  ol.steps { margin: 0; padding-left: 20px; color: var(--muted); font-size: 13.5px; }
+  ol.steps li { margin-bottom: 6px; }
+  ol.steps b { color: var(--text); font-weight: 600; }
+
+  details.help { margin-top: 14px; }
+  details.help summary {
+    cursor: pointer;
+    color: var(--accent);
+    font-size: 13.5px;
+    /* A disclosure row is a finger target like any other; 6px of padding made it
+       32px tall on the handset. Padding rather than min-height so the triangle
+       stays on the text baseline instead of floating in a tall empty row. */
+    padding: 13px 0;
+  }
+  details.help > div { padding-top: 10px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .scroll { overflow-x: auto; }
+
+  /* 140px, not 150px. The usable width inside a panel on a 384px phone is
+     384 − 40 (main padding) − 36 (panel padding) = 308px, and two 150px columns
+     plus the 10px gap need 310px. Every stat grid in the app therefore collapsed
+     to one tall column on the only device this app ships to, four pixels short. */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .stat { background: var(--panel-2); border-radius: 8px; padding: 11px 13px; }
+  .stat .k { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; }
+  .stat .v { font-size: 17px; margin-top: 3px; font-variant-numeric: tabular-nums; }
+
+  .pill {
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    font-size: 11.5px; font-weight: 600;
+  }
+  .pill.good { background: rgba(63,185,80,.15); color: var(--good); }
+  .pill.warn { background: rgba(210,153,34,.15); color: var(--warn); }
+  .pill.bad  { background: rgba(248,81,73,.15);  color: var(--bad);  }
+  /* "Nothing was compared" is not a verdict, so it must not borrow the colour of
+     one. A grey pill beside a green and an amber one is the only thing keeping
+     "rotor not checked" from reading as "rotor ruled out". */
+  .pill.none { background: var(--panel-2); color: var(--muted); border: 1px dashed var(--line); }
+
+  /* Peak rows: the frequency and the amplitude are the measurement, the rotor
+     state is the caveat, and at 384px they have to stack rather than scroll. */
+  .peaks { margin: 8px 0 0; padding: 0; list-style: none; }
+  .peaks li {
+    display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline;
+    padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13.5px;
+  }
+  .peaks li:last-child { border-bottom: 0; }
+  .peaks .hz { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 74px; }
+  .peaks .amp { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .peaks .detail { flex: 1 1 100%; color: var(--muted); font-size: 12px; }
+
+  select, button {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px;
+    padding: 8px 11px; font: inherit; font-size: 13.5px;
+    /* 44px is the smallest target a thumb hits reliably, and this app is read at
+       a flying field. Measured on the handset (SM-S928U, 384px CSS at dpr
+       2.8125) padding alone gave 34-38px: fine with a mouse, not with a finger.
+       The plot controls below already carried their own 40px floor; this raises
+       the pickers and Analyse to match. */
+    min-height: 44px;
+    /* A select sizes itself to its widest option, and the session picker's
+       options carry the craft name — which the log chose, not us. Without this
+       a long name stretches the whole page sideways on a phone. */
+    max-width: 100%;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+  .controls label { color: var(--muted); font-size: 12.5px; }
+
+  canvas { width: 100%; height: 240px; display: block; background: var(--panel-2); border-radius: 8px; }
+
+  /* The axis trace is dragged sideways with a finger to pan. `pan-y` keeps the
+     page itself scrollable vertically while the horizontal gesture belongs to
+     the plot; `none` would trap the whole page under the reader's thumb. */
+  #axis-plot { height: 220px; touch-action: pan-y; cursor: grab; }
+  #axis-plot.dragging { cursor: grabbing; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 0 0 8px; font-size: 12.5px; color: var(--muted); }
+  .legend .swatch {
+    display: inline-block; width: 14px; height: 3px; border-radius: 2px;
+    margin-right: 6px; vertical-align: middle;
+  }
+  .legend .swatch.cmd { background: var(--accent); }
+  .legend .swatch.gyro { background: var(--trace-gyro); }
+  .legend .swatch.mark { height: 8px; width: 8px; border-radius: 50%; }
+  .legend .swatch.mark.kept { background: var(--good); }
+  .legend .swatch.mark.refused { background: var(--warn); }
+
+  /* Finger targets. 40px is the smallest reliably tappable control on a phone,
+     and these sit under a plot the user is already dragging. The four icon
+     buttons keep their natural width so all five fit one row at 384px; only the
+     labelled one absorbs the slack. */
+  .plot-controls { gap: 8px; }
+  .plot-controls button { min-height: 44px; min-width: 44px; padding: 8px 6px; flex: 0 0 auto; }
+  .plot-controls #axis-fit { flex: 1 1 auto; padding: 8px 11px; }
+  input[type=range] { width: 100%; height: 44px; accent-color: var(--accent); }
+
+  ol.brief { margin: 8px 0 0; padding-left: 20px; font-size: 13.5px; color: var(--text); }
+  ol.brief li { margin-bottom: 7px; }
+  .boundary {
+    border-left: 3px solid var(--line); padding-left: 10px; margin: 14px 0 0;
+    font-size: 12.5px; color: var(--muted);
+  }
+
+  /* ---------------------------------------------------------------------
+     Recommendations.
+
+     Read standing at a flying field, on a 384px handset, by someone who does
+     not know what a D term is. So: one card per finding, the plain sentence
+     largest, the gain name second, and every number behind one tap rather
+     than scrolled past.
+     --------------------------------------------------------------------- */
+  .finding {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--line);
+    border-radius: 8px;
+    padding: 13px 14px;
+    margin-bottom: 12px;
+  }
+  .finding.kind-blocker { border-left-color: var(--warn); }
+  .finding.kind-adjustment { border-left-color: var(--accent); }
+  .finding.kind-next-flight { border-left-color: #a371f7; }
+  .finding.kind-observation { border-left-color: var(--good); }
+  /* The one change to make. It is the answer to the question the pilot opened
+     the app with, so it is the only thing on the screen with a filled edge. */
+  .finding.act-now { border: 1px solid var(--accent); border-left: 4px solid var(--accent);
+    background: rgba(74,168,255,.06); }
+  /* The one-sentence answer at the head of the advice panel. Sized to be read
+     at arm's length on a 384px phone, and empty until there is something to
+     say — an empty <p> with margins would push the panel open on nothing. */
+  #recommend-answer {
+    font-size: 17px; line-height: 1.3; font-weight: 600;
+    margin: 0 0 10px; color: var(--text);
+  }
+  #recommend-answer:empty { display: none; }
+  #recommend-answer .lead {
+    display: block; font-size: 12px; font-weight: 700; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--accent); margin-bottom: 3px;
+  }
+  .finding .start-here {
+    font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 8px;
+  }
+  .finding .step {
+    display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center;
+    font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em;
+    margin-bottom: 7px;
+  }
+  .finding .plain { font-size: 16px; line-height: 1.35; margin: 0 0 4px; }
+  .finding .engine { font-size: 13px; color: var(--muted); margin: 0 0 10px; }
+  /* The adjustment itself: the direction word and the thing to move. Never
+     rendered for any kind but `adjustment` — see renderFinding. */
+  .finding .change {
+    display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline;
+    background: var(--panel); border: 1px solid var(--accent); border-radius: 8px;
+    padding: 10px 12px; margin: 0 0 10px;
+  }
+  .finding .change .verb { font-size: 19px; font-weight: 700; color: var(--accent); }
+  .finding .change .what { font-size: 19px; font-weight: 700; }
+  .finding .change .gloss { flex: 1 1 100%; font-size: 12.5px; color: var(--muted); }
+  .finding p { font-size: 13.5px; margin: 0 0 9px; }
+  .finding p:last-child { margin-bottom: 0; }
+  .finding .label {
+    font-size: 11.5px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .04em; margin: 12px 0 4px;
+  }
+  ul.cands { margin: 4px 0 0; padding-left: 18px; font-size: 13.5px; }
+  ul.cands li { margin-bottom: 4px; }
+  table.basis { font-size: 12.5px; }
+  table.basis td.v { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  table.basis .src { display: block; color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+  .gate-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+
+  /* ---------------------------------------------------------------------
+     Flight window.
+     --------------------------------------------------------------------- */
+  #window-plot { height: 130px; }
+  .window-ends { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; align-items: center; }
+  .window-ends label { font-size: 12.5px; color: var(--muted); }
+  .window-ends input[type=range] { margin: 0; }
+  .window-times {
+    display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13.5px;
+    font-variant-numeric: tabular-nums; margin: 4px 0 10px;
+  }
+  .window-times b { font-weight: 600; }
+  .progress { font-size: 13.5px; margin: 6px 0 10px; font-variant-numeric: tabular-nums; }
+
+  /* ---------------------------------------------------------------------
+     Import progress.
+
+     Reading a full dataflash over USB runs at about 850 KiB/s, so a 128 MB
+     dump takes over two minutes with nothing else on screen. The bar is not
+     shown for the first 300 ms — a local file lands faster than that, and a
+     bar that flashes once reads as a glitch.
+     --------------------------------------------------------------------- */
+  #import-progress { margin-top: 14px; }
+  /* The decode bar sits under the log line rather than under the drop zone, and
+     reports steps rather than bytes — it is the same component saying a
+     different true thing. */
+  #decode-progress { margin-top: 12px; }
+  .bar {
+    height: 8px; border-radius: 999px; overflow: hidden;
+    background: var(--panel-2); border: 1px solid var(--line);
+  }
+  .bar > div { height: 100%; width: 0; background: var(--accent); }
+  /* Unknown total. The provider would not say how big the file is, so the bar
+     must not imply a fraction of it: it sweeps, and the byte count beside it
+     is the only number claimed. */
+  .bar > div.sweeping { width: 34%; animation: sweep 1.2s ease-in-out infinite; }
+  @keyframes sweep {
+    0%   { margin-left: -34%; }
+    100% { margin-left: 100%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bar > div.sweeping { animation: none; width: 100%; opacity: .35; }
+  }
+
+  /* ---------------------------------------------------------------------
+     Flight history, and the before/after.
+     --------------------------------------------------------------------- */
+  .headline { font-size: 16px; line-height: 1.35; margin: 0 0 8px; }
+  .floor {
+    border-left: 3px solid var(--line); padding-left: 10px; margin: 12px 0 0;
+    font-size: 12.5px; color: var(--muted);
+  }
+  .moved { width: 100%; font-size: 13px; margin-top: 6px; }
+  .moved td, .moved th { padding: 6px 8px; }
+
+  .aircraft { margin-top: 16px; }
+  .aircraft:first-child { margin-top: 4px; }
+  .aircraft-head {
+    display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline;
+    border-bottom: 1px solid var(--line); padding-bottom: 8px;
+  }
+  .aircraft-head .name { font-size: 15px; font-weight: 600; }
+  .aircraft-head .where { color: var(--muted); font-size: 12.5px; flex: 1 1 auto; }
+  .flight {
+    display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center;
+    padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13.5px;
+  }
+  .flight .ord { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 54px; }
+  .flight .meta { color: var(--muted); font-size: 12.5px; flex: 1 1 120px; }
+  /* Deletion is the whole reason keeping anything is defensible, so these are
+     ordinary full-size finger targets and not an icon hidden behind a swipe. */
+  .flight button, .aircraft-head button { min-height: 44px; padding: 8px 11px; }
+
+  /* ---------------------------------------------------------------------
+     What has been learned about one helicopter.
+
+     It sits between the aircraft's name and its flights, so a Forget tap and
+     the counts it changes are within one glance of each other. Kept SHORT on
+     purpose: the advice panel above already runs to several thousand pixels on
+     a phone, and every individual measurement here is one disclosure down.
+     --------------------------------------------------------------------- */
+  .learn { margin: 10px 0 4px; }
+  .learn-head { font-size: 13px; font-weight: 600; margin: 0 0 4px; }
+  .learn-sum { font-size: 13px; line-height: 1.45; margin: 0 0 10px; }
+  .learn-key, .learn-next { font-size: 12.5px; line-height: 1.45; color: var(--muted); }
+  .learn-key { margin: 8px 0 0; }
+  .learn-next { margin: 10px 0 0; color: var(--text); }
+  .learn-next .label { display: block; }
+
+  /* Nine cells, three per row, at 384 px. Fixed layout so the columns cannot be
+     dragged wide by a long axis name and push the panel sideways. */
+  /* Separate, not collapsed: collapsed borders discard border-radius, and the
+     cells have to read as nine separate counts rather than as a spreadsheet. */
+  .learn-grid {
+    width: 100%; table-layout: fixed;
+    border-collapse: separate; border-spacing: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .learn-grid th {
+    font-size: 12px; font-weight: 600; color: var(--muted); text-align: left;
+    padding: 2px 4px; border: 0; text-transform: uppercase; letter-spacing: .04em;
+  }
+  .learn-grid td {
+    padding: 7px 6px; border: 1px solid var(--line); border-radius: 6px;
+    font-size: 13px; line-height: 1.2;
+  }
+  .learn-grid td .have { font-weight: 600; }
+  /* The units, always beside the count. "2" on its own is a progress bar with
+     the numbers filed off; "2 of 4" is a fact somebody can act on. */
+  .learn-grid td .want { color: var(--muted); font-size: 11.5px; margin-left: 4px; }
+  .learn-grid td.none { color: var(--muted); }
+  .learn-grid td.some { border-color: var(--accent); }
+  .learn-grid td.believed { border-color: var(--good); background: var(--panel-2); }
+
+  .learn-belief, .provenance {
+    display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: baseline;
+    font-size: 13px; line-height: 1.45; margin: 10px 0 0;
+  }
+  .learn-belief > span, .provenance > span { flex: 1 1 100%; }
+  .learn-belief .pill, .provenance .pill { flex: 0 0 auto; }
+  .learn-belief .muted, .provenance .muted { font-size: 12px; }
+  .provenance { margin: 8px 0 0; }
+  pre.export {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; margin: 12px 0 0; max-height: 260px; overflow: auto;
+    font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+    color: var(--muted);
+  }
+
+  ul.codes { margin: 8px 0 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
+  ul.codes li { margin-bottom: 4px; }
+  ul.codes code { color: var(--warn); font-size: 12px; }
+  ul.reasons { margin: 8px 0 0; padding-left: 18px; font-size: 13.5px; }
+  ul.reasons li { margin-bottom: 5px; }
+
+  pre.license {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px;
+    margin: 0;
+    max-height: 320px;
+    overflow: auto;
+    font-size: 11.5px;
+    line-height: 1.45;
+    /* The license must stay readable on a phone; wrapping is allowed, the
+       wording is not changed by it. */
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--muted);
+  }
+
+  /* ---------------------------------------------------------------------
+     About & Legal.
+
+     A full-screen in-app page rather than another panel in the analysis
+     document. The fixed layer preserves the loaded log, the analysis state and
+     the main page's scroll position underneath it, while removing thousands of
+     pixels of licence text from that page's layout. It also gives iOS — which
+     has no Android system Back button — one visible way home.
+     --------------------------------------------------------------------- */
+  body.legal-page-open { overflow: hidden; }
+  .legal-page {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background: var(--bg);
+    color: var(--text);
+    padding: 0 env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .legal-page-bar {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: 12px;
+    align-items: center;
+    padding: calc(12px + env(safe-area-inset-top)) 20px 12px;
+    border-bottom: 1px solid var(--line);
+    background: rgba(14, 17, 22, .97);
+  }
+  .legal-page-bar button {
+    grid-row: 1 / span 2;
+    min-width: 76px;
+    margin: 0;
+  }
+  .legal-page-bar h2 {
+    margin: 0;
+    font-size: 18px;
+    line-height: 1.25;
+  }
+  .legal-page-bar p {
+    margin: 2px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .legal-page-content {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+  .legal-page-content > div {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 18px;
+  }
+
+  /* A Maven coordinate and a docs URL are single unbroken tokens, and the
+     longest here is wider than a phone. Keep them inside the legal page rather
+     than allowing that page — or the hidden analysis page — to scroll sideways. */
+  #legal a { color: var(--accent); overflow-wrap: anywhere; }
+  #legal ul.codes code { overflow-wrap: anywhere; word-break: break-all; }
+
+  /* ---------------------------------------------------------------------
+     Shared measurements, and the consent dialog.
+
+     NOTHING IN THIS APP SENDS ANYTHING ANYWHERE. These rules style a choice
+     and an opaque identity; the transport does not exist. See the comments on
+     #sharing-panel and #consent below, and app.mjs.
+     --------------------------------------------------------------------- */
+
+  /* The identity, sized to be READ OFF THE SCREEN AND WRITTEN DOWN — that is
+     the only thing that survives a wiped phone, so it gets a monospace face at
+     a size a person can transcribe standing outdoors, and `user-select: all`
+     so one tap selects the whole of it rather than one group. */
+  .share-id {
+    display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; margin: 10px 0;
+  }
+  .share-id .label {
+    font-size: 11.5px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .04em; flex: 1 1 100%;
+  }
+  .share-id code {
+    font-size: 15px; letter-spacing: .04em; user-select: all;
+    /* Four groups of five plus separators is 23 characters, which is wider than
+       the 308px usable inside a panel at 384px in this face. Wrapping between
+       groups keeps it readable; breaking inside one would make it transcribable
+       wrongly, which is worse than a second line. */
+    overflow-wrap: anywhere; word-break: break-word;
+  }
+
+  #sharing .aircraft-head { margin-bottom: 8px; }
+  #sharing button { min-height: 44px; }
+  #sharing p { font-size: 13.5px; margin: 0 0 10px; }
+  #sharing p:last-child { margin-bottom: 0; }
+  #sharing .headline { margin-bottom: 4px; }
+  ul.terms { margin: 4px 0 0; padding-left: 18px; font-size: 13px; }
+  ul.terms li { margin-bottom: 8px; }
+
+  /* ---------------------------------------------------------------------
+     The consent dialog.
+
+     A real overlay rather than window.confirm: this WebView has no
+     WebChromeClient, so confirm() returns false without ever painting — the
+     same reason "Forget everything" is a button that renames itself.
+
+     Scrollable inside itself and capped at the viewport, because the licence
+     disclosure opens to several hundred pixels and a card taller than the
+     screen would put the buttons where no thumb can reach them.
+     --------------------------------------------------------------------- */
+  .consent {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(4, 7, 11, .72);
+    padding: calc(12px + env(safe-area-inset-top)) 12px
+             calc(12px + env(safe-area-inset-bottom));
+  }
+  .consent.hidden { display: none; }
+  .consent-card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 18px; max-width: 480px; width: 100%; max-height: 100%; overflow-y: auto;
+  }
+  .consent-card h2 { font-size: 17px; margin: 0 0 12px; line-height: 1.3; }
+  .consent-card p { font-size: 13.5px; margin: 0 0 12px; }
+  .consent-nothing {
+    border-left: 3px solid var(--good); padding-left: 10px;
+    color: var(--muted);
+  }
+  /* The licence grant is a SEPARATE agreement from the privacy paragraph above
+     it, and looks like one. Burying a commercial grant inside a privacy notice
+     makes the consent weaker rather than the licence stronger — see
+     docs/SHARED_CORPUS_DESIGN.md section 4a. */
+  .consent-licence {
+    border-top: 1px solid var(--line); padding-top: 14px; margin-top: 16px;
+  }
+  .consent-licence > p:last-of-type { margin-bottom: 0; }
+  .consent-actions {
+    display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px;
+  }
+  /* Both full finger targets, and both the same size: same flex basis, same
+     growth, same type. Making the agreeing button larger than the declining one
+     is the cheapest dark pattern there is, and this dialog is the one screen
+     where it would matter most. The affirmative carries the accent, which is
+     ordinary convention and costs the declining answer no prominence — it is
+     the same size, in the same place, and it is the one that takes focus when
+     the dialog opens. The browser test measures width and type size rather than
+     height, because the flexbox equalises height whatever anyone writes here. */
+  .consent-actions button { min-height: 44px; flex: 1 1 140px; padding: 10px 12px; }
+  button.primary { border-color: var(--accent); color: var(--accent); }
+
+  .hidden { display: none; }
+  .muted { color: var(--muted); }
+  .error { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>RotorLens</h1>
+  <span class="tag">flight log analysis &mdash; on device</span>
+  <button id="legal-toggle" aria-expanded="false" aria-controls="legal-panel">About &amp; Legal</button>
+</header>
+
+<main>
+  <section class="panel" id="import-panel">
+    <h2>Open a log</h2>
+    <div id="drop" tabindex="0" role="button" aria-label="Choose a blackbox log file">
+      <strong>Choose a log file</strong>
+      <span>or drag one here &middot; .bbl, .bfl, .txt, .log</span>
+    </div>
+    <input type="file" id="file" accept=".bbl,.bfl,.txt,.log,application/octet-stream">
+
+    <!-- Copy progress from the native shell. Hidden until a copy has been
+         running for 300 ms; see IMPORT_PROGRESS_DELAY_MS in app.mjs. -->
+    <div id="import-progress" class="hidden" role="status" aria-live="polite">
+      <div class="progress" id="import-progress-label"></div>
+      <div class="bar"><div id="import-bar"></div></div>
+    </div>
+
+    <p class="privacy"><b>Nothing leaves this device.</b> The log is decoded locally.</p>
+
+    <details class="help">
+      <summary>How do I get the log off my helicopter?</summary>
+      <div>
+        <ol class="steps">
+          <li>Connect the flight controller to this device by USB.</li>
+          <li>Open the <b>Rotorflight configurator or tuning app</b> and connect.</li>
+          <li>Go to the <b>Blackbox</b> tab and tap <b>Activate mass storage device mode</b>.</li>
+          <li>The controller reappears as a drive, and this phone offers to open
+              RotorLens. Pick the <b>.bbl</b> file from it.</li>
+          <li><b>Before unplugging</b>, turn mass storage mode off again in the
+              configurator, or eject the drive from your phone's storage
+              notification. Pulling the cable while it is still mounted is what
+              makes Android warn that a device was removed unsafely. The log you
+              opened is unaffected, and the phone does not need restarting.</li>
+        </ol>
+        <p class="muted" style="font-size:12.5px;margin-top:10px">
+          On a phone you can also copy the file to local storage first, or share it
+          straight into RotorLens. If your controller logs to an SD card, reading
+          the card directly works too and skips the steps above.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <section class="panel hidden" id="status-panel">
+    <h2>Log</h2>
+    <div id="status" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <!-- How far the decode has got. Only sessions the pilot opens are read, so
+         this counts steps rather than bytes; see the Decode progress section in
+         app.mjs for why it cannot be driven by a timer the way the copy bar
+         above is. Hidden for a log small enough that it would only flash. -->
+    <div id="decode-progress" class="hidden" role="status" aria-live="polite">
+      <div class="progress" id="decode-progress-label"></div>
+      <div class="bar"><div id="decode-bar"></div></div>
+    </div>
+  </section>
+
+  <!-- FIRST after the log opens, deliberately: not behind an Analyse button and
+       not behind an axis picker. A pilot opens a log because he wants to know
+       what to fix, and every panel below this one is here so he can check the
+       answer rather than take it on trust.
+
+       Reversal recorded 12 August 2026 — see the note at the head of app.mjs. -->
+  <section class="panel hidden" id="recommend-panel">
+    <h2>What to change</h2>
+    <!-- The answer, in one sentence, above the provenance rather than under it.
+         A pilot standing at the flight line with gloves on reads this and
+         nothing else; `#recommend-status` below says what it was measured over,
+         which matters second. Populated in `measureRecommendations`. -->
+    <p id="recommend-answer" class="answer"></p>
+    <div id="recommend-status" class="muted" style="font-size:13px"></div>
+    <div id="recommend"></div>
+  </section>
+
+  <!-- What changed since the last flight of this helicopter, when RotorLens has
+       seen it before. Directly under the advice, because "did the last change
+       help?" is the same question as "what should I change now?" asked one
+       flight later.
+
+       Expect this to say nothing most of the time. Exactly one pair in 107 real
+       consecutive flight pairs carried a change and the evidence to judge it, so
+       silence here is the design working — see src/analysis/flight-history.mjs. -->
+  <section class="panel hidden" id="since-panel">
+    <h2>Since your last flight</h2>
+    <div id="since"></div>
+  </section>
+
+  <!-- The window every number on this page is measured over. Detected, then
+       draggable, then obeyed by the axis summary, the stop detector, the holds,
+       the recommendations and the vibration measurement alike. -->
+  <section class="panel hidden" id="window-panel">
+    <h2>Flight window</h2>
+    <div id="window-basis" style="font-size:13.5px"></div>
+    <div class="window-times" id="window-times"></div>
+    <canvas id="window-plot" aria-label="Collective and head speed across the whole recording,
+      with the flight window marked"></canvas>
+    <div class="window-ends">
+      <label for="window-start">Takeoff</label>
+      <input type="range" id="window-start" min="0" max="1000" value="0"
+             aria-label="Start of the flight window">
+      <label for="window-end">Landing</label>
+      <input type="range" id="window-end" min="0" max="1000" value="1000"
+             aria-label="End of the flight window">
+    </div>
+    <div class="controls plot-controls">
+      <button id="window-detect" type="button">Use the detected flight</button>
+      <button id="window-whole" type="button">Whole log</button>
+    </div>
+    <div id="window-note" class="muted" style="font-size:12.5px"></div>
+  </section>
+
+  <!-- A dataflash dump holds every flight since the chip was last erased — 73 of
+       them in the owner's own 125 MiB image. Only the one picked here is read;
+       the rest are described from their header blocks, which is why an option
+       can name the craft and the size but says "not opened yet" instead of a
+       sample count it has not measured. -->
+  <section class="panel hidden" id="session-panel">
+    <h2>Session</h2>
+    <div class="controls">
+      <label for="session">Session</label>
+      <select id="session"></select>
+    </div>
+    <div class="grid" id="session-stats"></div>
+    <div id="session-issues"></div>
+  </section>
+
+  <!-- Every log carries a command and a measured rate on all three axes, so this
+       panel renders on any flight without being asked and without waiting for a
+       manoeuvre to be detected. It is the picture a pilot checks a verdict
+       against; a number on its own cannot be checked against anything. -->
+  <section class="panel hidden" id="axis-panel">
+    <h2>Axis</h2>
+    <div class="controls">
+      <label for="axis">Axis</label>
+      <select id="axis">
+        <option value="roll">Roll</option>
+        <option value="pitch">Pitch</option>
+        <option value="yaw">Yaw</option>
+      </select>
+    </div>
+    <div class="grid" id="axis-stats"></div>
+    <div id="axis-note" class="muted" style="font-size:12.5px;margin-top:10px"></div>
+
+    <h3>Commanded against measured</h3>
+    <div class="legend">
+      <span><i class="swatch cmd"></i>commanded &deg;/s</span>
+      <span><i class="swatch gyro"></i>measured &deg;/s</span>
+      <span id="axis-mark-key" class="hidden"><i class="swatch mark kept"></i>stop measured
+        <i class="swatch mark refused" style="margin-left:10px"></i>stop refused</span>
+    </div>
+    <canvas id="axis-plot" aria-label="Commanded and measured rate against time"></canvas>
+    <input type="range" id="axis-scrub" min="0" max="1000" value="0"
+           aria-label="Position in the flight">
+    <div class="controls plot-controls">
+      <button id="axis-fit" type="button">Flight window</button>
+      <button id="axis-out" type="button" aria-label="Zoom out">&minus;</button>
+      <button id="axis-in" type="button" aria-label="Zoom in">+</button>
+      <button id="axis-prev" type="button" aria-label="Earlier">&#9664;</button>
+      <button id="axis-next" type="button" aria-label="Later">&#9654;</button>
+    </div>
+    <div class="muted" id="axis-plot-caption" style="font-size:12.5px;margin-top:8px"></div>
+
+    <!-- Vibration lives on the axis panel because it needs nothing but a gyro
+         column, so it reads on every log whatever the pilot flew — unlike stop
+         evidence, which needs a manoeuvre. It is measured on the window the plot
+         is showing, on demand: it costs tens of milliseconds on a desktop and
+         several times that in a WebView, which is fine for a tap and would be a
+         visible hitch on every axis change and every pan. -->
+    <h3>Vibration in the visible window</h3>
+    <div class="controls">
+      <button id="vibration-run" type="button">Measure vibration</button>
+      <span class="muted" id="vibration-range" style="font-size:12.5px"></span>
+    </div>
+    <div id="vibration"></div>
+  </section>
+
+  <section class="panel hidden" id="tune-panel">
+    <h2 id="tune-heading">Tune evidence</h2>
+    <div class="controls">
+      <label for="term">Term</label>
+      <select id="term">
+        <option value="P">P</option>
+        <option value="I">I</option>
+        <option value="D">D</option>
+      </select>
+      <button id="analyse">Analyse</button>
+    </div>
+    <div id="tune"></div>
+  </section>
+
+  <section class="panel hidden" id="plot-panel">
+    <h2>Any signal</h2>
+    <div class="controls">
+      <label for="field">Field</label>
+      <select id="field"></select>
+    </div>
+    <canvas id="plot" aria-label="Selected Blackbox signal against time"></canvas>
+    <div class="muted" id="plot-caption" style="font-size:12.5px;margin-top:8px"></div>
+  </section>
+
+  <section class="panel hidden" id="fields-panel">
+    <h2>Fields</h2>
+    <div class="scroll"><table id="fields"></table></div>
+  </section>
+
+  <!-- Everything RotorLens has remembered, in full, with a way to delete any of
+       it. This panel ships BEFORE the comparison above it is worth anything:
+       a store the pilot cannot see into and cannot empty is a trail, and the
+       app's whole privacy claim is that it keeps none. -->
+  <section class="panel hidden" id="history-panel">
+    <h2>Flight history</h2>
+    <div id="history-summary" class="muted" style="font-size:13px"></div>
+    <div class="controls">
+      <button id="history-export" type="button">Export</button>
+      <button id="history-forget-all" type="button">Forget everything</button>
+    </div>
+    <div id="history"></div>
+    <pre class="export hidden" id="history-export-text"></pre>
+  </section>
+
+  <!-- The choice, the identity, and what a shared record would contain.
+       NOTHING IN THIS APP SENDS ANYTHING ANYWHERE: there is no transport in this
+       build and the app has no INTERNET or sensitive platform permission.
+       This screen exists so the consent, the opaque identity and the deletion
+       path are on a phone and provable BEFORE anything can be sent, rather than
+       arriving as a surprise update on an installed base. Every state of it says
+       so in the plainest words available — see app.mjs, NOTHING_IS_SENT. -->
+  <section class="panel hidden" id="sharing-panel">
+    <h2>Shared measurements</h2>
+    <div id="sharing"></div>
+  </section>
+
+</main>
+
+<!-- A separate in-app page, not a second document. Keeping it in this document
+     preserves an open log and every analysis result while the notices are read.
+     `inert` is applied to the main page by legal.mjs while this view is open. -->
+<section class="legal-page hidden" id="legal-panel" role="dialog" aria-modal="true"
+         aria-hidden="true" aria-labelledby="legal-page-title">
+  <div class="legal-page-bar">
+    <button type="button" id="legal-back" aria-label="Back to RotorLens">&#8592; Back</button>
+    <h2 id="legal-page-title">About &amp; Legal</h2>
+    <p>Creator, source, licences and bundled components</p>
+  </div>
+  <div class="legal-page-content">
+    <div id="legal"></div>
+  </div>
+</section>
+
+<!-- Asked ONCE, after the first analysis that measured a real flight — never at
+     first run. Asking before the app has done anything useful is how consent
+     becomes a reflex tap on the way to the thing somebody actually opened. The
+     wording is docs/SHARED_CORPUS_DESIGN.md section 4, with the licence sentence
+     from 4a kept visually separate from the privacy paragraph: bundling a
+     commercial grant into a privacy notice makes the consent weaker rather than
+     the licence stronger. -->
+<div class="consent hidden" id="consent" role="dialog" aria-modal="true"
+     aria-labelledby="consent-title">
+  <div class="consent-card">
+    <h2 id="consent-title">Help RotorLens get better at this?</h2>
+
+    <p>RotorLens can send the measurements from this flight &mdash; about 4 kB of numbers
+      &mdash; to help work out what normal looks like across many helicopters. It is how the
+      thresholds this app judges your aircraft against stop being guesses.</p>
+
+    <p><b>Your log never leaves your phone.</b> What would be sent is the same handful of
+      numbers the app already keeps: your gains, how well each axis tracked, head speed, and
+      how much vibration was measured. Never the log, never your location, never a date, never
+      a file name, and never your helicopter&rsquo;s name.</p>
+
+    <p>You can see everything that has been sent, and delete all of it, at any time.</p>
+
+    <!-- The honest state of the thing being agreed to. Not in the design's
+         wording, because that document describes the world after the transport
+         exists; this build has none, and a dialog that let somebody believe
+         otherwise would be the one lie this whole feature cannot afford. -->
+    <p class="consent-nothing"><b>Nothing is sent yet, and this version cannot send.</b>
+      RotorLens has no INTERNET or sensitive platform permission. Saying yes records your choice and
+      creates a random local identity for each saved helicopter; nothing is sent.</p>
+
+    <!-- Visually separated, deliberately. Two agreements are being made and they
+         are legally different: consent to process, and a licence to use. -->
+    <div class="consent-licence">
+      <p><b>You keep ownership of your measurements.</b> Sharing them lets RotorLens use them
+        to improve the app, including free releases and releases distributed for a fee.</p>
+
+      <details class="help">
+        <summary>What this means</summary>
+        <div>
+          <ul class="terms">
+            <li><b>You keep ownership.</b> Sharing does not transfer it. Your measurements
+              remain yours to use for anything.</li>
+            <li><b>You grant a non-exclusive, worldwide, royalty-free licence</b> to use the
+              measurements you share.</li>
+            <li><b>The purpose is derived statistics</b> &mdash; averages, noise floors and
+              thresholds computed across many helicopters. Those numbers, rather than your
+              individual records, are what goes back into the app.</li>
+            <li><b>This includes commercial use.</b> RotorLens is open source, and open-source
+              releases may still be distributed for a fee. Improvements built on these numbers
+              may ship in those releases. Saying so here rather than letting you find out later
+              is the point of this section.</li>
+            <li><b>Your individual records are not published or passed to anyone else.</b>
+              Only the derived statistics appear in the app. Publishing the collection, or
+              sharing it with the Rotorflight project, would be a different question and would
+              have to be asked separately.</li>
+            <li><b>Deleting your shared measurements removes your records from the
+              collection.</b> Statistics already calculated from them &mdash; averages and
+              thresholds across many helicopters &mdash; cannot be recalculated to exclude
+              records that no longer exist, and remain in the app.</li>
+            <li><b>This covers these measurements and nothing else.</b> If RotorLens ever wants
+              to send anything beyond them, that is a new question rather than something
+              covered by this one.</li>
+          </ul>
+          <p class="muted" style="font-size:12.5px">Terms version 2026-08-14, recorded with
+            your choice so it is answerable later which wording you saw. This is a draft
+            awaiting legal review and is not legal advice; nothing can be sent from this
+            version of the app in any case.</p>
+        </div>
+      </details>
+    </div>
+
+    <div class="consent-actions">
+      <button type="button" id="consent-not-now">Not now</button>
+      <button type="button" id="consent-share" class="primary">Share measurements</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="./app.mjs"></script>
+<script type="module" src="./legal.mjs"></script>
+</body>
+</html>

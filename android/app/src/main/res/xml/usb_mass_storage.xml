@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Which USB devices offer to open RotorLens.
+
+  Matched by CLASS, not by vendor and product ID:
+
+    class    8   Mass Storage
+    subclass 6   SCSI transparent command set
+    protocol 80  Bulk-Only Transport   (0x50, written here in decimal)
+
+  That is what a flight controller enumerates as in mass-storage mode, and it
+  covers every board rather than the two whose IDs happen to be known here. It
+  also covers an SD card reader, which is the import path for pilots whose
+  controller logs to a removable card instead of onboard dataflash.
+
+  A vendor filter was the alternative and was rejected: it would have needed the
+  VID and PID of each board in MSC mode, would silently fail on any controller
+  nobody had tested, and gains nothing — the class triple is exactly the set of
+  devices this app has any use for.
+-->
+<resources>
+    <usb-device class="8" subclass="6" protocol="80" />
+</resources>

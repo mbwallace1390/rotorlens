@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RotorLens privacy policy</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0 auto;
+    max-width: 46rem;
+    padding: 2rem 1.25rem 4rem;
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #ffffff;
+    color: #16202b;
+  }
+  h1 { font-size: 1.7rem; letter-spacing: -0.01em; margin: 0 0 1.5rem; }
+  h2 { font-size: 1.15rem; margin: 2.25rem 0 0.75rem; }
+  p, li { overflow-wrap: anywhere; }
+  ul { padding-left: 1.25rem; }
+  li { margin-bottom: 0.4rem; }
+  code { font-size: 0.92em; background: rgba(127, 140, 155, 0.16); padding: 0.1em 0.35em; border-radius: 4px; }
+  a { color: #0b62c4; }
+  table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; display: block; overflow-x: auto; }
+  th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid rgba(127, 140, 155, 0.35); vertical-align: top; }
+  th { font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0e1116; color: #e6edf3; }
+    a { color: #4aa8ff; }
+  }
+</style>
+</head>
+<body>
+<h1>RotorLens privacy policy</h1>
+<p><strong>Effective 11 August 2026. Revised 15 August 2026</strong> to distinguish the privacy protections supplied by each platform — see <strong>Changes</strong> at the end. This is the canonical text. The hosted copy at the URL given to the app stores is generated from this file, and the two must not drift — see <code>docs/STORE_PRIVACY_ANSWERS.md</code>.</p>
+<h2>The short version</h2>
+<p><strong>RotorLens collects nothing.</strong> It has no account, no analytics, no advertising, no crash reporting, no upload transport, and makes no network requests. Your flight logs are read on your device, and they stay there.</p>
+<p>RotorLens can remember a short summary of a flight so that a later flight can be compared against it. That summary is a few dozen numbers. It never includes the log, never includes a position, never leaves the device, and you can read it, export it, and delete it from inside the app.</p>
+<p>If you answer the optional shared-measurements question, RotorLens remembers your answer. If you turn sharing on, it also creates a random local identity for each saved helicopter. That identity is not an account, device ID, advertising ID, or identity for you. There is no sharing transport in this version, so neither the answer nor an identity leaves the device. Both can be erased in the app.</p>
+<p>This is enforced differently on each platform. The Android app does not request the <code>INTERNET</code> permission, so Android will not let it open a network connection even if it tried. iOS has no equivalent permission switch; an iOS release must instead pass source, WebView-policy, and on-device network verification before this policy may be used for that build. The iOS shell is currently experimental, not a shipping release. Both platform shells request no sensitive platform permission.</p>
+<h2>What the app handles</h2>
+<p>A Blackbox flight log that you choose to open. You provide it deliberately — through the system file picker, by opening a <code>.bbl</code> file, or by sharing one into RotorLens. The app never goes looking for files on its own.</p>
+<p><strong>A flight log can contain location data.</strong> Blackbox logs from a flight controller with GPS carry position frames, and often a home coordinate — which is usually where you were standing, and may be where you live. RotorLens tells you when a log declares location fields, so the fact is visible rather than assumed. That data is processed on your device like every other field, and is not sent anywhere, because nothing is sent anywhere.</p>
+<h2>What is stored, and for how long</h2>
+<p>Three categories, with different lifetimes: the temporary copy of the log you opened; flight summaries you explicitly save; and the sharing preference and random aircraft identities created when you answer the optional sharing question. The last two categories persist between uses until you erase them.</p>
+<h2>The copy of the log you opened</h2>
+<p>When you open a log, RotorLens copies it into its own private cache. This is necessary rather than optional: the permission granted by a share expires, often before you have finished looking at the flight.</p>
+<ul>
+  <li><strong>One log at a time.</strong> Opening another deletes the previous copy.</li>
+  <li><strong>Deleted when the app closes.</strong> The copy is removed when the viewer is finished with it.</li>
+  <li><strong>Deleted at next start regardless.</strong> An app can be killed without warning by the system, which would otherwise leave the last flight in the cache. RotorLens clears that directory when it starts, so a log does not outlive the session that opened it even if the app never got the chance to tidy up.</li>
+</ul>
+<h2>The flight history</h2>
+<p>RotorLens can tell you whether a change you made to your helicopter's tuning actually helped. Answering that needs something remembered from the flight before it, so when you choose to save a flight, RotorLens writes a short summary of it into a single file in the app's own private storage.</p>
+<p><strong>It is a summary, not a log.</strong> Around 4.4 kilobytes of numbers per flight — roughly a page of them. The log itself is not part of it, and cannot be reconstructed from it.</p>
+<h2>What the flight history contains</h2>
+<table>
+  <tr><th></th><th>Why it is there</th></tr>
+  <tr><td>The craft name and board name from the log's header</td><td>to tell one of your helicopters from another, so two are never compared with each other</td></tr>
+  <tr><td>A counter — first flight, second flight, and so on</td><td>to know which flight came first. It replaces a date; see below</td></tr>
+  <tr><td>The firmware version string</td><td>so a comparison across a firmware update can be refused rather than misread</td></tr>
+  <tr><td>The nine PID gains, and the rest of each PID line</td><td>this is <strong>what changed</strong>, which is the entire point of the comparison</td></tr>
+  <tr><td>The rate-curve settings, as one short string</td><td>a change to them invalidates a comparison, so it is checked for</td></tr>
+  <tr><td>How long the flight was, and how it was detected</td><td>to keep ground runs out of the history</td></tr>
+  <tr><td>Per axis: hold, stop, vibration and headspeed measurements</td><td>the measurements the comparison is made from</td></tr>
+</table>
+<h2>What the flight history never contains</h2>
+<p>This list is enforced in the code, not just promised here: the file is written from a fixed list of permitted fields, and a test rejects anything outside it.</p>
+<table>
+  <tr><th>Never stored</th><th>Why</th></tr>
+  <tr><td>The flight log, or any part of it</td><td>keeping the source would make deleting the summary meaningless</td></tr>
+  <tr><td>GPS coordinates, or a home position</td><td>a home coordinate is usually where you were standing, and may be where you live</td></tr>
+  <tr><td>Satellite count, ground speed, altitude</td><td>not coordinates, but a series of them still describes where and how high you flew</td></tr>
+  <tr><td><strong>The date or time of the flight</strong></td><td>a list of them is a record of when you fly, which is behaviour rather than tuning. A counter orders the flights instead, and we checked that using the date would not have made the comparison any better</td></tr>
+  <tr><td>The name or path of the file you opened</td><td>that is a path into your own storage, and often a folder you named</td></tr>
+  <tr><td>Raw samples, traces, or graphs</td><td>a trace is the log again in another shape</td></tr>
+  <tr><td>Anything that never left the ground</td><td>a bench run is not a flight and does not belong in a flight history</td></tr>
+</table>
+<h2>What RotorLens works out from the flight history</h2>
+<p>RotorLens shows you what your saved flights add up to, gain by gain: how many it can use, what it would take to teach it more, and — where enough flights have earned it — an amount fitted to them. That display <strong>stores nothing of its own.</strong> It is worked out from the flights listed in the same panel, every time the panel is drawn, and then thrown away.</p>
+<p>This is a deliberate choice and it is the one that matters for deletion. No derived tuning model is fitted, cached, or written down, so there is no second copy to delete and no way for something learned from a flight to survive that flight being forgotten. Delete a flight and what it contributed is gone with it, on the same tap. Delete everything and there is nothing left to have learned from.</p>
+<p>The table above is therefore the complete list of what is kept in the <strong>flight history</strong>. The separate sharing file is described next.</p>
+<h2>The sharing preference and random aircraft identities</h2>
+<p>After RotorLens has enough information to analyse a flight, it may ask whether you want to contribute small, privacy-filtered measurements in a future version. Answering either <strong>Share</strong> or <strong>Not now</strong> stores a separate <code>sharing.json</code> file in the app's private storage so the same question is not shown every time. This can happen before you save a flight.</p>
+<p>That file contains:</p>
+<ul>
+  <li>whether the question has been answered and whether sharing is enabled;</li>
+  <li>while sharing is enabled, the version of the consent wording accepted (the field is <code>null</code> after <strong>Not now</strong> or after sharing is turned off);</li>
+  <li>a random 100-bit identity created for each saved helicopter while sharing is enabled; and</li>
+  <li>the local aircraft key used to associate each random identity with its flight history. That key is a lower-case form of the craft name and board model already present in the saved flight summary. It never enters a shared record.</li>
+</ul>
+<p>Turning sharing off does not erase an aircraft key or its random identity. Those mappings remain local so the same helicopter keeps the same identity if sharing is enabled again. They remain until you use <strong>Erase identity</strong>, <strong>Forget helicopter</strong>, or <strong>Forget everything</strong>. Uninstalling the app also removes them; on Android, <strong>Clear storage</strong> does too.</p>
+<p>The random identity identifies one helicopter's records to RotorLens. It is not derived from the craft name, phone, advertising ID, account, email address, or anything about you. This version has no server or upload transport, so the preference and identities remain local even when sharing is enabled. On Android, the missing <code>INTERNET</code> permission is an additional operating-system barrier. The Sharing panel shows the state and can erase the identities and preference. <strong>Forget everything</strong> erases this file as well as the flight history.</p>
+<h2>How long the flight history is kept</h2>
+<ul>
+  <li><strong>Until you delete it.</strong> Unlike the log copy above, the history is meant to outlive the session — that is what makes a comparison possible at all.</li>
+  <li><strong>At most 200 flights per helicopter.</strong> The oldest is dropped after that, so the file cannot grow into a record of every flight you have ever made.</li>
+  <li><strong>You can see all of it.</strong> The history screen shows every stored flight, and <strong>Export</strong> shows the whole history as plain text you can read yourself. It is displayed on screen; RotorLens writes no file and sends it nowhere.</li>
+  <li><strong>You can delete any of it.</strong> Forget one flight, forget one helicopter, or forget everything. Forgetting everything removes the counters too, so nothing is left behind — not even a count of how many times you flew.</li>
+  <li>Uninstalling the app removes it as well; on Android, <strong>Clear storage</strong> does too.</li>
+</ul>
+<p>Nothing else is stored. There are no accounts, email fields, device or advertising IDs, cookies, or browser storage of any kind — no <code>localStorage</code>, no <code>IndexedDB</code>, no web databases. A craft name is text the pilot configured on the flight controller and could itself contain a name or callsign; RotorLens does not infer or sanitize its meaning, and keeps it only in the local files described above. The flight history and sharing preference are ordinary files the native app owns.</p>
+<h2>What is not collected</h2>
+<p>To be explicit, because &quot;we do not collect&quot; is a sentence readers have learned to distrust:</p>
+<table>
+  <tr><th>Accounts or email</th><th>none — the app has no account system. A user-configured craft name may contain personal text, but remains local and is never transmitted</th></tr>
+  <tr><td>Device, advertising, account, or personal identifiers</td><td>none. The random local aircraft identity described above groups one helicopter only and is never transmitted</td></tr>
+  <tr><td>Location</td><td>never requested; location inside a log stays on the device, and never reaches the flight history</td></tr>
+  <tr><td>Usage analytics, telemetry, crash reports</td><td>none</td></tr>
+  <tr><td>Advertising or tracking SDKs</td><td>none</td></tr>
+  <tr><td>Contacts, photos, microphone, camera</td><td>never requested</td></tr>
+</table>
+<h2>Who your data is shared with</h2>
+<p>Nobody. There is no server, no third-party service, and no transmission of any kind, so there is nothing to share, sell, or disclose.</p>
+<h2>Third-party components</h2>
+<p>The app bundles open-source libraries from the Android Open Source Project, JetBrains, and Google, listed in full on the app's <strong>Legal</strong> screen. They are software components inside the app, not services: none of them contacts a network on RotorLens' behalf, and the absence of the <code>INTERNET</code> permission would prevent it if one tried.</p>
+<h2>Your rights</h2>
+<p>GDPR and CCPA give you rights over personal data a company holds about you — access, correction, deletion, portability, and the right to object. <strong>We hold none of it.</strong> There is no server, no account, and no copy of anything of yours anywhere but your own phone, so there is nothing for us to look up, hand over, or erase on your behalf.</p>
+<p>The flight history and sharing preference do not change that, and it is worth saying why. They live on your device, under your control, and the app gives you the same rights over them directly rather than through us:</p>
+<ul>
+  <li><strong>Access</strong> — the history screen shows every stored flight in full.</li>
+  <li><strong>Portability</strong> — <strong>Export</strong> shows the whole history as plain text on screen, which you can copy. RotorLens writes no export file.</li>
+  <li><strong>Deletion</strong> — forget one flight, one helicopter, or everything. There is no copy elsewhere to survive it.</li>
+  <li><strong>Sharing identity control</strong> — the Sharing panel can erase its local identities and preference without deleting flight history; Forget everything removes both.</li>
+</ul>
+<p>If you are in the EU or UK, note that this means there is no controller holding your data and no international transfer, because the data never leaves your device.</p>
+<h2>Children</h2>
+<p>RotorLens is a tool for analysing radio-controlled helicopter flight logs. It is not directed at children, and since it collects nothing, it collects nothing from anyone of any age.</p>
+<h2>Changes</h2>
+<p>If a future version of RotorLens ever collects, transmits, or stores anything beyond what is described here, this policy will be updated <strong>before</strong> that version is released, and the store listings' data declarations will be updated with it. On Android, network transmission would additionally require adding a permission the app has deliberately never had. An iOS release must independently prove the same no-transmission outcome because iOS has no equivalent permission.</p>
+<p><strong>15 August 2026 — platform-specific network protection.</strong> The policy now distinguishes the shared no-upload implementation from Android's stronger operating-system <code>INTERNET</code> permission barrier. It does not extend the policy to the experimental iOS shell; that shell must pass its own source, WebView-policy, and on-device network gates before release.</p>
+<p><strong>14 August 2026 — the sharing preference and aircraft identities.</strong> The app already persisted a consent answer, consent-text version and random identity per helicopter before it had any transport capable of using them. This revision describes that second local file explicitly, including that answering <strong>Not now</strong> can create it before a flight is saved. The store privacy answer remains “data not collected” because nothing is transmitted, but the previous claims that flight history was the only persistent file and that no identifiers existed were incorrect and have been removed.</p>
+<p><strong>13 August 2026 — the flight history.</strong> This is that rule being followed rather than an exception to it. The *flight history* section above was written before the version that stores anything, so the description is in place first. Nothing about it changes the claim the rest of this policy rests on: the app still has no <code>INTERNET</code> permission and still cannot transmit anything anywhere. The store declarations are unchanged, and remain &quot;no data collected&quot;, because both stores define collection as data leaving the device.</p>
+<p><strong>13 August 2026 — what RotorLens works out from the history.</strong> The app now shows what your saved flights add up to, gain by gain, and will fit an amount to them where they support one. <strong>Nothing was added to what is stored.</strong> The model is derived from the flights already described above and kept only for as long as it is on screen, which is why it appears in this policy as a section about deletion rather than as a new row in the table of what is kept — delete a flight and the model is rebuilt without it on the spot. The size figure in *The flight history* was also corrected, from about 2.5 kB a flight to about 4.4 kB: the smaller figure is the summary in its compact form, and the file as actually written on the device is indented text.</p>
+<h2>Contact</h2>
+<p>Questions about this policy: <strong>mbwallace1390@gmail.com</strong></p>
+<p>RotorLens is an independent project. It is not affiliated with, endorsed by, or sponsored by the Rotorflight or Betaflight projects.</p>
+</body>
+</html>

@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use or build on RotorLens, please cite the project and its original creator."
+title: "RotorLens"
+type: software
+authors:
+  - family-names: "Wallace"
+    given-names: "Michael"
+    alias: "mbwallace1390"
+repository-code: "https://github.com/mbwallace1390/rotorlens"
+url: "https://github.com/mbwallace1390/rotorlens"
+license: "MPL-2.0"
+abstract: "An independent, privacy-conscious Rotorflight flight-log analysis and tuning-advice application."
+keywords:
+  - "RotorLens"
+  - "Rotorflight"
+  - "Blackbox"
+  - "flight-log analysis"
+  - "RC helicopter"
