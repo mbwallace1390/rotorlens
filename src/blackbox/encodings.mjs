@@ -154,16 +154,55 @@ function decodeTag2_3S32(reader, count) {
 function decodeTag2_3SVariable(reader, count) {
   const lead = reader.u8();
   const selector = lead >> 6;
+  const values = [0, 0, 0];
 
-  // Only the widest selector differs from TAG2_3S32: it falls back to
-  // variable-byte values rather than fixed byte widths.
-  if (selector === 3) {
-    const values = [reader.signedVB(), reader.signedVB(), reader.signedVB()];
-    return values.slice(0, count);
+  // Only selector 0 shares its packing with TAG2_3S32. Selectors 1 and 2 are
+  // BIT-packed straddling byte boundaries — 5-5-4 bits over two bytes and
+  // 8-7-7 bits over three — not the nibble/byte-aligned 4-4-4 and 6-6-6 of
+  // TAG2_3S32, and selector 3 is per-field signed varints after a bare
+  // selector byte.
+  //
+  // Until 17 August 2026 selectors 0-2 all delegated to TAG2_3S32, and nothing
+  // could catch it: selector 1 consumes two bytes and selector 2 three bytes
+  // under BOTH layouts, so frame sync holds and every value decoded from a
+  // 3-8 bit delta is silently wrong. This is the same silent-permutation class
+  // as TAG8_4S16, one step worse — it is not a permutation of the right bits
+  // but a different partition of them, invisible to alignment, round-trip
+  // (there was none) and any check short of continuity on a real log carrying
+  // encoding 10, which none of the four held logs does. Layouts below are
+  // written from the format's serializer; see docs/BLACKBOX_FORMAT_NOTES.md.
+  switch (selector) {
+    case 0: // three 2-bit values in the lead byte, field 0 in the HIGH pair
+      for (let index = 0; index < 3; index += 1) {
+        values[index] = signExtend((lead >> (4 - index * 2)) & 0x03, 2);
+      }
+      break;
+
+    case 1: { // 5-5-4 bits across two bytes: ss111 1122 2223 333
+      const second = reader.u8();
+      values[0] = signExtend((lead >> 1) & 0x1f, 5);
+      values[1] = signExtend(((lead & 0x01) << 4) | ((second >> 4) & 0x0f), 5);
+      values[2] = signExtend(second & 0x0f, 4);
+      break;
+    }
+
+    case 2: { // 8-7-7 bits across three bytes: ss111111 11222222 23333333
+      const second = reader.u8();
+      const third = reader.u8();
+      values[0] = signExtend(((lead & 0x3f) << 2) | ((second >> 6) & 0x03), 8);
+      values[1] = signExtend(((second & 0x3f) << 1) | ((third >> 7) & 0x01), 7);
+      values[2] = signExtend(third & 0x7f, 7);
+      break;
+    }
+
+    default: // per-field signed variable-byte values
+      for (let index = 0; index < 3; index += 1) {
+        values[index] = reader.signedVB();
+      }
+      break;
   }
 
-  reader.offset = reader.offset - 1;
-  return decodeTag2_3S32(reader, count);
+  return values.slice(0, count);
 }
 
 function decodeTag8_4S16(reader, count) {

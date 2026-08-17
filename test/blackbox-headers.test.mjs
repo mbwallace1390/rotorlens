@@ -116,3 +116,22 @@ test('parseSession reports unterminated and malformed trailing header lines as u
     'a malformed setting must not enter retained evidence'
   );
 });
+
+test('a ratio-spelled `P interval` yields the step from its denominator', () => {
+  // `P interval:1/2` means one logged frame per two loop iterations — a step of
+  // 2, from the DENOMINATOR. Taking the leading integer read it as 1, which is
+  // the exact loopIteration-sawtooth defect the `I interval`/`P ratio`
+  // derivation was added to fix, alive on the alternate header spelling.
+  const step = lines => parseSession(headerBytes([...MINIMAL_HEADER, ...lines]), 0, 0)
+    .constants.incrementStep;
+
+  assert.equal(step(['H P interval:1/2']), 2);
+  assert.equal(step(['H P interval:1/1']), 1);
+  assert.equal(step(['H P interval:2/4']), 2);
+  assert.equal(step(['H P interval:2']), 2, 'the bare-step spelling keeps working');
+  // The quotient derivation still wins when both headers are present.
+  assert.equal(step(['H I interval:64', 'H P ratio:32', 'H P interval:1/4']), 2);
+  // Malformed ratios fall back rather than crash.
+  assert.equal(step(['H P interval:3/2']), 3, 'a non-integral ratio falls back to the leading integer');
+  assert.equal(step(['H P interval:0/0']), 1);
+});

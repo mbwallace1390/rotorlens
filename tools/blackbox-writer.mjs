@@ -161,8 +161,49 @@ function writeTag2_3S32(writer, values, reverseSlotOrder = false) {
   values.forEach((value, index) => writer.signedLE(value, widths[index]));
 }
 
+/**
+ * TAG2_3SVARIABLE: same selector-0 packing as TAG2_3S32, but selectors 1 and 2
+ * are bit-packed straddling byte boundaries (5-5-4 and 8-7-7 bits) and
+ * selector 3 is per-field signed varints after a bare selector byte. Mirrors
+ * `decodeTag2_3SVariable`; the same no-round-trip-can-adjudicate-a-layout
+ * caveat as every other grouped encoding applies.
+ */
+function writeTag2_3SVariable(writer, values) {
+  if (values.every(value => fitsSigned(value, 2))) {
+    let lead = 0;
+    values.forEach((value, index) => {
+      lead |= (value & 0x03) << (4 - index * 2);
+    });
+    writer.u8(lead);
+    return;
+  }
+
+  if (fitsSigned(values[0], 5) && fitsSigned(values[1], 5) && fitsSigned(values[2], 4)) {
+    writer.u8((1 << 6) | ((values[0] & 0x1f) << 1) | ((values[1] >> 4) & 0x01));
+    writer.u8(((values[1] & 0x0f) << 4) | (values[2] & 0x0f));
+    return;
+  }
+
+  if (fitsSigned(values[0], 8) && fitsSigned(values[1], 7) && fitsSigned(values[2], 7)) {
+    writer.u8((2 << 6) | ((values[0] >> 2) & 0x3f));
+    writer.u8(((values[0] & 0x03) << 6) | ((values[1] >> 1) & 0x3f));
+    writer.u8(((values[1] & 0x01) << 7) | (values[2] & 0x7f));
+    return;
+  }
+
+  writer.u8(3 << 6);
+  values.forEach(value => writer.signedVB(value));
+}
+
 function writeTag8_4S16(writer, values, reverseSlotOrder = false) {
   const padded = [...values, 0, 0, 0, 0].slice(0, 4);
+  const outOfRange = padded.find(value => !fitsSigned(value, 16));
+  if (outOfRange !== undefined) {
+    // Masking would silently fold the residual into a different value and
+    // encode a wrong fixture without an error — the event-payload path already
+    // throws for its overflow, and this one must too.
+    throw new RangeError(`TAG8_4S16 cannot encode ${outOfRange}: exceeds 16 signed bits`);
+  }
   const widths = padded.map(value => {
     if (value === 0) return 0;
     if (fitsSigned(value, 4)) return 1;
@@ -226,6 +267,9 @@ export function writeGroup(writer, encoding, values, options = {}) {
     case Encoding.TAG2_3S32:
       writeTag2_3S32(writer, [...values, 0, 0, 0].slice(0, 3), reversed);
       break;
+    case Encoding.TAG2_3SVARIABLE:
+      writeTag2_3SVariable(writer, [...values, 0, 0, 0].slice(0, 3));
+      break;
     case Encoding.TAG8_4S16: writeTag8_4S16(writer, values, reversed); break;
     default:
       throw new Error(`Writer does not support encoding ${encoding}`);
@@ -237,6 +281,7 @@ function groupCapacity(encoding) {
   switch (encoding) {
     case Encoding.TAG8_8SVB: return 8;
     case Encoding.TAG2_3S32: return 3;
+    case Encoding.TAG2_3SVARIABLE: return 3;
     case Encoding.TAG8_4S16: return 4;
     default: return 1;
   }

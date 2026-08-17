@@ -94,6 +94,14 @@ export class FrameDecoder {
 
   #previous = null;
   #previous2 = null;
+  // False from the moment a frame fails until the next I frame re-anchors the
+  // stream. A P frame's residuals were computed by firmware against the frame
+  // that was lost in the gap, so applying them to the stale history yields
+  // values offset by the missing delta — plausible-looking garbage, which is
+  // exactly what design choice 1 above exists to prevent. Frames decoded while
+  // un-anchored are consumed (their byte length is self-describing and correct)
+  // but never committed or published.
+  #anchored = true;
   #slow = null;
   #home = [0, 0];
 
@@ -340,15 +348,18 @@ export class FrameDecoder {
     return published ? fix : null;
   }
 
-  /** Scans forward to the next byte that could plausibly start a frame. */
-  #resync(fromOffset) {
-    let offset = fromOffset + 1;
+  /**
+   * Scans forward from `searchFrom` (inclusive) to the next byte that could
+   * plausibly start a frame, and returns the offset it stopped at.
+   */
+  #resync(searchFrom) {
+    let offset = searchFrom;
     while (offset < this.#reader.length && !FRAME_MARKERS.has(this.#reader.at(offset))) {
       offset += 1;
     }
 
     this.#reader.offset = offset;
-    return offset - fromOffset;
+    return offset;
   }
 
   /**
@@ -377,10 +388,14 @@ export class FrameDecoder {
     // decoded and discarded — see GPS_PUBLISHED_FIELDS.
     const gps = [];
     const errors = [];
-    const counts = {I: 0, P: 0, S: 0, G: 0, H: 0, E: 0, rejected: 0, resyncBytes: 0};
+    const counts = {
+      I: 0, P: 0, S: 0, G: 0, H: 0, E: 0,
+      rejected: 0, droppedInterFrames: 0, resyncBytes: 0
+    };
 
     let reachedLogEnd = false;
     let limitExceeded = false;
+    let sawTruncatedError = false;
     let recordsProcessed = 0;
 
     const recordLimit = (resource, limit, offset = this.#reader.offset) => {
@@ -423,6 +438,7 @@ export class FrameDecoder {
             // and restart prediction history from it.
             this.#previous = null;
             this.#previous2 = null;
+            this.#anchored = true;
             this.#commitMainFrame(values);
             intraSampleIndices.push(samples.length);
             samples.push(values);
@@ -439,9 +455,22 @@ export class FrameDecoder {
               throw corruptFrame('P frame before any I frame', {offset: frameStart});
             }
             const values = this.#decodeFields(mainInter, true);
+            if (!this.#anchored) {
+              // The stream lost a frame since the last commit, so this delta's
+              // base is gone: the bytes are consumed (the frame's length is
+              // self-describing) but the values would be offset by the missing
+              // delta, so nothing is committed or published until the next I
+              // frame carries an absolute again.
+              counts.droppedInterFrames += 1;
+              break;
+            }
             if (!this.#isPlausibleMainFrame(values)) {
               counts.rejected += 1;
-              throw corruptFrame('P frame failed monotonicity check', {offset: frameStart});
+              // The frame body itself decoded cleanly to the reader's current
+              // offset; tell the resync where it may resume the scan so the
+              // rejected frame's own payload bytes are not re-read as markers.
+              throw corruptFrame('P frame failed monotonicity check',
+                {offset: frameStart, resumeOffset: this.#reader.offset});
             }
             this.#commitMainFrame(values);
             samples.push(values);
@@ -545,10 +574,30 @@ export class FrameDecoder {
         }
 
         if (error.code === DecodeErrorCode.TRUNCATED) {
+          // The reader can run dry mid-payload (e.g. a float cut 1-3 bytes
+          // short) with its offset still inside the session; the flag, not the
+          // final offset, is what records that the capture stopped mid-frame.
+          sawTruncatedError = true;
           break;
         }
 
-        counts.resyncBytes += this.#resync(frameStart);
+        // Prediction history now predates a gap; see the field's declaration.
+        this.#anchored = false;
+
+        const resumeOffset = Number.isSafeInteger(error.details?.resumeOffset) &&
+          error.details.resumeOffset > frameStart
+          ? error.details.resumeOffset
+          : frameStart + 1;
+        const resumedAt = this.#resync(resumeOffset);
+        counts.resyncBytes += resumedAt - frameStart;
+
+        if (resumedAt >= sessionEnd) {
+          // The scan found nothing decodable between this failure and the end
+          // of the session: the shape of a capture that simply stopped (erased-
+          // flash padding, a cut final frame), not of a misread log. Recorded on
+          // the error so `splitSessionErrors` can classify it as the tail.
+          errors[errors.length - 1].scannedToSessionEnd = true;
+        }
       }
 
       if (reachedLogEnd) {
@@ -567,7 +616,7 @@ export class FrameDecoder {
       reachedLogEnd,
       limitExceeded,
       bytesConsumed: this.#reader.offset - session.dataOffset,
-      truncated: !reachedLogEnd && this.#reader.offset >= sessionEnd
+      truncated: !reachedLogEnd && (this.#reader.offset >= sessionEnd || sawTruncatedError)
     };
   }
 }

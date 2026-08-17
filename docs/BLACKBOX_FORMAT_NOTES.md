@@ -263,7 +263,7 @@ that encoding, across 134,000 frames, without the stream ever losing sync.
 | 7 | TAG2_3S32 | see below | real log — **except selector 3's first two width slots, which no log we hold separates** |
 | 8 | TAG8_4S16 | see below | real log |
 | 9 | NULL | no bytes; value comes entirely from the predictor | real log |
-| 10 | TAG2_3SVARIABLE | as TAG2_3S32, widest selector uses signed varints | **round-trip only — not seen in any of the four logs** |
+| 10 | TAG2_3SVARIABLE | selector 0 as TAG2_3S32; selectors 1-2 bit-packed 5-5-4 / 8-7-7; selector 3 per-field signed varints | **round-trip only — not seen in any of the four logs** |
 
 Measured field-table inventory, 2026-08-12: the real 4.6 log declares encodings
 {0, 1, 3, 6, 7, 8, 9}; the three third-party 4.4 logs declare {0, 1, 6, 7, 9}.
@@ -375,9 +375,18 @@ The worst offender in each reversal:
 | 2 (three 6-bit values) | `axisP[0]` **19.6x**, `axisP[2]` 10.5x |
 | none — as shipped | 1.16x, and nothing above the threshold |
 
-**TAG2_3SVARIABLE has no width-slot surface of its own.** Its selectors 0–2
-delegate straight to TAG2_3S32 and therefore inherited nothing wrong; its
-selector 3 is variable-byte with no width slots at all.
+**TAG2_3SVARIABLE is NOT a delegation to TAG2_3S32, and believing it was is the
+worst layout error this file has carried.** Until 17 August 2026 this paragraph
+said its selectors 0–2 "delegate straight to TAG2_3S32 and therefore inherited
+nothing wrong". Only selector 0 shares TAG2_3S32's packing. Selector 1 is three
+values BIT-packed 5-5-4 across two bytes (`ss111 1122 2223 333`), selector 2 is
+8-7-7 across three bytes (`ss111111 11222222 23333333`), and selector 3 is
+per-field signed varints after a bare selector byte. The delegation consumed
+the right number of bytes under both layouts — selector 1 spans two bytes and
+selector 2 three either way — so sync held and every 3-8 bit delta would have
+decoded silently wrong. No held log declares encoding 10, so no continuity
+measurement covers it: the corrected layout is written from the format's
+serializer and verified by round-trip only, with all the limits that carries.
 
 ### TAG8_8SVB is in the silent class too
 
@@ -445,11 +454,15 @@ right. Analysis built on it was measuring a sawtooth.
 aligned proves nothing about the values in it.** Any encoding whose widths are
 selected by a header byte can be permuted without losing sync.
 
-**That warning was correct and has now been discharged, the hard way.** It named
-TAG2_3S32 as deserving the same continuity check, and when the check was finally
-run, TAG2_3S32 selector 3 turned out to be broken in the identical shape — see
-its section above. TAG2_3SVARIABLE was cleared for a different reason: it has no
-width slots of its own.
+**That warning was correct and has now been discharged, the hard way — twice.**
+It named TAG2_3S32 as deserving the same continuity check, and when the check
+was finally run, TAG2_3S32 selector 3 turned out to be broken in the identical
+shape — see its section above. TAG2_3SVARIABLE had been "cleared" on the theory
+that it has no width slots of its own; that theory was wrong (see its section
+above): its middle selectors partition their bits differently from TAG2_3S32
+while consuming the same byte counts, which is the same silent class again. No
+held log can measure it; a real log declaring encoding 10 remains on the
+wishlist at the top of this file.
 
 Two things follow, and they are worth stating as rules rather than as history:
 

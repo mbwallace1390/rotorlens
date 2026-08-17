@@ -31,6 +31,21 @@ export function sessionEndOffset(result, index, byteLength) {
  *
  * `body` is the set that means the decoder did not understand the log. `tail` is
  * the set explained by the capture stopping mid-frame.
+ *
+ * Two error shapes qualify as tail, and both are required in practice:
+ *
+ * - a `truncated` error near the end — the reader ran out of bytes inside a
+ *   frame, the literal cut;
+ * - a `corrupt-frame` error whose resync scanned to the session end without
+ *   finding another frame (`scannedToSessionEnd`, stamped by the frame loop).
+ *   A dataflash dump cut by power-off usually does NOT end at an exact frame
+ *   boundary: it ends in erased-flash 0xff padding or a stump that fails a
+ *   check, which surfaces as `corrupt-frame`, never as `truncated`. Requiring
+ *   the `truncated` code alone classified every such ordinary capture as
+ *   damaged — the exact false alarm this module exists to prevent. No distance
+ *   bound applies to this shape because erased padding can be arbitrarily
+ *   long; the evidence is that nothing decodable followed, not that the
+ *   failure sat near the end.
  */
 export function splitSessionErrors(session, sessionEnd, tolerance = TAIL_TOLERANCE_BYTES) {
   const body = [];
@@ -39,12 +54,18 @@ export function splitSessionErrors(session, sessionEnd, tolerance = TAIL_TOLERAN
   for (const error of session.errors ?? []) {
     const offset = error.offset;
     const distanceFromEnd = sessionEnd - offset;
-    const canBeCaptureTail = Boolean(session.truncated) &&
+    const inSession = Boolean(session.truncated) &&
       Number.isFinite(offset) &&
       offset >= (session.byteOffset ?? 0) &&
-      distanceFromEnd >= 0 &&
-      distanceFromEnd <= tolerance &&
-      error.code === 'truncated';
+      distanceFromEnd >= 0;
+    // `formatMismatch` marks affirmative evidence the decoder disagrees with
+    // the bytes (e.g. a log-end record with the wrong payload) — that is a
+    // misread wherever it sits, never a cut.
+    const canBeCaptureTail = inSession &&
+      error.formatMismatch !== true &&
+      (error.code === 'truncated'
+        ? distanceFromEnd <= tolerance
+        : error.code === 'corrupt-frame' && error.scannedToSessionEnd === true);
 
     if (canBeCaptureTail) {
       tail.push(error);

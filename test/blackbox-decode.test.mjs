@@ -232,8 +232,15 @@ test('a damaged span costs frames but never the rest of the log', async () => {
 
   assert.ok(session.errors.length > 0, 'damage must be reported, not hidden');
   assert.ok(session.frameCounts.resyncBytes > 0, 'decoder must resync past the damage');
+  // A P frame between the damage and the next I frame carries a delta whose
+  // base was lost in the gap; committing it would publish values offset by the
+  // missing delta as if they were decoded truth. Those frames are consumed and
+  // dropped, so up to one keyframe period is lost on top of the damaged span
+  // itself — the cost of never presenting a stale-base sample.
+  assert.ok(session.frameCounts.droppedInterFrames > 0,
+    'un-anchored delta frames after the gap must be dropped, not committed');
   assert.ok(
-    session.samples.length > 300,
+    session.samples.length > 280,
     `expected most frames to survive, got ${session.samples.length}`
   );
   for (const error of session.errors) {
@@ -1155,4 +1162,85 @@ test('each GPS coordinate predicts against its own home coordinate, not the firs
   // real log looked correct. Pin that the corpus does not repeat that mistake.
   const [zeroed] = decodeLog(homeCoordLog({home: [0, 0], residuals: [112, 4104]})).sessions;
   assert.deepEqual(zeroed.samples, [[1000, 112, 4104]]);
+});
+
+test('a dump ending in erased-flash padding is a truncated capture, not a damaged log', () => {
+  // A dataflash capture cut by power-off does not stop at a frame boundary: it
+  // stops wherever the last write reached, followed by erased 0xff cells. That
+  // surfaces as a corrupt-frame error (0xff is no frame marker), never as a
+  // `truncated` one — so classifying the tail by error code alone reported
+  // every such ordinary capture as damaged, the exact false alarm
+  // log-integrity.mjs exists to prevent.
+  const writer = new ByteWriter();
+  writer.ascii([
+    'H Product:Blackbox flight data recorder by Nicholas Sherlock',
+    'H Data version:2',
+    'H Field I name:time',
+    'H Field I signed:0',
+    'H Field I predictor:0',
+    'H Field I encoding:1',
+    'H Field P predictor:1',
+    'H Field P encoding:0',
+    'H Firmware type:Rotorflight',
+    'H Firmware revision:Rotorflight 4.6.0 (protocol fixture) STM32H743',
+    ''
+  ].join('\n'));
+  writer.ascii('I').unsignedVB(1000);
+  writer.ascii('P').signedVB(10);
+  for (let index = 0; index < 8192; index += 1) {
+    writer.u8(0xff); // erased flash, deliberately wider than TAIL_TOLERANCE_BYTES
+  }
+  const bytes = new Uint8Array(writer.toBuffer());
+
+  const [session] = decodeLog(bytes).sessions;
+  assert.deepEqual(session.samples, [[1000], [1010]], 'the flown frames must survive');
+  assert.equal(session.truncated, true);
+  assert.ok(session.errors.length > 0, 'the cut must be reported, not hidden');
+
+  const integrity = sessionIntegrity(session, bytes.length);
+  assert.equal(integrity.state, 'truncated',
+    'a power-cut capture must never be reported as a misread log');
+  assert.deepEqual(integrity.bodyErrors, []);
+});
+
+test('a capture cut inside a float payload is truncated, not damaged', () => {
+  // floatLE throws `truncated` with 1-3 bytes remaining, so the reader stops
+  // BEFORE the session end; the flag on the error, not the final offset, is
+  // what records that the capture stopped mid-frame.
+  const cut = protocolLog({body(writer) {
+    writer.ascii('I').unsignedVB(1000);
+    writer.ascii('E').u8(13).u8(0x85); // inflight adjustment, float flag set
+    writer.u8(0x00).u8(0x00); // two of the four float bytes, then the cut
+  }});
+
+  const [session] = decodeLog(cut).sessions;
+  assert.equal(session.truncated, true);
+  assert.ok(session.errors.some(error => error.code === 'truncated'));
+  assert.equal(sessionIntegrity(session, cut.length).state, 'truncated');
+});
+
+test('a rejected frame\'s own payload is not rescanned for frame markers', () => {
+  // A P frame that decodes cleanly but fails the monotonicity check has a known
+  // end offset. Resyncing from inside its payload would treat payload bytes
+  // that happen to match 'I'/'P'/'E'... as frame starts and cascade errors.
+  const bytes = protocolLog({body(writer) {
+    writer.ascii('I').unsignedVB(100_000);
+    // Backwards time step: residual encodes -50_000, and the varint bytes of
+    // zigzag(-50_000) = 0x9f 0x8d 0x06 contain no frame marker; pad the frame
+    // with a following P frame whose bytes DO contain marker-valued bytes.
+    writer.ascii('P').signedVB(-50_000);
+    writer.ascii('P').signedVB(10);
+    writeLogEnd(writer);
+  }});
+
+  const [session] = decodeLog(bytes).sessions;
+  const monotonicity = session.errors.filter(error =>
+    /monotonicity/.test(error.message ?? ''));
+  assert.equal(monotonicity.length, 1, 'exactly one frame is rejected');
+  assert.equal(session.frameCounts.rejected, 1);
+  // The following P frame is dropped (its delta base is gone), and the stream
+  // then ends cleanly: no cascade of secondary errors from payload rescanning.
+  assert.equal(session.errors.length, 1);
+  assert.equal(session.frameCounts.droppedInterFrames, 1);
+  assert.equal(session.reachedLogEnd, true);
 });

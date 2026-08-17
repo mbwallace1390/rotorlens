@@ -115,3 +115,59 @@ test('an unknown encoding is a typed error rather than silent garbage', () => {
     error => error.code === DecodeErrorCode.UNSUPPORTED_ENCODING
   );
 });
+
+/**
+ * TAG2_3SVARIABLE decodes fixed byte vectors written from the format's
+ * serializer, NOT from our own writer.
+ *
+ * These vectors are the only guard round-trip cannot provide. Selectors 1 and 2
+ * consume the same byte counts as TAG2_3S32's selectors 1 and 2 while
+ * partitioning the bits differently (5-5-4 and 8-7-7 against 4-4-4 and 6-6-6),
+ * which is how delegating them to TAG2_3S32 shipped silently: sync held, and
+ * every 3-8 bit delta decoded wrong. A writer-fed test would have agreed with
+ * whichever layout the writer shared. See docs/BLACKBOX_FORMAT_NOTES.md.
+ */
+test('TAG2_3SVARIABLE decodes serializer-derived byte vectors per selector', () => {
+  const cases = [
+    // selector 0: three 2-bit values in the lead byte, field 0 in the high pair
+    {bytes: [0b00_01_11_10], expected: [1, -1, -2]},
+    // selector 1: 5-5-4 bits — ss111 1122 2223 333
+    {bytes: [0x42, 0x10], expected: [1, 1, 0]},
+    {bytes: [0b01_11110_1, 0b1111_1000], expected: [-2, -1, -8]},
+    // selector 2: 8-7-7 bits — ss111111 11222222 23333333
+    {bytes: [0x81, 0x40, 0x00], expected: [5, 0, 0]},
+    {bytes: [0b10_111111, 0b11_111111, 0b1_1000000], expected: [-1, -1, -64]},
+    // selector 3: bare selector byte, then three signed varints
+    {bytes: [0b11_000000, 0x02, 0x01, 0x04], expected: [1, -1, 2]}
+  ];
+
+  for (const {bytes, expected} of cases) {
+    const reader = new ByteReader(new Uint8Array(bytes));
+    assert.deepEqual(decodeGroup(reader, Encoding.TAG2_3SVARIABLE, 3), expected,
+      `TAG2_3SVARIABLE failed for bytes ${bytes.map(b => b.toString(16)).join(' ')}`);
+    assert.equal(reader.offset, bytes.length, 'the group must consume exactly its bytes');
+  }
+});
+
+test('TAG2_3SVARIABLE round-trips through every selector width', () => {
+  const byWidth = [
+    [-2, 1, 0],                    // 2-bit
+    [-16, 15, -8],                 // 5-5-4 bit
+    [-128, 63, -64],               // 8-7-7 bit
+    [2_000_000, -2_000_000, 1]     // signed varints
+  ];
+
+  for (const values of byWidth) {
+    assert.deepEqual(roundTrip(Encoding.TAG2_3SVARIABLE, values), values,
+      `TAG2_3SVARIABLE failed for ${values.join(',')}`);
+  }
+});
+
+test('a residual too wide for TAG8_4S16 is refused, never silently masked', () => {
+  const writer = new ByteWriter();
+  assert.throws(() => writeGroup(writer, Encoding.TAG8_4S16, [0, 40_000, 0, 0]), RangeError);
+  assert.throws(() => writeGroup(writer, Encoding.TAG8_4S16, [-32_769, 0, 0, 0]), RangeError);
+  // The representable extremes still encode.
+  assert.deepEqual(roundTrip(Encoding.TAG8_4S16, [-32_768, 32_767, 0, 1]),
+    [-32_768, 32_767, 0, 1]);
+});

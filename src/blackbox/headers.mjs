@@ -338,8 +338,11 @@ function buildFieldTable(headers, frameType, nameSourceType = frameType, headerO
  * Not every loop iteration is written to the card. `I interval` counts loop
  * iterations between keyframes and `P ratio` counts logged frames between them,
  * so their quotient is iterations per logged frame. `P interval` states the same
- * thing directly, but as a ratio string (`1/1`, `1/2`) whose leading number is
- * the step.
+ * thing directly — either as a bare step (`2`) or as a fraction of iterations
+ * logged (`1/1`, `1/2`): `1/2` means one frame per two iterations, so the step
+ * is the DENOMINATOR over the numerator, not the leading number. Taking the
+ * leading integer of `1/2` yields a step of 1 and reproduces the loopIteration
+ * sawtooth described below on any firmware that spells the header that way.
  *
  * This was hardcoded to 1 until 12 August 2026. The real 4.6 log declares
  * `I interval:64`, `P interval:2`, `P ratio:32` — a step of 2 — so loopIteration
@@ -355,8 +358,17 @@ function incrementStep(headers) {
     return Math.max(1, intraInterval / interRatio);
   }
 
-  // `P interval` is "1/1" or "2" depending on firmware; intHeader takes the
-  // leading integer either way.
+  // `P interval` is "num/denom" or a bare step depending on firmware.
+  const raw = typeof headers['P interval'] === 'string' ? headers['P interval'].trim() : '';
+  const ratio = raw.match(/^(\d+)\s*\/\s*(\d+)$/);
+  if (ratio) {
+    const numerator = Number.parseInt(ratio[1], 10);
+    const denominator = Number.parseInt(ratio[2], 10);
+    if (numerator > 0 && denominator > 0 && denominator % numerator === 0) {
+      return Math.max(1, denominator / numerator);
+    }
+  }
+
   return Math.max(1, intHeader(headers, 'P interval', 1));
 }
 
