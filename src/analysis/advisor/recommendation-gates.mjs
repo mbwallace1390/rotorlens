@@ -621,7 +621,13 @@ export function evaluateHeadspeedGate(events, options = {}) {
       if (!DIRECTIONS.includes(event?.commandSign)) {
         continue;
       }
-      const from = event.stopTimeUs - (event.commandDurationUs ?? 0);
+      // `stopTimeUs` is where the COMMAND reached centre, which is the hold's
+      // end plus the release transit. Omitting the transit started the window
+      // mid-hold, so a governor sag confined to the early hold — the exact
+      // thing a per-event span exists to catch — fell outside the span.
+      const from = event.stopTimeUs
+        - (event.releaseTransitUs ?? 0)
+        - (event.commandDurationUs ?? 0);
       const to = event.stopTimeUs + (options.responseWindowUs ?? 1_000_000);
       const windowRecords = records
         .filter(record => record.timeUs >= from && record.timeUs <= to);
@@ -803,7 +809,15 @@ export function evaluateStabilityGate(sweep) {
 
   const required = GAIN_GATE_THRESHOLDS.requiredSweepAgreementRatio;
 
-  if (evaluable.length < outcomes.length) {
+  // A combination that could not measure is silence, not dissent — see
+  // `requiredSweepOpinionShare`, whose derivation is exactly this rule. The
+  // old unconditional check blocked the gate whenever even ONE combination was
+  // silent, so a single over-narrow window vetoed what the rest of the grid
+  // unanimously measured — the same defect that constant was added to fix,
+  // applied in one consumer and not in the gate its docstring sits beside.
+  // Unanimity among the combinations WITH an opinion is still required above.
+  const opinionShare = evaluable.length / outcomes.length;
+  if (!(opinionShare > GAIN_GATE_THRESHOLDS.requiredSweepOpinionShare)) {
     codes.push('SWEEP_INCOMPLETE');
   }
   if (!(directionAgreementRatio >= required)) {
@@ -825,6 +839,8 @@ export function evaluateStabilityGate(sweep) {
     measured: frozen({
       combinationCount: outcomes.length,
       evaluableCount: evaluable.length,
+      opinionShare,
+      requiredOpinionShare: GAIN_GATE_THRESHOLDS.requiredSweepOpinionShare,
       directionAgreementRatio,
       verdictAgreementRatio,
       requiredAgreementRatio: required,

@@ -387,6 +387,7 @@ export function summarizeAxis(session, signals) {
   let excursionCount = 0;
   let inExcursion = false;
   let excursionStartUs = null;
+  let excursionLastAboveUs = null;
   let longestAboveUs = 0;
 
   for (let i = 0; i < samples.length; i += 1) {
@@ -405,10 +406,17 @@ export function summarizeAxis(session, signals) {
           excursionCount += 1;
           excursionStartUs = times[i];
         }
+        excursionLastAboveUs = times[i];
       } else if (inExcursion && magnitude <= stopThresholdDps) {
         inExcursion = false;
-        if (Number.isFinite(excursionStartUs)) {
-          longestAboveUs = Math.max(longestAboveUs, times[i] - excursionStartUs);
+        // Measured to the LAST sample above the command threshold, matching how
+        // `detectStopEvents` measures a hold. Timing it to where the command
+        // fell to the stop threshold added the whole release ramp and any dwell
+        // between the two thresholds, so this display read longer than the hold
+        // the detector would judge — a pilot could see 180 ms against a
+        // published 150 ms floor and still be refused HOLD_TOO_SHORT.
+        if (Number.isFinite(excursionStartUs) && Number.isFinite(excursionLastAboveUs)) {
+          longestAboveUs = Math.max(longestAboveUs, excursionLastAboveUs - excursionStartUs);
         }
       }
     }
@@ -431,8 +439,8 @@ export function summarizeAxis(session, signals) {
     }
   }
 
-  if (inExcursion && Number.isFinite(excursionStartUs)) {
-    longestAboveUs = Math.max(longestAboveUs, times[times.length - 1] - excursionStartUs);
+  if (inExcursion && Number.isFinite(excursionStartUs) && Number.isFinite(excursionLastAboveUs)) {
+    longestAboveUs = Math.max(longestAboveUs, excursionLastAboveUs - excursionStartUs);
   }
 
   const window = Number.isFinite(intervalUs) && intervalUs > 0

@@ -204,13 +204,43 @@ export const EVIDENCE_LIMITS = Object.freeze({
   holdErrorNoiseFloorDps: 0.39,
 
   /**
+   * THE SAME FLOOR, MEASURED PER AXIS — which the pooled figure above is not.
+   *
+   * The 0.39 pooled p90 mixes a tight yaw distribution with two loose ones.
+   * Measured per axis on the same identical-gain corpus: roll p90 0.915 (n=5),
+   * pitch p90 1.390 (n=4), yaw p90 0.0966 max 0.1006 (n=18) — so the pooled
+   * figure applied per axis is ~4x too loose on yaw, where the metric's entire
+   * observed range is 0.0025–0.105 and the pooled gate sits above all of it (a
+   * gate that can never open), and 2.4–3.6x too tight on roll and pitch, where
+   * it re-admits exactly the weather-as-verdict false positives the floor was
+   * introduced to stop. Rounded UP from the measured p90s, because rounding a
+   * floor up only ever refuses more. The pooled figure above remains as the
+   * fallback for a comparison that has no axis, and `SENSITIVITY_FLOOR_DPS` in
+   * flight-history.mjs re-exports these same values so there is one definition.
+   */
+  holdErrorNoiseFloorByAxisDps: Object.freeze({
+    roll: 0.92,
+    pitch: 1.39,
+    yaw: 0.1
+  }),
+
+  /**
    * Hold segments needed PER SIDE before a before/after comparison may speak.
    *
-   * From the measured per-segment spread (n=83, sd 0.41 deg/s) and a two-sample
-   * t at alpha 0.05, power 0.80: five segments a side resolve a 0.8 deg/s shift,
-   * seventeen resolve 0.4, and 0.1 deg/s would need 264. Five is the smallest
-   * count that resolves anything at all, and it is deliberately the floor rather
-   * than a target.
+   * Derived from the per-axis spread and the per-axis floor, not the pooled
+   * ones. The old figure of 5 came from the POOLED per-segment sd (0.41 deg/s)
+   * resolving a POOLED 0.8 deg/s shift at alpha 0.05, power 0.80 — and it never
+   * once opened on real data: the maximum hold segments ever observed on one
+   * flight-axis across 109 sessions is 4, so all 310 same-aircraft pairs
+   * returned not-enough-evidence and the comparison had never fired.
+   *
+   * Per axis, the same two-sample power arithmetic — n per side =
+   * 2·(z₀.₀₂₅+z₀.₈)²·(sd/Δ)² with the measured per-segment sds (roll 0.348,
+   * pitch 0.445, yaw 0.0355) and the per-axis floors as the smallest shift a
+   * verdict may claim (a difference below the floor is refused regardless) —
+   * gives 2.3 for roll, 1.6 for pitch and 2.0 for yaw. Three is the ceiling of
+   * the worst axis with a margin for the small-sample t, and it is reachable:
+   * real flight-axes have shown up to 4.
    *
    * It matters because 59% of the comparable sides in the corpus (58 of 98) had
    * exactly ONE hold segment, and n=1 against n=1 cannot support any claim.
@@ -220,7 +250,7 @@ export const EVIDENCE_LIMITS = Object.freeze({
    * hand, and a function that refused to compute would make that impossible.
    * `src/analysis/flight-history.mjs` is where it is enforced.
    */
-  minimumComparisonHolds: 5,
+  minimumComparisonHolds: 3,
 
   /**
    * The band an I term can hunt in. One definition, shared.
@@ -787,10 +817,12 @@ export function compareDirectionalStopEvidence(baseline, test, options = {}) {
         test: to,
         difference: round(difference, 4),
         relative: round(relative, 4),
-        // A change inside tolerance is not a result, however tidy it looks.
+        // A change inside tolerance is not a result, however tidy it looks. A
+        // zero baseline makes any nonzero move an infinite relative one, which
+        // exceeds every tolerance — see the same rule in `compareHoldEvidence`.
         significant: Number.isFinite(relative)
           ? Math.abs(relative) > limits.comparisonToleranceRatio
-          : null
+          : (from === 0 && difference !== 0 ? true : null)
       };
     }
 
@@ -1006,6 +1038,13 @@ function measureHold(records, segment, axisIndex, termIndex, limits) {
   const smoothingSamples = Number.isFinite(medianIntervalUs) && medianIntervalUs > 0
     ? Math.round(limits.huntingSmoothingUs / medianIntervalUs)
     : 1;
+  // At or below ~10 Hz the smoothing window rounds to a single sample and
+  // `movingAverage` returns the raw signal. Counting crossings on raw error is
+  // the exact defect the filter exists to prevent (it once produced a confident
+  // "reduce I" from sensor noise crossing 61 times a second), and the noise
+  // split reads 0 — an unfiltered measurement wearing a filtered label. Such a
+  // hold reports its hunting metrics as unmeasured instead.
+  const huntingFilterApplied = smoothingSamples > 1;
   const smoothed = movingAverage(errors, smoothingSamples);
 
   const measuredDurationUs = endUs - measureStartUs;
@@ -1071,11 +1110,22 @@ function measureHold(records, segment, axisIndex, termIndex, limits) {
     errorDriftMeasurable,
 
     /** Slow error left after removing the offset: the hunting component. */
-    errorRippleRmsDps: round(rms(smoothed.map(value => value - errorCentre)), 4),
-    errorCrossingRateHz: round(zeroCrossingRateHz(times, smoothed), 4),
+    errorRippleRmsDps: huntingFilterApplied
+      ? round(rms(smoothed.map(value => value - errorCentre)), 4) : null,
+    errorCrossingRateHz: huntingFilterApplied
+      ? round(zeroCrossingRateHz(times, smoothed), 4) : null,
 
     /** Fast content, kept separate so noise is reported as noise. */
-    errorNoiseRmsDps: round(rms(errors.map((value, index) => value - smoothed[index])), 4),
+    errorNoiseRmsDps: huntingFilterApplied
+      ? round(rms(errors.map((value, index) => value - smoothed[index])), 4) : null,
+
+    /**
+     * Whether the hunting filter could be realised at this log's sample rate.
+     * False means the metrics above are null because measuring them would have
+     * counted raw sensor noise as hunting — see `huntingSmoothingUs`.
+     */
+    huntingFilterApplied,
+    huntingSmoothingSamples: smoothingSamples,
 
     iTermMean: round(mean(iTerms), 4),
     iTermRms: round(rms(iTerms), 4),
@@ -1212,6 +1262,13 @@ export function buildHoldEvidence(records, selection, options = {}) {
     meanErrorRippleRmsDps: across('errorRippleRmsDps'),
     meanErrorCrossingRateHz: across('errorCrossingRateHz'),
     meanErrorNoiseRmsDps: across('errorNoiseRmsDps'),
+    /**
+     * Holds whose sample rate let the hunting filter be applied. Zero means the
+     * hunting metrics above are null — unmeasured, not quiet — and
+     * `interpretHoldEvidence` says so in a code rather than reading silence as
+     * a healthy loop.
+     */
+    huntingMeasuredHoldCount: holds.filter(hold => hold.huntingFilterApplied).length,
     meanITermRms: across('iTermRms'),
     meanITermDriftPerSecond: across('iTermDriftPerSecond')
   };
@@ -1350,6 +1407,12 @@ export function interpretHoldEvidence(evidence, options = {}) {
     addCode(codes, 'DRIFT_NOT_SEPARABLE_FROM_ERROR');
   }
 
+  // Null hunting metrics mean the sample rate was too low to realise the
+  // filter, not that the loop was quiet. Falling through to 0 makes `hunting`
+  // false — the safe direction — but the distinction must be visible.
+  if (summary.huntingMeasuredHoldCount === 0) {
+    addCode(codes, 'HUNTING_NOT_MEASURABLE_AT_SAMPLE_RATE');
+  }
   const crossingRate = summary.meanErrorCrossingRateHz ?? 0;
   const ripple = summary.meanErrorRippleRmsDps ?? 0;
   const noise = summary.meanErrorNoiseRmsDps ?? 0;
@@ -1465,9 +1528,13 @@ export function compareHoldEvidence(baseline, test, options = {}) {
       test: to,
       difference: round(difference, 4),
       relative: round(relative, 4),
+      // A zero baseline makes any nonzero move an infinite relative one, which
+      // exceeds every tolerance; leaving it null silenced arbitrarily large
+      // deteriorations from a 0.0000 baseline (reachable after 4-decimal
+      // rounding), because a null could never satisfy the verdict gate below.
       significant: Number.isFinite(relative)
         ? Math.abs(relative) > limits.comparisonToleranceRatio
-        : null
+        : (from === 0 && difference !== 0 ? true : null)
     };
   }
 
@@ -1489,7 +1556,14 @@ export function compareHoldEvidence(baseline, test, options = {}) {
   // verdict now needs the move to clear the measured flight-to-flight floor as
   // well, and when it does not, the code says so rather than the verdict
   // silently reading like a tolerance miss.
-  const floorDps = limits.holdErrorNoiseFloorDps;
+  //
+  // The floor is the AXIS's own — see `holdErrorNoiseFloorByAxisDps`. The
+  // pooled figure applied here sat above yaw's entire dynamic range (a verdict
+  // that could never fire) and below roll/pitch ordinary weather (the false
+  // positives, back again). The pooled fallback survives only for a comparison
+  // whose axis carries no measured floor.
+  const floorDps = limits.holdErrorNoiseFloorByAxisDps?.[baseline.axis]
+    ?? limits.holdErrorNoiseFloorDps;
   const clearsNoiseFloor = Number.isFinite(errorChange?.difference)
     && Number.isFinite(floorDps)
     && Math.abs(errorChange.difference) > floorDps;

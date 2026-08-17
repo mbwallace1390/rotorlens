@@ -1002,9 +1002,11 @@ test('numbers that move with no gain change are NOT ATTRIBUTABLE, never "improve
 
 test('one hold against one hold cannot support a claim, however big the move', () => {
   // 59% of the comparable sides in the real corpus (58 of 98) had exactly one
-  // hold segment. From the measured spread, five a side resolves 0.8 deg/s and
-  // seventeen resolves 0.4.
-  for (const holdCount of [1, 2, 3, 4]) {
+  // hold segment. The gate is 3 per side, from per-axis power arithmetic
+  // against the per-axis floors — see EVIDENCE_LIMITS.minimumComparisonHolds;
+  // the old pooled derivation gave 5, which no real flight-axis has ever
+  // reached, so the comparison had never once fired.
+  for (const holdCount of [1, HISTORY_LIMITS.minimumComparisonHolds - 1]) {
     const comparison = compareFlightRecords(
       record({errorDps: 5, holdCount}),
       {...record({headers: YAW_I_CHANGED, errorDps: 1, holdCount}), ordinal: 1}
@@ -1380,7 +1382,8 @@ test('the engine\'s own comparison now refuses a move below the measured floor',
   assert.equal(comparison.changes.meanAbsoluteSteadyStateErrorDps.clearsNoiseFloor, false);
   assert.equal(comparison.verdict, 'unchanged');
   assert.ok(comparison.codes.includes('CHANGE_BELOW_MEASURED_NOISE_FLOOR'));
-  assert.equal(comparison.noiseFloorDps, EVIDENCE_LIMITS.holdErrorNoiseFloorDps);
+  assert.equal(comparison.noiseFloorDps, EVIDENCE_LIMITS.holdErrorNoiseFloorByAxisDps.yaw,
+    'the comparison must gate on its own axis\'s measured floor, not the pooled one');
   assert.equal(comparison.holdCounts.baseline, before.summary.holdCount);
 });
 

@@ -1158,6 +1158,14 @@ export function sweepStopShapeConclusion(records, axis, options = {}) {
     detectorCombinationCount: detectorCombinations.length,
     judgementCombinationCount: judgementCombinations.length,
     evaluatedCombinations,
+    // The judgement grid the conclusions were held to, carried with the result
+    // so a consumer judging against a grid BOUND (is the frequency above every
+    // swept D-band floor?) reads the same grid the sweep ran, not a copy that
+    // can drift.
+    judgementGrid: frozen({
+      ringingFloorHz: frozen([...judgementGrid.ringingFloorHz]),
+      offsetDominantShare: frozen([...judgementGrid.offsetDominantShare])
+    }),
     directions: frozen(directions)
   });
 }
@@ -2737,7 +2745,11 @@ function axisFindings({axis, material, records, summary, airframe, mechanical, h
     completeness: completeness.status,
     agreement: agreement.status,
     headspeed: headspeedGate.status,
-    stability: gainInterlocks.tracking.mayRecommend && gainInterlocks.ringing.mayRecommend
+    // The stability entry must be the STABILITY gate's own answer. It used to
+    // fold in `gainInterlocks.*.mayRecommend`, which is all five gates at once,
+    // so a withheld sentence built from this table could name "stability" as
+    // the failed check when the actual blocker was, say, event-level headspeed.
+    stability: sweeps.tracking.status === 'permitted' && sweeps.ringing.status === 'permitted'
       ? 'permitted' : 'blocked'
   };
 
@@ -2764,6 +2776,13 @@ function axisFindings({axis, material, records, summary, airframe, mechanical, h
       sweptOscillationSource: swept?.oscillationSource ?? null,
       sweptClassification: swept?.classification ?? null,
       sweptStable: swept?.stable ?? null,
+      // The swept judgements the verdicts below must consult. Both were
+      // computed by the sweep and then never copied here, so `P_TOO_LOW` tested
+      // only the shipped `offsetDominantShare` and the D-band split only the
+      // shipped `ringingFloorHz` — the sweep ran and gated nothing, which is
+      // exactly the judgement-becomes-verdict failure it exists to prevent.
+      sweptErrorKind: swept?.errorKind ?? null,
+      sweptFrequencyHzRange: swept?.frequencyHzRange ?? null,
       meanPlateauRippleDps: mean(entries.map(entry => entry.tracking?.plateauRippleRmsDps)),
       meanSignedOffsetDps: mean(entries.map(entry => entry.tracking?.signedOffsetDps)),
       meanOffsetShare: mean(entries.map(entry => entry.tracking?.offsetShare)),
@@ -3076,10 +3095,17 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
 
   if (shapeConclusion === 'not-stopped') {
     // A failure to arrest with a standing offset is P too low. Everything else
-    // with the same shape has other explanations, so the offset is required.
+    // with the same shape has other explanations, so the offset is required —
+    // and required to SURVIVE THE SWEEP: `sweptErrorKind` is 'offset' only when
+    // every event, at every detector window and every swept
+    // `offsetDominantShare`, read offset-dominant. Testing only the shipped
+    // constant let a 0.62 mean share earn "Raise P" while the sweep's 0.65 and
+    // 0.7 grid points read the same events as mixed — a conclusion that moved
+    // across the sweep, emitted anyway.
     const offsetDominant = DIRECTIONS.every(direction =>
       Number.isFinite(perDirection[direction].meanOffsetShare)
       && perDirection[direction].meanOffsetShare >= SHAPE_DEFAULTS.offsetDominantShare
+      && perDirection[direction].sweptErrorKind === 'offset'
       && (perDirection[direction].meanSignedOffsetDps ?? 0) > 0);
 
     // HOW MUCH of the commanded rate was missing — not just how cleanly the
@@ -3194,10 +3220,25 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
   }
 
   if (shapeConclusion === 'ringing') {
-    const fastEnough = Number.isFinite(perDirection.positive.meanFrequencyHz)
-      && Number.isFinite(perDirection.negative.meanFrequencyHz)
-      && Math.min(perDirection.positive.meanFrequencyHz, perDirection.negative.meanFrequencyHz)
-        >= SHAPE_DEFAULTS.ringingFloorHz;
+    // `ringingFloorHz` is a swept judgement, and the sweep must actually gate
+    // it: `classifyStopShape` keeps `ringing` regardless of frequency (it only
+    // adds a code), so classification unanimity never exercises this constant,
+    // and the D-versus-slow split used to rest on the shipped 8 Hz alone — a
+    // ring at 8.5 Hz, inside the sweep's own ambiguity band, earned a confident
+    // "Lower D". Fast now means every measured frequency clears the HIGHEST
+    // swept floor; slow means every one sits below the LOWEST; in between, the
+    // judgement constant itself would be deciding, so no gain is named.
+    const sweptRingingFloors = sweeps?.shape?.judgementGrid?.ringingFloorHz ?? null;
+    const highestSweptFloorHz = sweptRingingFloors?.length
+      ? Math.max(...sweptRingingFloors) : SHAPE_DEFAULTS.ringingFloorHz;
+    const lowestSweptFloorHz = sweptRingingFloors?.length
+      ? Math.min(...sweptRingingFloors) : SHAPE_DEFAULTS.ringingFloorHz;
+    const frequencyBounds = DIRECTIONS.map(direction =>
+      perDirection[direction].sweptFrequencyHzRange);
+    const fastEnough = frequencyBounds.every(range =>
+      Number.isFinite(range?.minimum) && range.minimum >= highestSweptFloorHz);
+    const tooSlowThroughout = frequencyBounds.every(range =>
+      Number.isFinite(range?.maximum) && range.maximum < lowestSweptFloorHz);
 
     if (!Number.isFinite(separable)) {
       out.push(makeFinding({
@@ -3320,6 +3361,47 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
           + 'should start falling. If the aircraft starts overshooting further instead, you '
           + 'have gone one step too far.',
         codes: ['FLAT_ENVELOPE_OVER_TWO_CYCLES']
+      }));
+      return out;
+    }
+
+    if (!tooSlowThroughout) {
+      // The measured frequency straddles the swept D-band boundary: at some
+      // grid points it reads as the D band and at others below it, so which
+      // term to name depends on the one constant nobody derived. Naming a gain
+      // from inside that band is the judgement deciding, not the evidence.
+      out.push(makeFinding({
+        id: 'RINGING_FREQUENCY_AMBIGUOUS',
+        rung: 'gain-D',
+        axis,
+        kind: 'next-flight',
+        confidence: 'low',
+        headline: `${axis} rings after a release at a frequency this log cannot place `
+          + 'clearly above or below the D term\'s band.',
+        reasoning: 'A fast sustained ring after a release points at the D term, and a slow '
+          + 'one at the airframe or a proportional limit cycle — but the boundary between '
+          + '"fast" and "slow" is a judgement, and this oscillation sits inside the range '
+          + 'over which that judgement was swept. Some defensible readings call it the D '
+          + 'band and others do not, so naming a gain from it would let the constant decide '
+          + 'what the evidence could not.',
+        basis: [
+          ...oscillationBasis,
+          basisEntry('measured ring frequency, lowest across the sweep',
+            round(Math.min(...frequencyBounds.map(range => range?.minimum ?? Number.NaN)
+              .filter(Number.isFinite)), 2), 'Hz', 'sweepStopShapeConclusion'),
+          basisEntry('measured ring frequency, highest across the sweep',
+            round(Math.max(...frequencyBounds.map(range => range?.maximum ?? Number.NaN)
+              .filter(Number.isFinite)), 2), 'Hz', 'sweepStopShapeConclusion'),
+          basisEntry('the D-band floor, across the swept judgement grid',
+            `${lowestSweptFloorHz}-${highestSweptFloorHz}`, 'Hz', 'SHAPE_SWEEP.ringingFloorHz')
+        ],
+        candidates: ['too much D on this axis', 'too much P on this axis',
+          'a frame or rotor mode excited by the release'],
+        confirm: 'Fly the same stops at a clearly different head speed and run the '
+          + 'vibration check over both windows. A frame or rotor mode moves with rotor '
+          + 'speed and a loop oscillation does not, and a cleaner measurement of the '
+          + 'frequency itself may fall clearly on one side of the band.',
+        codes: ['RINGING_FREQUENCY_INSIDE_SWEPT_BAND']
       }));
       return out;
     }

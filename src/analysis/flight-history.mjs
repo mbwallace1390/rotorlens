@@ -45,8 +45,10 @@
  * The floor itself (`EVIDENCE_LIMITS.holdErrorNoiseFloorDps`, 0.39 deg/s) is
  * the p90 of the change seen between two flights where nothing was changed, and
  * it is POOLED across the three axes — which is the wrong statistic to apply per
- * axis, and is corrected for the model's own purposes by SENSITIVITY_FLOOR_DPS
- * further down. The corpus contains FIVE single-gain transitions, of which one
+ * axis. Per-axis floors (`EVIDENCE_LIMITS.holdErrorNoiseFloorByAxisDps`,
+ * re-exported below as SENSITIVITY_FLOOR_DPS) are what both this module and
+ * `compareHoldEvidence` itself now gate on; the pooled figure survives only as
+ * the fallback for a comparison with no axis. The corpus contains FIVE single-gain transitions, of which one
  * has hold evidence on both sides; re-measured over the detected window it moved
  * the metric by 0.0285 deg/s, with a 95% interval of [-0.087, +0.144] that
  * includes zero. The noise is more than ten times the effect against the pooled
@@ -2150,8 +2152,10 @@ export function compareFlightRecords(before, after) {
  * ---------------------------------------------------------------------------
  *
  * `EVIDENCE_LIMITS.holdErrorNoiseFloorDps` (0.39) is the p90 of identical-gain
- * pairs POOLED across roll, pitch and yaw, and it is applied per axis. Measured
- * per axis on the same corpus it is wrong on all three: roll p90 0.915 (n=5),
+ * pairs POOLED across roll, pitch and yaw, and it WAS applied per axis until
+ * the per-axis floors moved into `EVIDENCE_LIMITS.holdErrorNoiseFloorByAxisDps`
+ * and `compareHoldEvidence` itself. Measured
+ * per axis on the same corpus the pooled figure is wrong on all three: roll p90 0.915 (n=5),
  * pitch p90 1.390 (n=4), yaw p90 0.0966 max 0.1006 (n=18) — roughly 4x too loose
  * on yaw, where the metric's entire observed range is 0.0025 to 0.105 so the
  * pooled gate sits above the full dynamic range, and 2.4x to 3.6x too tight on
@@ -2204,11 +2208,13 @@ export function compareFlightRecords(before, after) {
  *   3. A SIGN, and only then a magnitude — the far horizon, and honest about it.
  *
  * The binding constraint on all three is hold segments per flight: the corpus
- * means are 0.93 roll, 0.70 pitch, 0.83 yaw, with a maximum of 4 ever, against a
- * paired-comparison gate of 5. A qualifying hold is 5 s and the median observed
- * hold is 8.4 s, so five deliberate tail holds is 25 s of a 59 s flight. That is
- * a guidance problem, not a modelling one, and it is the highest-leverage change
- * available to this feature.
+ * means are 0.93 roll, 0.70 pitch, 0.83 yaw, with a maximum of 4 ever. The
+ * paired-comparison gate sat at 5 — derived from the pooled sd resolving a
+ * pooled 0.8 deg/s — and so never once opened; rederived per axis against the
+ * per-axis floors it is 3 (see `minimumComparisonHolds`), which real
+ * flight-axes have reached. Deliberate tail holds remain the highest-leverage
+ * change available to this feature: a qualifying hold is 5 s and the median
+ * observed hold is 8.4 s.
  */
 export const SENSITIVITY_MODEL_KIND = 'rotorlens-sensitivity-model';
 
@@ -2260,9 +2266,12 @@ export const SENSITIVITY_RESPONSE_METRIC = 'meanAbsoluteSteadyStateErrorDps';
  * them with the pilot's own.
  */
 export const SENSITIVITY_FLOOR_DPS = Object.freeze({
-  roll: 0.92,
-  pitch: 1.39,
-  yaw: 0.1,
+  // One definition: the per-axis figures live in EVIDENCE_LIMITS so that
+  // `compareHoldEvidence` gates on the same floors this model does — the two
+  // drifted once (the engine kept gating on the pooled figure per axis long
+  // after this table existed) and the drifted copy was the one that shipped in
+  // the advisor bundle.
+  ...EVIDENCE_LIMITS.holdErrorNoiseFloorByAxisDps,
   pooled: EVIDENCE_LIMITS.holdErrorNoiseFloorDps
 });
 
@@ -2270,7 +2279,7 @@ export const SENSITIVITY_LIMITS = Object.freeze({
   /**
    * Hold segments a flight needs before it may be ONE POINT.
    *
-   * Deliberately lower than `minimumComparisonHolds` (5), and the difference is
+   * Deliberately lower than `minimumComparisonHolds` (3), and the difference is
    * not a relaxation. A paired comparison has two numbers and no way to estimate
    * how much they scatter, so it must buy its confidence inside each flight. A
    * fit over six or more flights estimates the scatter from its own residuals,
@@ -2279,9 +2288,11 @@ export const SENSITIVITY_LIMITS = Object.freeze({
    * air; at two, 19% of real flight-axes qualify against 51% at one, and the
    * guided protocol (five 5 s tail holds) is what is meant to feed this.
    *
-   * The 5-hold paired gate, for the record, has never once opened on real data:
-   * the maximum ever observed on one flight-axis across 109 sessions is 4, and
-   * 0 of 90 admissible flight-axes reach 5.
+   * The paired gate sat at 5 until 17 August 2026 and never once opened on
+   * real data: the maximum ever observed on one flight-axis across 109 sessions
+   * is 4, and 0 of 90 admissible flight-axes reach 5. The 5 came from POOLED
+   * power arithmetic; rederived per axis it is 3 — see
+   * `EVIDENCE_LIMITS.minimumComparisonHolds` for the numbers.
    */
   minimumHoldsPerPoint: 2,
 

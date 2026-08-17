@@ -314,9 +314,14 @@ const REACHABILITY = [
     }))}
   )],
   ['SWEEP_NOT_RUN', () => evaluateStabilityGate(null)],
+  // Silence is abstention, not dissent: the gate blocks only when the silent
+  // combinations reach half the grid — see `requiredSweepOpinionShare`, whose
+  // rule used to be applied in the shape sweep but not here, so one over-narrow
+  // window vetoed what the rest of the grid unanimously measured.
   ['SWEEP_INCOMPLETE', () => evaluateStabilityGate({
-    outcomes: [...unanimousSweep().outcomes.slice(0, 269),
-      {...unanimousSweep().outcomes[269], worse: null, overWarnRatio: null}]
+    outcomes: unanimousSweep().outcomes.map((outcome, index) => index < 136
+      ? {...outcome, worse: null, overWarnRatio: null}
+      : outcome)
   })],
   ['SWEEP_FLIPS_DIRECTION', () => evaluateStabilityGate({
     outcomes: unanimousSweep().outcomes.map((outcome, index) => ({
@@ -823,4 +828,28 @@ test('the sweep grid brackets the shipped constants on both sides', async () => 
     window[0] === STOP_DETECTION_DEFAULTS.fastWindowUs[0]
     && window[1] === STOP_DETECTION_DEFAULTS.fastWindowUs[1]));
   assert.equal(sweepCombinations().length, 9 * 6 * 5);
+});
+
+test('one silent sweep combination abstains; a silent majority blocks', () => {
+  // A combination whose window could not measure is silence, and silence is
+  // not a contrary verdict. The old unconditional SWEEP_INCOMPLETE let a
+  // single over-narrow window veto a grid that was otherwise unanimous.
+  const oneSilent = evaluateStabilityGate({
+    outcomes: unanimousSweep().outcomes.map((outcome, index) => index === 0
+      ? {...outcome, worse: null, overWarnRatio: null}
+      : outcome)
+  });
+  assert.ok(!oneSilent.codes.includes('SWEEP_INCOMPLETE'),
+    'one abstention out of 270 must not veto the unanimous rest');
+  assert.equal(oneSilent.status, 'permitted');
+  assert.ok(oneSilent.measured.opinionShare > 0.99);
+
+  // Exactly half is not a majority of opinions, so it still blocks.
+  const halfSilent = evaluateStabilityGate({
+    outcomes: unanimousSweep().outcomes.map((outcome, index) => index < 135
+      ? {...outcome, worse: null, overWarnRatio: null}
+      : outcome)
+  });
+  assert.ok(halfSilent.codes.includes('SWEEP_INCOMPLETE'));
+  assert.equal(halfSilent.status, 'blocked');
 });
