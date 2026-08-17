@@ -23,6 +23,10 @@ if (selection.term === "I")  { addCode(codes, "I_TERM_HOLD_EVIDENCE_UNSUPPORTED"
 if (selection.axis === "yaw") { addCode(codes, "YAW_DIRECTIONAL_EVIDENCE_UNSUPPORTED"); }
 ```
 
+(The two lines above are quoted from the fork's Tune Center. As fork code they
+are GPL-3.0-covered context, like the patch beside this file, and are not
+RotorLens source; the root MPL licence does not cover this quotation.)
+
 Every yaw capture, and every I-term capture on any axis, was stamped
 inconclusive. Both gates were honest — the evidence really was missing — and both
 are now replaced by evidence rather than deleted:

@@ -24,6 +24,7 @@
 
 import {readFile, writeFile, readdir, stat} from 'node:fs/promises';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {createCorpusScan} from './corpus/measure.mjs';
 import {summarizeCorpus, renderCorpusReport, auditAll} from './corpus/summarize.mjs';
 
@@ -38,7 +39,10 @@ function parseArguments(argv) {
     if (argument === '--json') {
       options.json = argv[index += 1] ?? null;
     } else if (argument === '--limit') {
-      options.limit = Number.parseInt(argv[index += 1] ?? '', 10) || Infinity;
+      // `|| Infinity` turned `--limit 0` into "unlimited"; a non-negative
+      // integer is honoured as given and anything unparsable means no limit.
+      const parsed = Number.parseInt(argv[index += 1] ?? '', 10);
+      options.limit = Number.isInteger(parsed) && parsed >= 0 ? parsed : Infinity;
     } else if (argument === '--quiet') {
       options.quiet = true;
     } else if (argument.startsWith('--')) {
@@ -219,4 +223,10 @@ async function main() {
   }
 }
 
-await main();
+// Same entry guard as every other CLI in tools/: an unconditional `await
+// main()` exits the importing process with code 2 the moment a test or tool
+// imports this file for a helper. Resolved-path comparison, not string
+// comparison — see the note in serve-ui.mjs.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
+}

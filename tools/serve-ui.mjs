@@ -30,7 +30,18 @@ const CONTENT_TYPES = new Map([
 
 export function createUiServer() {
   return createServer(async (request, response) => {
-    const requested = decodeURIComponent(new URL(request.url, 'http://localhost').pathname);
+    // Inside the try-of-this-function's error handling, not outside it: both
+    // `new URL` and `decodeURIComponent` throw on a malformed request
+    // (`GET /%zz`), and an exception in an async http handler is an unhandled
+    // rejection that kills the whole process — one stray request took down the
+    // dev server, and with it every remaining browser test running against it.
+    let requested;
+    try {
+      requested = decodeURIComponent(new URL(request.url, 'http://localhost').pathname);
+    } catch {
+      response.writeHead(400, {'Content-Type': 'text/plain'}).end('Bad request');
+      return;
+    }
 
     // Redirect rather than serving ui/index.html at "/": the browser resolves a
     // page's relative script paths against the document URL, so serving it at the

@@ -75,10 +75,16 @@ const HOLDERS = [
   }
 ];
 
+// Accuracy is what makes the compatibility statement trademark-safe: the
+// decoder accepts Rotorflight 4.3-4.6 and refuses everything else
+// (src/blackbox/decode.mjs), so naming Betaflight in a sentence that reads as
+// "opens their logs" outran the shipped behaviour — a Betaflight pilot with a
+// .bfl registered to this app would find it refused.
 const NON_AFFILIATION =
   'RotorLens is not affiliated with, endorsed by, or sponsored by the ' +
-  'Rotorflight or Betaflight projects. It reads their Blackbox log format, ' +
-  'which is a published interoperability format, and contains none of their code.';
+  'Rotorflight or Betaflight projects. It reads the Blackbox log format, ' +
+  'which is a published interoperability format, and contains none of those ' +
+  'projects’ code. This release opens logs from Rotorflight 4.3–4.6 only.';
 
 /**
  * The disclaimer, in the app.

@@ -150,3 +150,18 @@ test('the disclaimer does not promise more than the engine enforces', async () =
   assert.ok(!/we (will )?(apply|write|set|change) (your |the )?(gain|setting)/i.test(app),
     'nothing may suggest RotorLens applies a change itself');
 });
+
+test('the compatibility statement never outruns the decoder', () => {
+  // The trademark policy permits naming Rotorflight and Betaflight to describe
+  // log compatibility WHEN ACCURATE. The decoder accepts Rotorflight 4.3-4.6
+  // and refuses everything else, so a sentence reading "reads their Blackbox
+  // log format" beside .bfl file registrations promised Betaflight pilots an
+  // app that would refuse their logs. The statement must carry the accepted
+  // range, and must not claim to read "their" format as though both projects'
+  // logs open.
+  const everything = JSON.stringify(LEGAL);
+  assert.doesNotMatch(everything, /reads their Blackbox log format/i,
+    'the legal screen claims to read both projects\' logs; the decoder does not');
+  assert.match(everything, /Rotorflight 4\.3(?:–|-)4\.6 only/,
+    'the legal screen must state the firmware range this release actually accepts');
+});

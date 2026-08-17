@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {access, readFile} from 'node:fs/promises';
+import {access, readFile, readdir} from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import {fileURLToPath} from 'node:url';
@@ -95,6 +95,15 @@ test('Firebase dependencies stay outside the app and root package', async () => 
   );
   assert.doesNotMatch(androidManifest, /android\.permission\.INTERNET/);
 
+  // Read the FILES, not the path strings. The original of this check asserted
+  // that `path.join(projectRoot, 'src')` does not contain '/backend/firebase/'
+  // — true for every input forever, so it could never fail; this repository's
+  // own history is exactly that pattern. It now scans file contents itself
+  // rather than deferring to test/firebase-backend-boundary.test.mjs, so
+  // weakening the root test does not leave this one silently green.
+  const forbidden =
+    /firebase|firestore|httpsCallable|submitCommunityContribution|deleteCommunityContributions|getCommunityStats/i;
+  const skipDirectories = new Set(['.firebase', '.git', '.gradle', 'build', 'node_modules']);
   for (const relative of [
     'src',
     'ui',
@@ -103,8 +112,25 @@ test('Firebase dependencies stay outside the app and root package', async () => 
     'tools',
     'bin'
   ]) {
-    const commandSurface = path.join(projectRoot, relative).replaceAll('\\', '/');
-    assert.ok(!commandSurface.includes('/backend/firebase/'));
+    const pending = [path.join(projectRoot, relative)];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      for (const entry of await readdir(current, {withFileTypes: true})) {
+        const full = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          if (!skipDirectories.has(entry.name)) {
+            pending.push(full);
+          }
+          continue;
+        }
+        if (!/\.(?:mjs|js|java|kt|kts|swift|html|json|xml|toml)$/i.test(entry.name)) {
+          continue;
+        }
+        const source = await readFile(full, 'utf8');
+        assert.doesNotMatch(source, forbidden,
+          `${path.relative(projectRoot, full)} must not reference the emulator backend`);
+      }
+    }
   }
 });
 

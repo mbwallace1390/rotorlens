@@ -48,7 +48,7 @@ export const LEGAL = {
       }
     ]
   },
-  "nonAffiliation": "RotorLens is not affiliated with, endorsed by, or sponsored by the Rotorflight or Betaflight projects. It reads their Blackbox log format, which is a published interoperability format, and contains none of their code.",
+  "nonAffiliation": "RotorLens is not affiliated with, endorsed by, or sponsored by the Rotorflight or Betaflight projects. It reads the Blackbox log format, which is a published interoperability format, and contains none of those projects’ code. This release opens logs from Rotorflight 4.3–4.6 only.",
   "project": {
     "name": "RotorLens",
     "creator": "Michael Wallace",

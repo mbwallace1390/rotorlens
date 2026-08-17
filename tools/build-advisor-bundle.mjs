@@ -30,7 +30,8 @@ const outputPath = path.join(projectRoot, 'dist', 'rotorlens-pid-evidence.js');
 
 export const GLOBAL_NAME = 'RotorLensPidEvidence';
 
-const EXPORT_DECLARATION = /^export\s+(const|let|function|class)\s+([A-Za-z_$][\w$]*)/gm;
+const EXPORT_DECLARATION =
+  /^export\s+(?:const|let|var|class|(?:async\s+)?function\s*\*?)\s*([A-Za-z_$][\w$]*)/gm;
 
 /**
  * Converts the ES module source into a UMD factory body.
@@ -51,13 +52,26 @@ export function transformToUmd(source, globalName = GLOBAL_NAME) {
 
   const exported = [];
   for (const match of source.matchAll(EXPORT_DECLARATION)) {
-    exported.push(match[2]);
+    exported.push(match[1]);
   }
   if (exported.length === 0) {
     throw new Error('Bundled source exports nothing');
   }
 
-  const body = source.replace(/^export\s+(?=(const|let|function|class)\s)/gm, '');
+  const body = source.replace(
+    /^export\s+(?=(?:const|let|var|class|(?:async\s+)?function)[\s*])/gm, ''
+  );
+
+  // The doc-comment above promises this transform throws rather than guessing.
+  // `export async function` was neither matched nor refused: the bare `export`
+  // survived into the UMD factory body, which is a SyntaxError at load — the
+  // tool WROTE a broken bundle instead of refusing to. Any export form the
+  // stripping above did not consume is refused here.
+  if (/^\s*export\b/m.test(body)) {
+    const leftover = body.match(/^\s*export\b.*$/m)?.[0]?.trim();
+    throw new Error(`Bundled source contains an export form the transform does not handle: `
+      + `"${leftover}"`);
+  }
   const returned = exported.map(name => `    ${name}: ${name}`).join(',\n');
 
   return `/**

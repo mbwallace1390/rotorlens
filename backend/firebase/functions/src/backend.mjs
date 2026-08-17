@@ -245,7 +245,14 @@ function auditClosedContribution(contribution, termsReceipt) {
     && violationCodes.length === REQUIRED_DRAFT_VIOLATIONS.length
     && violationCodes.every(code => REQUIRED_DRAFT_VIOLATION_SET.has(code))
     && REQUIRED_DRAFT_VIOLATIONS.every(code => violationCodes.includes(code));
-  if (!exactDraftBlockers) {
+  // A contribution that passes the FULL audit is not malformed, so refusing it
+  // as CONTRIBUTION_REJECTED would tell the first real client its payload was
+  // broken when the truth is that ingestion is closed. Unreachable while the
+  // terms registry holds only drafts (every honest contribution then carries
+  // exactly the two NOT_ADOPTED violations), but the day the terms are adopted
+  // this is the branch the first valid submission lands on.
+  const fullyValid = audit.ok === true && violationCodes.length === 0;
+  if (!fullyValid && !exactDraftBlockers) {
     refuse('invalid-argument', 'CONTRIBUTION_REJECTED');
   }
   refuse(
@@ -310,6 +317,9 @@ export function rejectCommunitySubmission(data) {
     refuse('invalid-argument', 'SUBMISSION_REQUEST_INVALID');
   }
   auditClosedContribution(request.contribution, request.termsReceipt);
+  // `auditClosedContribution` throws on every path today, so this line is a
+  // fail-closed backstop, not a reachable refusal: if that function ever gains
+  // a returning path, submission still cannot fall through to an accept.
   refuse('failed-precondition', 'PRODUCTION_INGESTION_CLOSED');
 }
 
