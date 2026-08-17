@@ -2468,7 +2468,7 @@ function mechanicalRange(scoped) {
  */
 const AXIS_ORDER = ['roll', 'pitch', 'yaw'];
 
-async function collectRecommendationMaterial(scoped, session) {
+async function collectRecommendationMaterial(scoped, session, superseded = () => false) {
   // Fetched here rather than imported at the top of this file.
   //
   // `recommendations.mjs` and the gates it pulls in are 210 KB, and they are of
@@ -2555,8 +2555,19 @@ async function collectRecommendationMaterial(scoped, session) {
   // Keep exactly one axis's records alive — the one the measurement panels are
   // about to use. The other two are ~50 MB each on a mid-size log and nothing
   // reads them again.
-  state.records = axes[selected]?.records ?? null;
-  state.recordsAxis = state.records ? selected : null;
+  //
+  // ONLY when this run is still the current one. This write sits after every
+  // await above, and the token check in `measureRecommendations` guards the
+  // paint, not this cache: a superseded run landing here late — the pilot
+  // dragged the window twice, or opened a second log while the first's ~4 s
+  // analysis was in flight — used to overwrite `state.records` with records
+  // built over a window, or a HELICOPTER, the page no longer shows, and
+  // `ensureRecords` would then serve them as current.
+  if (!superseded()) {
+    state.records = axes[selected]?.records ?? null;
+    state.recordsAxis = state.records ? selected : null;
+    state.recordsMissing = [];
+  }
 
   return {
     result,
@@ -2650,7 +2661,8 @@ async function measureRecommendations() {
 
   let produced;
   try {
-    produced = await collectRecommendationMaterial(scoped, session);
+    produced = await collectRecommendationMaterial(scoped, session,
+      () => token !== state.recommendationRun);
   } catch (error) {
     if (token !== state.recommendationRun) {
       return;
@@ -4669,6 +4681,23 @@ function renderAxisPanel() {
   // column indexes and do not care which session object they are read from.
   const summary = summarizeAxis(windowedSession(), signals);
   state.axisSummary = summary;
+
+  // `summarizeAxis` returns null for a session with the right columns and no
+  // samples — a header that parsed cleanly over an empty frame stream, e.g. an
+  // armed-and-instantly-disarmed capture. `signals.usable` is true there (the
+  // columns exist), so without this branch the dereferences below threw, the
+  // exception escaped `openSession`'s decode-scoped try, and the progress bar
+  // stayed stranded over a half-rendered page.
+  if (summary === null) {
+    $('axis-stats').innerHTML = '';
+    $('axis-note').innerHTML =
+      'This session carries the right signals but no samples — the recording ' +
+      'stopped before any frame was written — so there is nothing to measure.';
+    $('axis-plot-caption').textContent = '';
+    clearAxisPlot();
+    resetVibration();
+    return;
+  }
 
   const noise = summary.unfilteredHighFrequencyRmsDps === null
     ? `${text(summary.gyroHighFrequencyRmsDps)}°/s`
