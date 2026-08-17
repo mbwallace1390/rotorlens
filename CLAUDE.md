@@ -91,10 +91,12 @@ carries a delta, so a field decoded wrongly drifts and snaps back on a fixed
 **The claim is Rotorflight 4.6, one board, one flight.** Do not widen it in the
 README or store copy without a log for each version claimed.
 `docs/BLACKBOX_FORMAT_NOTES.md` records exactly which encodings and predictors
-real firmware has exercised and which are still round-trip only, plus event type
-51, deliberately left unimplemented because no log we hold contains one — an
-unknown event resyncs loudly, a known one with the wrong length silently
-misreads every frame after it.
+real firmware has exercised and which are still round-trip only, plus which
+event types no held log contains (51, 14, 30 — their layouts come from the
+pinned firmware serializer, not from measurement). An unknown event resyncs
+loudly; a known one with the wrong length would silently misread every frame
+after it, which is why an event layout is only ever added against the pinned
+serializer.
 
 Check any log with `npm run verify:log -- <path>`.
 
@@ -220,12 +222,17 @@ item is not code — it is one deliberate sortie, described in
 `docs/PILOT_GUIDE.md`, flown with `gyroRAW` enabled and one governor setting.
 
 **Two shipped gates could never open, and both were found by volume rather than
-by review.** `minimumComparisonHolds` is 5 per side; the maximum hold segments
+by review.** `minimumComparisonHolds` was 5 per side; the maximum hold segments
 ever observed on a flight-axis is 4, so all 310 same-aircraft pairs returned
 not-enough-evidence and the comparison had never once fired. And the 0.39 deg/s
-noise floor is a POOLED statistic applied per axis: measured per-axis it is roll
-0.915, pitch 1.390, yaw 0.0966, so it is ~4x too loose on yaw and 2.4-3.6x too
-tight on roll and pitch. Neither is fixed.
+noise floor is a POOLED statistic that was applied per axis: measured per-axis
+it is roll 0.915, pitch 1.390, yaw 0.0966, so it was ~4x too loose on yaw and
+2.4-3.6x too tight on roll and pitch. Both were fixed on 17 August 2026: the
+per-axis floors now live in `EVIDENCE_LIMITS.holdErrorNoiseFloorByAxisDps` and
+gate `compareHoldEvidence` itself, and the hold minimum was rederived per axis
+against those floors to 3 per side (the derivations are in
+`src/analysis/pid-evidence.mjs`). Neither change has yet produced a verdict on
+a real flight — the deliberate sortie below is still the blocking item.
 
 **The Android memory cap is not solved.** Lazy decoding cut opening a 125 MiB
 dump from 6.2 s to 40 ms, but the file's own bytes must now stay resident, so
