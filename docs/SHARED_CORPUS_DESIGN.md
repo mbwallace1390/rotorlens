@@ -53,7 +53,7 @@ guesses at.
 
 | Question | Status today | What a corpus gives |
 | --- | --- | --- |
-| How many hold segments can a real flight produce? | `minimumComparisonHolds` is 5. **The maximum ever observed is 4**, so the comparison has never once fired. | The real distribution, and a gate that can open. |
+| How many hold segments can a real flight produce? | `minimumComparisonHolds` sat at 5 while **the maximum ever observed is 4**, so the comparison had never once fired; rederived per axis to 3 on 17 August 2026, which observed flight-axes can reach. | The real distribution, and margin above the gate rather than a gate that barely opens. |
 | What is the flight-to-flight noise floor per axis? | Measured on 2 aircraft: roll 0.915, pitch 1.390, yaw 0.0966 °/s. n = 5, 4 and 18. | The same numbers at n in the thousands, per aircraft class. |
 | When is vibration worth chasing? | `8 °/s`, calibrated on synthetic signals, marked experimental. | Where normal sits, and — with labelled faults — where bad sits. |
 | Is 80 °/s the right stop threshold? | Chosen for 3D flying. The owner's flights peak at 56 and 32. | What learners actually fly, so the gate matches the users. |
@@ -799,9 +799,11 @@ happens to agree.
 
 Two things in that table are worth naming rather than leaving in a cell:
 
-- **The gate still cannot open.** Not one flight-axis in 93 reached five holds.
-  This is now a property of a corpus rather than of a comment, and it is the
-  number to weigh against the power the minimum was chosen for.
+- **The gate as originally shipped could not open.** Not one flight-axis in 93
+  reached five holds — a property of a corpus rather than of a comment, and the
+  number that drove the 17 August 2026 rederivation of `minimumComparisonHolds`
+  to 3 per side (per-axis power arithmetic against the per-axis floors; see
+  `src/analysis/pid-evidence.mjs`), which observed flight-axes can reach.
 - **31 flights, not 33.** `src/analysis/records.mjs` says 33, from a hand-rolled
   classifier — "rotor above 1000 rpm for more than 20 s AND the sticks moved".
   This tool uses the shipped `checkFlightAdmissible` instead, and it admits two

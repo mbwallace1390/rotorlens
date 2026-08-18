@@ -215,8 +215,15 @@ identify authorship. A separate trademark policy controls use of the RotorLens
 name and logo so modified builds can give accurate credit without presenting
 themselves as official releases.
 
-Compatibility wording may say RotorLens reads Rotorflight or Betaflight logs. It
-must not imply endorsement or affiliation, and the non-affiliation statement must
+Compatibility wording may name Rotorflight and Betaflight only to describe the
+log format, and only accurately: what makes a nominative compatibility claim
+safe is that it is TRUE, and the shipped decoder accepts Rotorflight 4.3–4.6
+and refuses everything else (`src/blackbox/decode.mjs`). So the wording states
+the accepted firmware range — "reads the Blackbox log format; this release
+opens logs from Rotorflight 4.3–4.6 only" — rather than "reads Rotorflight or
+Betaflight logs", which promises Betaflight pilots an app that would refuse
+every log they own (`test/legal-disclaimer.test.mjs` pins this). It must not
+imply endorsement or affiliation, and the non-affiliation statement must
 remain in the store listing and About & Legal screen.
 
 ## 9. Release checklist

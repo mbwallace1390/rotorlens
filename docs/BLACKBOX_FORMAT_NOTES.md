@@ -263,7 +263,7 @@ that encoding, across 134,000 frames, without the stream ever losing sync.
 | 7 | TAG2_3S32 | see below | real log — **except selector 3's first two width slots, which no log we hold separates** |
 | 8 | TAG8_4S16 | see below | real log |
 | 9 | NULL | no bytes; value comes entirely from the predictor | real log |
-| 10 | TAG2_3SVARIABLE | selector 0 as TAG2_3S32; selectors 1-2 bit-packed 5-5-4 / 8-7-7; selector 3 per-field signed varints | **round-trip only — not seen in any of the four logs** |
+| 10 | TAG2_3SVARIABLE | selector 0 as TAG2_3S32; selectors 1-2 bit-packed 5-5-4 / 8-7-7; selector 3 per-field byte counts (field 0 low pair) then raw LE bytes | **round-trip only — not seen in any of the four logs** |
 
 Measured field-table inventory, 2026-08-12: the real 4.6 log declares encodings
 {0, 1, 3, 6, 7, 8, 9}; the three third-party 4.4 logs declare {0, 1, 6, 7, 9}.
@@ -380,13 +380,27 @@ worst layout error this file has carried.** Until 17 August 2026 this paragraph
 said its selectors 0–2 "delegate straight to TAG2_3S32 and therefore inherited
 nothing wrong". Only selector 0 shares TAG2_3S32's packing. Selector 1 is three
 values BIT-packed 5-5-4 across two bytes (`ss111 1122 2223 333`), selector 2 is
-8-7-7 across three bytes (`ss111111 11222222 23333333`), and selector 3 is
-per-field signed varints after a bare selector byte. The delegation consumed
-the right number of bytes under both layouts — selector 1 spans two bytes and
-selector 2 three either way — so sync held and every 3-8 bit delta would have
-decoded silently wrong. No held log declares encoding 10, so no continuity
-measurement covers it: the corrected layout is written from the format's
-serializer and verified by round-trip only, with all the limits that carries.
+8-7-7 across three bytes (`ss111111 11222222 23333333`), and selector 3 carries
+three 2-bit per-field byte counts in the lead byte's low six bits — field 0 in
+the LOW pair, count = bits + 1 — followed by each field as raw little-endian
+two's-complement bytes, the same construction as TAG2_3S32's selector 3. The
+delegation consumed the right number of bytes for selectors 1 and 2 under both
+layouts, so sync held and every 3-8 bit delta would have decoded silently
+wrong.
+
+**And the first correction of this section got selector 3 wrong too.** It kept
+the old "per-field signed varints after a bare selector byte" reading and
+called the whole layout serializer-derived. The serializer's selector-3 case
+builds `(3 << 6) | selector2` with the byte counts in `selector2` and writes
+raw LE bytes; the varint reading ignored those byte counts AND consumed a
+different number of bytes (firmware's `C1 2C 01 00 00` for `[300, 0, 0]` read
+as `[22, -1, 0]` across four bytes), so unlike the middle selectors it would
+also have desynchronized the stream. Caught by re-deriving each selector
+against the serializer independently rather than trusting this file's own
+previous sentence. No held log declares encoding 10, so no continuity
+measurement covers any of it: the corrected layout is written from the
+format's serializer and verified by fixed serializer-derived byte vectors plus
+round-trip, with all the limits that carries.
 
 ### TAG8_8SVB is in the silent class too
 

@@ -77,12 +77,15 @@ constant command each — a heading held, or a steady turn — with the other tw
 axes quiet. That is what the I term is measured on.
 
 Five is not a round number picked for the sake of it. Comparing one flight
-directly against the one before it needs five holds **on each side**, and in the
-reference corpus 59% of otherwise comparable flights carried exactly one. Two
-holds produce a flight the direct comparison will then refuse, which is the most
-frustrating way to waste a sortie. (The learning model asks less of a single
-flight — two holds — because it estimates its own scatter across many flights
-instead of trusting two. Fly five and you feed both.)
+directly against the one before it needs three holds **on each side** (the
+minimum was rederived per axis on 17 August 2026 — it was five, which no real
+flight-axis had ever reached), and in the reference corpus 59% of otherwise
+comparable flights carried exactly one. Two holds produce a flight the direct
+comparison will then refuse, which is the most frustrating way to waste a
+sortie — and five gives the comparison margin above its floor rather than
+sitting exactly on it. (The learning model asks less of a single flight — two
+holds — because it estimates its own scatter across many flights instead of
+trusting two. Fly five and you feed both.)
 
 Leave at least a second and a half of calm between stops so they do not run into
 each other.

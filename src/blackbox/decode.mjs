@@ -94,14 +94,24 @@ function freezeFrameCounts(counts) {
     H: counts.H,
     E: counts.E,
     rejected: counts.rejected,
+    droppedInterFrames: counts.droppedInterFrames,
     resyncBytes: counts.resyncBytes
   });
 }
 
 function freezeDecodeErrors(errors) {
+  // The two boolean flags are part of what an error MEANS to the integrity
+  // classifier: `splitSessionErrors` reads `scannedToSessionEnd` to recognise
+  // a capture that simply stopped and `formatMismatch` to refuse that reading.
+  // Stripping them here made frozen evidence classify a power-cut erased-flash
+  // tail as `damaged` while the live session's own errors classified the same
+  // bytes `truncated` — two answers about one file, the split the classifier
+  // exists to prevent.
   return Object.freeze(errors.map(error => Object.freeze({
     code: error.code,
-    offset: error.offset
+    offset: error.offset,
+    ...(error.scannedToSessionEnd === true ? {scannedToSessionEnd: true} : {}),
+    ...(error.formatMismatch === true ? {formatMismatch: true} : {})
   })));
 }
 
@@ -261,7 +271,10 @@ function unreadableSession(report) {
     intraSampleIndices: [],
     events: [],
     gps: [],
-    frameCounts: {I: 0, P: 0, S: 0, G: 0, H: 0, E: 0, rejected: 0, resyncBytes: 0},
+    frameCounts: {
+      I: 0, P: 0, S: 0, G: 0, H: 0, E: 0,
+      rejected: 0, droppedInterFrames: 0, resyncBytes: 0
+    },
     truncated: false,
     reachedLogEnd: false,
     limitExceeded: (report.errors ?? [])

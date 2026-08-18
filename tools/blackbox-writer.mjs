@@ -162,9 +162,11 @@ function writeTag2_3S32(writer, values, reverseSlotOrder = false) {
 }
 
 /**
- * TAG2_3SVARIABLE: same selector-0 packing as TAG2_3S32, but selectors 1 and 2
- * are bit-packed straddling byte boundaries (5-5-4 and 8-7-7 bits) and
- * selector 3 is per-field signed varints after a bare selector byte. Mirrors
+ * TAG2_3SVARIABLE: same selector-0 packing as TAG2_3S32, selectors 1 and 2
+ * bit-packed straddling byte boundaries (5-5-4 and 8-7-7 bits), and selector 3
+ * carrying per-field 2-bit byte counts in the lead byte (field 0 in the low
+ * pair) followed by raw little-endian fields — the serializer's layout, not
+ * signed varints, which this function's first version wrote. Mirrors
  * `decodeTag2_3SVariable`; the same no-round-trip-can-adjudicate-a-layout
  * caveat as every other grouped encoding applies.
  */
@@ -191,8 +193,18 @@ function writeTag2_3SVariable(writer, values) {
     return;
   }
 
-  writer.u8(3 << 6);
-  values.forEach(value => writer.signedVB(value));
+  const widths = values.map(value => {
+    if (fitsSigned(value, 8)) return 1;
+    if (fitsSigned(value, 16)) return 2;
+    if (fitsSigned(value, 24)) return 3;
+    return 4;
+  });
+  let lead = 3 << 6;
+  widths.forEach((width, index) => {
+    lead |= (width - 1) << (index * 2);
+  });
+  writer.u8(lead);
+  values.forEach((value, index) => writer.signedLE(value, widths[index]));
 }
 
 function writeTag8_4S16(writer, values, reverseSlotOrder = false) {

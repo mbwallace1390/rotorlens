@@ -159,8 +159,10 @@ function decodeTag2_3SVariable(reader, count) {
   // Only selector 0 shares its packing with TAG2_3S32. Selectors 1 and 2 are
   // BIT-packed straddling byte boundaries — 5-5-4 bits over two bytes and
   // 8-7-7 bits over three — not the nibble/byte-aligned 4-4-4 and 6-6-6 of
-  // TAG2_3S32, and selector 3 is per-field signed varints after a bare
-  // selector byte.
+  // TAG2_3S32. Selector 3 carries three 2-bit per-field BYTE COUNTS in the
+  // lead byte's low six bits (field 0 in the LOW pair, count = bits + 1) and
+  // then each field as raw little-endian two's-complement bytes — the same
+  // shape as TAG2_3S32's selector 3, NOT signed varints.
   //
   // Until 17 August 2026 selectors 0-2 all delegated to TAG2_3S32, and nothing
   // could catch it: selector 1 consumes two bytes and selector 2 three bytes
@@ -169,7 +171,11 @@ function decodeTag2_3SVariable(reader, count) {
   // as TAG8_4S16, one step worse — it is not a permutation of the right bits
   // but a different partition of them, invisible to alignment, round-trip
   // (there was none) and any check short of continuity on a real log carrying
-  // encoding 10, which none of the four held logs does. Layouts below are
+  // encoding 10, which none of the four held logs does. And the first fix of
+  // this function corrected selectors 1-2 while keeping selector 3 as signed
+  // varints, which the serializer contradicts: that layout ignores the lead
+  // byte's byte counts AND consumes the wrong number of bytes, so one wide
+  // delta would have desynchronized everything after it. Layouts below are
   // written from the format's serializer; see docs/BLACKBOX_FORMAT_NOTES.md.
   switch (selector) {
     case 0: // three 2-bit values in the lead byte, field 0 in the HIGH pair
@@ -195,9 +201,10 @@ function decodeTag2_3SVariable(reader, count) {
       break;
     }
 
-    default: // per-field signed variable-byte values
+    default: // per-field byte counts in the lead byte, then raw LE bytes
       for (let index = 0; index < 3; index += 1) {
-        values[index] = reader.signedVB();
+        const width = ((lead >> (index * 2)) & 0x03) + 1;
+        values[index] = reader.signedLE(width);
       }
       break;
   }

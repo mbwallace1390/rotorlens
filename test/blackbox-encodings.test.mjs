@@ -137,8 +137,15 @@ test('TAG2_3SVARIABLE decodes serializer-derived byte vectors per selector', () 
     // selector 2: 8-7-7 bits — ss111111 11222222 23333333
     {bytes: [0x81, 0x40, 0x00], expected: [5, 0, 0]},
     {bytes: [0b10_111111, 0b11_111111, 0b1_1000000], expected: [-1, -1, -64]},
-    // selector 3: bare selector byte, then three signed varints
-    {bytes: [0b11_000000, 0x02, 0x01, 0x04], expected: [1, -1, 2]}
+    // selector 3: per-field 2-bit byte counts in the lead byte's low six bits
+    // (field 0 in the LOW pair, count = bits + 1), then raw little-endian
+    // fields. NOT signed varints — the first fix of this encoding kept the
+    // varint layout here and this vector, computed from the serializer's
+    // (3<<6)|selector2 construction, is what refutes it: firmware writes
+    // [300, 0, 0] as C1 2C 01 00 00, which the varint reading decoded to
+    // [22, -1, 0] while consuming four of the five bytes.
+    {bytes: [0xc1, 0x2c, 0x01, 0x00, 0x00], expected: [300, 0, 0]},
+    {bytes: [0xc4, 0xff, 0xd4, 0xfe, 0x00], expected: [-1, -300, 0]}
   ];
 
   for (const {bytes, expected} of cases) {
@@ -154,7 +161,8 @@ test('TAG2_3SVARIABLE round-trips through every selector width', () => {
     [-2, 1, 0],                    // 2-bit
     [-16, 15, -8],                 // 5-5-4 bit
     [-128, 63, -64],               // 8-7-7 bit
-    [2_000_000, -2_000_000, 1]     // signed varints
+    [300, 0, 0],                   // per-field byte counts, mixed widths
+    [2_000_000, -2_000_000, 1]     // per-field byte counts, widest fields
   ];
 
   for (const values of byWidth) {

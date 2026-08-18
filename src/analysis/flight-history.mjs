@@ -1750,8 +1750,14 @@ function compareAxisHold(before, after, axis, changedTerm = null) {
   const absoluteFloorDps = SENSITIVITY_FLOOR_DPS[axis]
     ?? SENSITIVITY_FLOOR_DPS.pooled;
   const clearsAbsoluteFloor = Math.abs(difference) > absoluteFloorDps;
+  // A zero baseline makes any nonzero move an infinite relative one, which
+  // exceeds every tolerance — the same rule the engine's own comparisons
+  // apply. A null relative could never satisfy this gate, so a stored 0.0000
+  // baseline (reachable after 4-decimal rounding) silenced arbitrarily large
+  // deteriorations; the absolute floor above still refuses small ones.
   const clearsRelativeFloor = Number.isFinite(relative)
-    && Math.abs(relative) > HISTORY_LIMITS.comparisonToleranceRatio;
+    ? Math.abs(relative) > HISTORY_LIMITS.comparisonToleranceRatio
+    : baseline === 0 && difference !== 0;
 
   const measured = Object.freeze({
     metric: 'meanAbsoluteSteadyStateErrorDps',

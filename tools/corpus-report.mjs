@@ -39,10 +39,17 @@ function parseArguments(argv) {
     if (argument === '--json') {
       options.json = argv[index += 1] ?? null;
     } else if (argument === '--limit') {
-      // `|| Infinity` turned `--limit 0` into "unlimited"; a non-negative
-      // integer is honoured as given and anything unparsable means no limit.
-      const parsed = Number.parseInt(argv[index += 1] ?? '', 10);
-      options.limit = Number.isInteger(parsed) && parsed >= 0 ? parsed : Infinity;
+      // `|| Infinity` turned `--limit 0` into "unlimited". A non-negative
+      // integer is honoured as given; anything else — including a negative,
+      // which is parsable but meaningless — is refused loudly, the same way an
+      // unknown option is, rather than silently scanning the whole dump.
+      const raw = argv[index += 1] ?? '';
+      const parsed = Number.parseInt(raw, 10);
+      if (!Number.isInteger(parsed) || parsed < 0 || `${parsed}` !== raw.trim()) {
+        process.stderr.write(`--limit needs a non-negative integer, got "${raw}"\n`);
+        process.exit(2);
+      }
+      options.limit = parsed;
     } else if (argument === '--quiet') {
       options.quiet = true;
     } else if (argument.startsWith('--')) {

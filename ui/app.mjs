@@ -2495,6 +2495,11 @@ async function collectRecommendationMaterial(scoped, session, superseded = () =>
   const axisSummaries = {};
   const skipped = [];
   let anyRecords = [];
+  // The selected axis's missing-optional-field list, kept so the records cache
+  // below can carry it: a usable build still names what was absent (headspeed,
+  // vbat, ...), and analyse() renders that as "Not logged: ... Some gates
+  // cannot be checked."
+  let selectedMissing = [];
   let budget = MAX_ANALYSIS_RECORDS;
 
   const selected = $('axis').value;
@@ -2512,6 +2517,9 @@ async function collectRecommendationMaterial(scoped, session, superseded = () =>
     }
 
     const built = buildAnalysisRecords(scoped, {axis});
+    if (axis === selected) {
+      selectedMissing = built.missing ?? [];
+    }
     if (!built.usable) {
       skipped.push({axis, why: `this log does not carry ${built.missing.join(', ')}`});
       continue;
@@ -2566,7 +2574,11 @@ async function collectRecommendationMaterial(scoped, session, superseded = () =>
   if (!superseded()) {
     state.records = axes[selected]?.records ?? null;
     state.recordsAxis = state.records ? selected : null;
-    state.recordsMissing = [];
+    // The REAL missing list, not [] — a usable build still names its absent
+    // optional fields, and blanking them here made the cached path drop the
+    // "Not logged: ... Some gates cannot be checked." note that a fresh
+    // ensureRecords build would show for the same log.
+    state.recordsMissing = state.records ? selectedMissing : [];
   }
 
   return {
@@ -4694,6 +4706,13 @@ function renderAxisPanel() {
       'This session carries the right signals but no samples — the recording ' +
       'stopped before any frame was written — so there is nothing to measure.';
     $('axis-plot-caption').textContent = '';
+    // Zero the view before resetting the vibration panel: `signals.usable` is
+    // TRUE here (the columns exist), so `syncVibrationRange` would otherwise
+    // read the PREVIOUS session's span out of `state.view` and leave "Measure
+    // vibration" enabled with a range label describing a flight that is no
+    // longer on screen. `fitAxisView` sets a zero span for an empty session,
+    // which is what disables and clears it.
+    fitAxisView();
     clearAxisPlot();
     resetVibration();
     return;
