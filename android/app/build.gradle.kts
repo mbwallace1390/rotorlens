@@ -53,8 +53,8 @@ dependencies {
     // and D8 fails on the duplicates. Pinning the shims to the same version as
     // stdlib empties them; it does not add anything to the APK.
     constraints {
-        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22")
-        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22")
+        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk7:2.4.10")
+        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8:2.4.10")
     }
 
     testImplementation("junit:junit:4.13.2")
