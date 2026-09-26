@@ -1480,6 +1480,36 @@ function describeTone(tone) {
   return `${round(tone.frequencyHz, 1)} Hz${where}${order}${size}`;
 }
 
+/**
+ * The tones that put the airframe into `attention`, when EVERY one of them is
+ * matched to a rotor order — largest first — or null.
+ *
+ * Null whenever anything else could be carrying the attention: no attention
+ * tone at all (the attention came from somewhere this layer cannot see), any
+ * unmatched attention tone, or a raised broadband floor, which no rotor order
+ * explains. Null routes the pilot to the general vibration blocker, which is
+ * the answer this function exists to narrow and never to widen.
+ */
+export function attentionTonesOnRotorOrders(airframe) {
+  if ((airframe?.elevatedAxes ?? []).length > 0) {
+    return null;
+  }
+  const attention = [];
+  for (const entry of airframe?.axes ?? []) {
+    for (const tone of entry?.tones ?? []) {
+      if (tone?.attentionEligible === true) {
+        attention.push(tone);
+      }
+    }
+  }
+  if (attention.length === 0
+      || !attention.every(tone => typeof tone.rotor === 'string' && Number.isFinite(tone.order))) {
+    return null;
+  }
+  return attention.sort((left, right) =>
+    (right.bandRmsDps ?? -Infinity) - (left.bandRmsDps ?? -Infinity));
+}
+
 /* ------------------------------------------------------ the headspeed assessment */
 
 /**
@@ -2444,25 +2474,110 @@ function airframeFindings(airframe, mechanical) {
   }
 
   const upstreamCodes = airframe.upstream.codes;
+  // WHAT the vibration check said, not only that it did not say "clear". The
+  // upstream gate blocks on `attention` (vibration measured) and on
+  // `insufficient` (vibration could not be measured) alike, which is right for
+  // the gate and wrong for the sentence: both used to reach the pilot as the
+  // same "vibration present" blocker, so a log too short to measure told him
+  // his helicopter was shaking. The gate is untouched below — every branch still
+  // emits an airframe blocker, which is what `orderFindings` suppresses gains on.
+  const mechanicalStatus = airframe.upstream.measured?.mechanicalStatus ?? null;
+  const notMeasured = mechanicalStatus === 'insufficient';
   if (upstreamCodes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED')) {
-    out.push(makeFinding({
-      id: 'AIRFRAME_VIBRATION_PRESENT',
-      rung: 'airframe',
-      kind: 'blocker',
-      adjust: 'airframe',
-      confidence: 'medium',
-      headline: 'The vibration check did not come back clear on this range.',
-      reasoning: 'A tracking fault, a worn damper or a dry bearing all look like a badly '
-        + 'tuned D term in the gyro trace, and moving a gain to chase one leaves the '
-        + 'aircraft exactly as it was.',
-      basis,
-      confirm: 'Sort the airframe, then fly the same manoeuvres again and compare this '
-        + 'number rather than the gains.',
-      codes: ['MECHANICAL_EVIDENCE_GATE_BLOCKED']
-    }));
+    const rotorTones = notMeasured ? null : attentionTonesOnRotorOrders(airframe);
+    if (notMeasured) {
+      // BROADBAND_NOT_MEASURED above already says "not measured" whenever the
+      // floor is missing, which it is on every insufficient range seen so far.
+      // One sentence per cause: a second blocker restating it reads as a
+      // second fault.
+      if (!out.some(finding => finding.id === 'AIRFRAME_BROADBAND_NOT_MEASURED')) {
+        out.push(makeFinding({
+          id: 'AIRFRAME_VIBRATION_NOT_MEASURED',
+          rung: 'airframe',
+          kind: 'blocker',
+          confidence: 'none',
+          headline: 'The vibration check could not measure this range, so the airframe has '
+            + 'not been ruled out.',
+          reasoning: 'This is an absence of measurement, not a measurement of vibration. '
+            + 'Nothing below it can be earned until the airframe has actually been looked at, '
+            + 'but nothing here says the helicopter is shaking either.',
+          basis: [
+            ...basis,
+            basisEntry('why it could not be measured',
+              (mechanical?.reasonCodes ?? []).join(', ') || null, null,
+              'mechanical-spectrum.mjs reason codes')
+          ],
+          confirm: 'Select a longer range with a steady head speed, and run the vibration '
+            + 'check again over that.',
+          codes: ['MECHANICAL_EVIDENCE_GATE_BLOCKED', 'VIBRATION_NOT_MEASURED']
+        }));
+      }
+    } else if (rotorTones !== null) {
+      // Every tone that reached the attention level sits on a rotor order. A
+      // control loop cannot choose to oscillate at exactly the rotor's own
+      // rotational frequency (see `coincidentTone`), so what crossed the line is
+      // the rotor — which `ATTENTION_BAND_RMS_THRESHOLD_DPS` in
+      // mechanical-spectrum.mjs records as the case it decides on 29 of 33 real
+      // flights, and names the open question: block, or route to the rotor.
+      // This answers only the second half. It still blocks, exactly as before;
+      // it just sends the pilot to the rotor instead of to "vibration".
+      const rotors = [...new Set(rotorTones.map(tone => tone.rotor))];
+      const which = rotors.length === 1 ? `the ${rotors[0]} rotor` : 'the rotors';
+      out.push(makeFinding({
+        id: 'AIRFRAME_ROTOR_ORDER_VIBRATION',
+        rung: 'airframe',
+        kind: 'blocker',
+        adjust: `${which} — blade tracking and balance`,
+        confidence: 'medium',
+        headline: `The vibration that stopped the check is ${which} itself: `
+          + `${describeTone(rotorTones[0])}`
+          + `${rotorTones.length > 1 ? `, and ${rotorTones.length - 1} more like it` : ''}.`,
+        reasoning: 'A tone at exactly a rotor order is the rotor itself — blade tracking, '
+          + 'balance, grips, dampers or play in the head — because a control loop cannot '
+          + 'pick the rotor\'s rotational frequency to oscillate at. It still blocks every '
+          + 'gain finding: it sits in the same gyro signal the tune is judged on. The level '
+          + 'it crossed is the experimental attention threshold, calibrated on synthetic '
+          + 'logs; where a freshly tracked and balanced head sits against it has not been '
+          + 'measured yet, so this may be ordinary for this machine. A checked head settles '
+          + 'that. A gain change cannot.',
+        basis: [
+          ...basis,
+          ...rotorTones.slice(0, 6).map(tone => basisEntry(
+            `tone at the attention level: ${describeTone(tone)}`,
+            round(tone.bandRmsDps, 3), 'deg/s',
+            `spectrum peak, present in ${Math.round((tone.persistenceRatio ?? 0) * 100)}% of `
+            + 'the analysed windows'
+          ))
+        ],
+        confirm: `Check ${which}: blade tracking and balance, the grips and dampers, and `
+          + 'anything loose in the head. Then fly the same way and compare the size of this '
+          + 'tone. If it falls, it was the rotor.',
+        codes: ['MECHANICAL_EVIDENCE_GATE_BLOCKED', 'ATTENTION_TONES_ON_ROTOR_ORDERS']
+      }));
+    } else {
+      out.push(makeFinding({
+        id: 'AIRFRAME_VIBRATION_PRESENT',
+        rung: 'airframe',
+        kind: 'blocker',
+        adjust: 'airframe',
+        confidence: 'medium',
+        headline: 'The vibration check did not come back clear on this range.',
+        reasoning: 'A tracking fault, a worn damper or a dry bearing all look like a badly '
+          + 'tuned D term in the gyro trace, and moving a gain to chase one leaves the '
+          + 'aircraft exactly as it was.',
+        basis,
+        confirm: 'Sort the airframe, then fly the same manoeuvres again and compare this '
+          + 'number rather than the gains.',
+        codes: ['MECHANICAL_EVIDENCE_GATE_BLOCKED']
+      }));
+    }
   }
-  if (upstreamCodes.includes('ROTOR_CORRELATION_UNAVAILABLE')
-      || upstreamCodes.includes('ROTOR_CORRELATION_NOT_ATTEMPTED')) {
+  // Not raised when the check could not measure anything at all: with no
+  // spectrum there was no peak to compare against the rotor, and the sentence
+  // below blames the head speed for a range that was simply too short.
+  if (!notMeasured
+      && (upstreamCodes.includes('ROTOR_CORRELATION_UNAVAILABLE')
+        || upstreamCodes.includes('ROTOR_CORRELATION_NOT_ATTEMPTED'))) {
     out.push(makeFinding({
       id: 'AIRFRAME_ROTOR_NOT_COMPARED',
       rung: 'airframe',

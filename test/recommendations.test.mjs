@@ -56,6 +56,7 @@ import {
   airframeAmbiguity,
   analyseAxisEvidence,
   assessAirframe,
+  attentionTonesOnRotorOrders,
   assessHeadspeed,
   assessHoldIndication,
   buildRecommendations,
@@ -2228,4 +2229,133 @@ test('the ambiguity note names a real tone when one is sitting at that frequency
   const rotorTone = [{frequencyHz: 31, bandRmsDps: 3.5, bandwidthHz: 2, rotor: 'main', order: 1}];
   assert.equal(airframeAmbiguity(rotorTone, 30).tone, null);
   assert.equal(unmatchedTone(rotorTone, 30), null);
+});
+
+/* =========================================================================== */
+/* WHAT THE VIBRATION CHECK SAID, NOT ONLY THAT IT DID NOT SAY "CLEAR"         */
+/* =========================================================================== */
+
+/** A mechanical result that crossed the attention level on the given tones. */
+function attentionAirframe(peaksByAxis, overrides = {}) {
+  return cleanAirframe({
+    status: 'attention',
+    reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY'],
+    tuningEvidenceGate: {status: 'blocked', reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY']},
+    axes: ['roll', 'pitch', 'yaw'].map(axis => ({
+      axis, source: 'gyroRAW', available: true,
+      medianNoisePsdDps2PerHz: 0.0002, broadbandRmsDps: 1.2,
+      peaks: peaksByAxis[axis] ?? []
+    })),
+    ...overrides
+  });
+}
+
+const ONCE_PER_REV = Object.freeze({
+  frequencyHz: 30.1, bandRmsDps: 11.5, bandwidthHz: 1.5, persistenceRatio: 0.9,
+  attentionEligible: true, harmonicMatch: {rotor: 'main', order: 1}
+});
+const TWICE_PER_REV = Object.freeze({
+  frequencyHz: 60.2, bandRmsDps: 9.1, bandwidthHz: 1.5, persistenceRatio: 0.8,
+  attentionEligible: true, harmonicMatch: {rotor: 'main', order: 2}
+});
+const FRAME_TONE = Object.freeze({
+  frequencyHz: 71, bandRmsDps: 9.4, bandwidthHz: 1.5, persistenceRatio: 0.9,
+  attentionEligible: true, harmonicMatch: null
+});
+
+const airframeIds = result => result.findings
+  .filter(finding => finding.rung === 'airframe').map(finding => finding.id);
+const adjustmentIds = result => result.findings
+  .filter(finding => finding.kind === 'adjustment').map(finding => finding.id);
+
+test('a range the vibration check could not measure is never reported as vibration', () => {
+  // The five short synthetic logs used to reach the pilot as "Your helicopter is
+  // shaking" beside "could not be measured" and "never compared against the
+  // rotor" — three blockers, one cause, and the loudest of them false.
+  const flight = buildStopFlight({axis: 'yaw', ...STOP_FAULTS.tooMuchD});
+  const unmeasured = cleanAirframe({
+    status: 'insufficient',
+    reasonCodes: ['INSUFFICIENT_CONTIGUOUS_GYRO_DATA'],
+    tuningEvidenceGate: {status: 'blocked', reasonCodes: ['INSUFFICIENT_CONTIGUOUS_GYRO_DATA']},
+    harmonicCorrelation: {state: 'not-evaluated'},
+    analyzedBandHz: null,
+    axes: []
+  });
+
+  const result = recommendFor(flight, 'yaw', unmeasured);
+  assert.deepEqual(airframeIds(result), ['AIRFRAME_BROADBAND_NOT_MEASURED'],
+    'one sentence for one cause, and it is "not measured"');
+  assert.equal(result.findings[0].actNow, true, 'it is still what the pilot is told first');
+  assert.equal(result.gates.airframe.status, 'blocked', 'the gate itself is untouched');
+  assert.deepEqual(adjustmentIds(result), [],
+    'and nothing about the gains is said over an airframe nobody has looked at');
+});
+
+test('an unmeasured range with its floors intact still says "not measured", once', () => {
+  const flight = buildStopFlight({axis: 'yaw', ...STOP_FAULTS.tooMuchD});
+  const result = recommendFor(flight, 'yaw', cleanAirframe({
+    status: 'insufficient',
+    reasonCodes: ['INSUFFICIENT_TIMESTAMPED_SAMPLES'],
+    tuningEvidenceGate: {status: 'blocked', reasonCodes: ['INSUFFICIENT_TIMESTAMPED_SAMPLES']},
+    harmonicCorrelation: {state: 'not-evaluated'}
+  }));
+
+  assert.deepEqual(airframeIds(result), ['AIRFRAME_VIBRATION_NOT_MEASURED']);
+  const finding = result.findings[0];
+  assert.equal(finding.kind, 'blocker');
+  assert.equal(finding.confidence, 'none', 'an absence of measurement is not a verdict');
+  assert.ok(finding.codes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED'));
+  assert.ok(finding.basis.some(entry =>
+    String(entry.value).includes('INSUFFICIENT_TIMESTAMPED_SAMPLES')),
+    'and it says why it could not be measured');
+  assert.deepEqual(adjustmentIds(result), []);
+});
+
+test('attention carried only by rotor-order tones sends the pilot to the rotor, and '
+  + 'still blocks every gain', () => {
+  const flight = buildStopFlight({axis: 'yaw', ...STOP_FAULTS.tooMuchD});
+  const result = recommendFor(flight, 'yaw', attentionAirframe({
+    roll: [ONCE_PER_REV], pitch: [TWICE_PER_REV]
+  }));
+
+  assert.deepEqual(airframeIds(result), ['AIRFRAME_ROTOR_ORDER_VIBRATION']);
+  const finding = result.findings[0];
+  assert.equal(finding.actNow, true);
+  assert.equal(finding.kind, 'blocker', 'the rotor still outranks the gains');
+  assert.match(finding.adjust, /main rotor/);
+  assert.match(finding.adjust, /tracking and balance/);
+  assert.match(finding.headline, /once-per-rev/, 'the largest tone is named, with its order');
+  assert.match(finding.reasoning, /synthetic/,
+    'and it says the level it crossed has not been checked on a real helicopter');
+  assert.ok(finding.basis.some(entry => /2 times-per-rev/.test(entry.label)),
+    'every attention tone is in the basis, not only the first');
+  assert.equal(result.gates.airframe.status, 'blocked');
+  assert.deepEqual(adjustmentIds(result), [],
+    'routing the sentence to the rotor must not open the gate it sits behind');
+});
+
+test('one unexplained tone keeps the general vibration blocker', () => {
+  const flight = buildStopFlight({axis: 'yaw', ...STOP_FAULTS.tooMuchD});
+  const mixed = recommendFor(flight, 'yaw', attentionAirframe({
+    roll: [ONCE_PER_REV], yaw: [FRAME_TONE]
+  }));
+  assert.deepEqual(airframeIds(mixed), ['AIRFRAME_VIBRATION_PRESENT'],
+    'a 71 Hz line is a frame or a bearing, and the rotor cannot be blamed for it');
+
+  // Attention with no tone this layer can see is not "the rotor" either.
+  const unseen = recommendFor(flight, 'yaw', attentionAirframe({}));
+  assert.deepEqual(airframeIds(unseen), ['AIRFRAME_VIBRATION_PRESENT']);
+
+  // A raised floor is never a rotor order, whatever tones sit on top of it.
+  assert.equal(attentionTonesOnRotorOrders(assessAirframe(attentionAirframe(
+    {roll: [ONCE_PER_REV]},
+    {axes: ['roll', 'pitch', 'yaw'].map(axis => ({
+      axis, source: 'gyroRAW', available: true,
+      medianNoisePsdDps2PerHz: 24, broadbandRmsDps: 109,
+      peaks: axis === 'roll' ? [ONCE_PER_REV] : []
+    }))}
+  ))), null);
+  for (const result of [mixed, unseen]) {
+    assert.deepEqual(adjustmentIds(result), []);
+  }
 });
