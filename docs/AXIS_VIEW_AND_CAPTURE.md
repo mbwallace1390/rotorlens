@@ -99,6 +99,50 @@ to fly a manoeuvre that will be refused for the same reason again.
 `test/axis-report.test.mjs` asserts the brief still quotes those constants, so
 retuning a threshold cannot leave the guidance behind.
 
+## Flying styles: the same gates, described three ways
+
+Many pilots never fly 3D. They hover, fly circuits and pirouette, and a brief
+written in 3D terms — "well past half stick, hold it for a second" — reads to
+them as "this app is not for you". Most of what the detector needs is in fact
+flown in ordinary flying:
+
+| Evidence | Ordinary manoeuvre | Style |
+| --- | --- | --- |
+| tail stops | stopping a pirouette | every style |
+| I term (holds) | a steady hover, or straight-and-level cruising | every style |
+| roll stops | rolling into and out of a turn | sport |
+| pitch stops | pulling up into a climb, then levelling out | sport |
+
+So `stopManoeuvre(axis, {style})` and `holdManoeuvre(axis, {style})` take one of
+`FLYING_STYLES` — `hover`, `sport`, `3d` — and describe the same manoeuvre in
+that style's flying. **A style changes the words and never a threshold.** The
+styled briefs read the same constants as the detector-language one, converted
+rather than restated (a quarter to half a second at the command threshold is
+quoted as the bank or pitch angle it produces), and the same tests assert it.
+`3d`, or no style at all, returns the brief this module always returned.
+
+Three decisions are worth knowing:
+
+- **Roll and pitch stops from a hover are optional.** They are possible — tip it,
+  let go for a second, catch it — but not comfortable for everyone, so the hover
+  brief says "only if you are comfortable with it" and what the rest of the
+  flight still measures without them (vibration, head speed, tail, I term).
+- **A styled hold brief asks for one kind of hold only**: a heading held, never
+  "or a steady turn". A flight that mixes held headings with steady turns is
+  refused by the before/after comparison in `flight-history.mjs`, so a brief that
+  offered both would produce exactly the flight the next step cannot use.
+- **The default style comes from the detector's own threshold.**
+  `likelyFlyingStyle` picks `hover` when neither cyclic axis reached the stop
+  command threshold in the flight on screen, otherwise `sport`. It never picks
+  `3d`: nothing in a log says a pilot wants to be asked for 3D. The pilot can
+  change it; the choice lasts for the page and is not stored, because the privacy
+  policy promises no browser storage.
+
+The viewer draws these as one "Your next flight" checklist above the findings
+(`nextFlightHtml` in `ui/app.mjs`), built from the engine's own next-flight
+findings. A manoeuvre the engine asks for to separate two causes keeps the
+engine's own words; no style rewrites it.
+
 ## The line, and where the owner moved it on 12 August 2026
 
 This section used to read *"The analysis reports MEASUREMENTS, never

@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {readFile, readdir} from 'node:fs/promises';
 
 import {
+  FLYING_STYLES,
   TERM_VIEWS,
   decimate,
   describeHoldCapture,
@@ -14,6 +15,7 @@ import {
   explainStopRefusal,
   holdManoeuvre,
   indexAtOrAfter,
+  likelyFlyingStyle,
   niceStep,
   resolveAxisSignals,
   stopManoeuvre,
@@ -964,6 +966,89 @@ test('the manoeuvre brief quotes the gates that will actually judge it', () => {
   assert.ok(hold.includes(`${EVIDENCE_LIMITS.minimumHolds} such holds`));
 });
 
+test('every flying style describes the same gates, in the flying that style does', () => {
+  // The style changes the words and never the numbers. Each styled brief must
+  // still quote the detector's own thresholds, so a hover pilot and a 3D pilot
+  // flying to their own briefs are flying to the one set of gates.
+  const needed = EVIDENCE_LIMITS.minimumStopsPerDirection;
+  const floor = STOP_DETECTION_DEFAULTS.minimumCommandHoldUs / 1e6;
+  for (const style of ['hover', 'sport']) {
+    for (const axis of ['roll', 'pitch', 'yaw']) {
+      const brief = stopManoeuvre(axis, {style});
+      const text = brief.steps.join(' ');
+      assert.equal(brief.style, style);
+      assert.ok(text.includes(`${STOP_DETECTION_DEFAULTS.commandThresholdDps}°/s`),
+        `${style} ${axis}: the command threshold must be the detector's`);
+      assert.ok(text.includes(`${floor} s is the floor`),
+        `${style} ${axis}: the hold floor must be the detector's`);
+      assert.ok(text.includes(`${needed}`), `${style} ${axis}: the count must be quoted`);
+      assert.match(text, /a full second|full \d/, `${style} ${axis}: the quiet window`);
+      assert.match(text, /spring back to centre in one clean motion/,
+        'the release is what most often throws a real stop away, so every brief says it');
+    }
+  }
+
+  // The tail is a pirouette stop for everyone who is not flying 3D.
+  for (const style of ['hover', 'sport']) {
+    const tail = stopManoeuvre('yaw', {style});
+    assert.match(tail.title, /pirouette/);
+    assert.equal(tail.optional, false);
+    assert.ok(!tail.steps.join(' ').includes('cyclic'));
+  }
+
+  // Roll and pitch from a hover are offered, never required, and the brief
+  // says what the flight still measures without them.
+  for (const axis of ['roll', 'pitch']) {
+    const hover = stopManoeuvre(axis, {style: 'hover'});
+    assert.equal(hover.optional, true);
+    assert.match(hover.steps[0], /Only if you are comfortable/);
+    assert.match(hover.skipped, /vibration check/);
+    assert.match(hover.skipped, /I term/);
+    const sport = stopManoeuvre(axis, {style: 'sport'});
+    assert.equal(sport.optional, false);
+    assert.match(sport.steps.join(' '), axis === 'roll' ? /bank/ : /nose comes up/);
+  }
+
+  // 3D, and no style at all, is the detector-language brief it always was.
+  for (const axis of ['roll', 'pitch', 'yaw']) {
+    assert.deepEqual(stopManoeuvre(axis, {style: '3d'}), stopManoeuvre(axis));
+    assert.deepEqual(holdManoeuvre(axis, {style: '3d'}), holdManoeuvre(axis));
+    assert.deepEqual(stopManoeuvre(axis, {style: 'aerobatic'}), stopManoeuvre(axis),
+      'an unknown style is no style, not an error');
+  }
+});
+
+test('a styled hold brief is one steady stretch, of one kind, for every axis', () => {
+  for (const style of ['hover', 'sport']) {
+    const briefs = ['roll', 'pitch', 'yaw'].map(axis => holdManoeuvre(axis, {style}));
+    assert.deepEqual(new Set(briefs.map(brief => brief.steps.join(' '))).size, 1,
+      'one stretch of steady flight is a hold on every axis at once');
+    const text = briefs[0].steps.join(' ');
+    assert.ok(text.includes(`${EVIDENCE_LIMITS.minimumHoldDurationUs / 1e6} s`));
+    assert.ok(text.includes(`${EVIDENCE_LIMITS.holdSetpointBandDps}°/s`));
+    assert.ok(text.includes(`${EVIDENCE_LIMITS.offAxisCommandLimitDps}°/s`));
+    assert.ok(text.includes(`${EVIDENCE_LIMITS.minimumHolds} such stretches`));
+    assert.ok(text.includes(`${EVIDENCE_LIMITS.minimumComparisonHolds} or more`),
+      'the brief must say what the before/after comparison needs, not only this flight');
+    assert.doesNotMatch(text, /turn/,
+      'mixing held headings with steady turns is refused by the comparison, so a styled '
+      + 'hold brief asks for one kind only');
+  }
+});
+
+test('the default flying style comes from the detector\'s own threshold', () => {
+  const threshold = STOP_DETECTION_DEFAULTS.commandThresholdDps;
+  assert.equal(likelyFlyingStyle({roll: threshold - 1, pitch: threshold - 1}), 'hover');
+  assert.equal(likelyFlyingStyle({roll: threshold, pitch: 10}), 'sport');
+  assert.equal(likelyFlyingStyle({roll: 10, pitch: threshold + 50}), 'sport');
+  assert.equal(likelyFlyingStyle({}), 'sport', 'nothing measured is not evidence of hovering');
+  assert.equal(likelyFlyingStyle({roll: null, pitch: Number.NaN}), 'sport');
+  for (const peaks of [{roll: 900, pitch: 900}, {roll: 1, pitch: 1}, {}]) {
+    assert.notEqual(likelyFlyingStyle(peaks), '3d',
+      'nothing in a log says a pilot wants to be asked for 3D; it is only ever chosen');
+  }
+});
+
 test('hold capture separates never-flown from set-aside', () => {
   const absent = describeHoldCapture({status: 'inconclusive', holds: [], rejectedHoldCounts: {}},
     {axis: 'roll'});
@@ -1356,8 +1441,15 @@ test('every sentence this measurement module can assemble is free of instruction
   // covering it.
   const sentences = [];
   for (const axis of ['roll', 'pitch', 'yaw']) {
-    for (const brief of [stopManoeuvre(axis), holdManoeuvre(axis)]) {
-      sentences.push(brief.title, brief.note, ...brief.steps);
+    // Every style of every brief: a style is a second copy of the same
+    // manoeuvre, and a copy nobody swept is where an instruction would hide.
+    for (const options of [{}, ...FLYING_STYLES.map(style => ({style}))]) {
+      for (const brief of [stopManoeuvre(axis, options), holdManoeuvre(axis, options)]) {
+        sentences.push(brief.title, brief.note, ...brief.steps);
+        if (brief.skipped) {
+          sentences.push(brief.skipped);
+        }
+      }
     }
     for (const state of [
       // Both arms of `absent`. The one WITH a peak was already here; the one

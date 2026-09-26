@@ -637,14 +637,73 @@ function round(value, digits = 1) {
 }
 
 /**
+ * How a pilot flies, which decides only how a manoeuvre is DESCRIBED.
+ *
+ * Nothing here moves a threshold. The detector judges every flight by the same
+ * numbers whatever the pilot picks; a style changes which ordinary manoeuvre
+ * those numbers are explained as. Many pilots never fly 3D — they hover, fly
+ * circuits, pirouette — and a brief written in 3D terms ("well past half stick,
+ * hold it for a second") reads to them as "this app is not for you", when most
+ * of what the detector needs is flown in ordinary sport flying:
+ *
+ *   tail    stopping a pirouette            any style
+ *   I term  a steady hover, or cruising     any style, and hover pilots best
+ *   roll    rolling into and out of a turn  sport
+ *   pitch   pulling up into a climb         sport
+ *
+ * Roll and pitch stops from a hover are possible but uncomfortable for many
+ * pilots, so the hover brief marks them optional and says what the rest of the
+ * flight still measures without them.
+ */
+export const FLYING_STYLES = Object.freeze(['hover', 'sport', '3d']);
+
+export const FLYING_STYLE_LABELS = Object.freeze({
+  hover: 'Hover & scale',
+  sport: 'Sport',
+  '3d': '3D'
+});
+
+function styleOf(options) {
+  return FLYING_STYLES.includes(options?.style) ? options.style : null;
+}
+
+/**
+ * The style a log looks like it was flown in, for a default the pilot can
+ * change. `hover` when neither cyclic axis reached the command a stop needs —
+ * the detector's own threshold, so the default can never disagree with it —
+ * otherwise `sport`. Never `3d`: nothing about a log says a pilot is comfortable
+ * being asked for 3D, so that is only ever chosen.
+ *
+ * @param {object} peakCommands `{roll, pitch}` peak commanded rate in deg/s
+ */
+export function likelyFlyingStyle(peakCommands = {}) {
+  const threshold = records.STOP_DETECTION_DEFAULTS?.commandThresholdDps ?? 80;
+  const cyclic = [peakCommands?.roll, peakCommands?.pitch].filter(Number.isFinite);
+  if (cyclic.length > 0 && cyclic.every(peak => peak < threshold)) {
+    return 'hover';
+  }
+  return 'sport';
+}
+
+/** Rounds to the nearest `step`, for figures a pilot reads rather than checks. */
+function nearest(value, step) {
+  return Math.round(value / step) * step;
+}
+
+/**
  * The manoeuvre that would produce stop evidence on this axis.
  *
  * Every number in it is read from the detector's own defaults rather than
  * written here, so a pilot who flies to this brief is flying to the gates that
  * will actually judge him. A brief that drifts from the detector is worse than
  * none: it sends someone up to fly a manoeuvre that will be refused again.
+ *
+ * @param {string} axis
+ * @param {object} [options] `{style}` — one of FLYING_STYLES. Without one, the
+ *   brief is the detector-language version this function has always returned,
+ *   which is also what a 3D pilot gets.
  */
-export function stopManoeuvre(axis) {
+export function stopManoeuvre(axis, options = {}) {
   const defaults = records.STOP_DETECTION_DEFAULTS ?? {};
   const commandDps = defaults.commandThresholdDps ?? 80;
   const holdSeconds = round((defaults.minimumCommandHoldUs ?? 150_000) / 1e6, 2);
@@ -655,6 +714,10 @@ export function stopManoeuvre(axis) {
     ? ['nose left', 'nose right']
     : axis === 'roll' ? ['left', 'right'] : ['forward', 'back'];
 
+  const style = styleOf(options);
+  if (style === 'hover' || style === 'sport') {
+    return styledStopManoeuvre(axis, style, {commandDps, holdSeconds, quietSeconds, needed});
+  }
   return Object.freeze({
     axis,
     title: `To capture stop evidence on ${axis}`,
@@ -674,8 +737,118 @@ export function stopManoeuvre(axis) {
   });
 }
 
-/** The manoeuvre that would produce hold evidence, i.e. I-term evidence. */
-export function holdManoeuvre(axis) {
+/**
+ * The same stop, described as a manoeuvre a hover or sport pilot already flies.
+ *
+ * The figures are the detector's, converted rather than restated: a quarter to
+ * half a second at the command threshold is the attitude change quoted, so the
+ * degrees a pilot pictures and the deg/s the detector checks cannot disagree.
+ * A quarter second is used rather than the hold floor itself because the floor
+ * is where half of real inputs already land (median 119 ms across the corpus,
+ * against a 150 ms floor — records.mjs), and a brief aimed at the floor is a
+ * brief aimed at being refused.
+ */
+function styledStopManoeuvre(axis, style, figures) {
+  const {commandDps, holdSeconds, quietSeconds, needed} = figures;
+  const briefHold = round(Math.max(0.25, nearest(holdSeconds * 1.5, 0.05)), 2);
+  const longHold = round(briefHold * 2, 2);
+  const lowDegrees = nearest(commandDps * briefHold, 5);
+  const highDegrees = nearest(commandDps * briefHold * 2, 5);
+  const secondsPerTurn = round(nearest(360 / commandDps, 0.5), 1);
+  const spare = needed + 2;
+  // "a full second" reads as the instruction it is; "a full 1 s" reads as a unit.
+  const quiet = quietSeconds === 1 ? 'second' : `${quietSeconds} s`;
+  const note = 'This says what to fly so there is something to measure. It is not a change '
+    + 'to your aircraft or your setup.';
+
+  if (axis === 'yaw') {
+    return Object.freeze({
+      axis,
+      style,
+      optional: false,
+      title: 'Tail: stop a pirouette',
+      steps: Object.freeze([
+        `In a hover at a safe height, start a pirouette of at least ${commandDps}°/s — one `
+          + `full turn every ${secondsPerTurn} s or quicker, which is slower than most `
+          + 'pirouettes.',
+        `Keep the rudder stick steady for at least ${briefHold} s (${holdSeconds} s is the `
+          + 'floor), then let it spring back to centre in one clean motion so the tail stops.',
+        `Leave the rudder stick alone for a full ${quiet} after it stops. That second `
+          + 'is the measurement; a correction inside it throws the stop away.',
+        `Stop ${needed} going nose left and ${needed} going nose right. A half turn is plenty `
+          + `each time; fly ${spare} or so each way to allow for one that does not count.`
+      ]),
+      note
+    });
+  }
+
+  if (style === 'sport') {
+    const roll = axis === 'roll';
+    return Object.freeze({
+      axis,
+      style,
+      optional: false,
+      title: roll ? 'Roll: roll into and out of turns' : 'Pitch: pull up, then level out',
+      steps: Object.freeze(roll
+        ? [
+          `At a safe height in forward flight, roll into a turn with a firm, steady input — at `
+            + `least ${commandDps}°/s, held for ${briefHold}–${longHold} s (${holdSeconds} s `
+            + `is the floor). That is roughly ${lowDegrees}–${highDegrees}° of bank.`,
+          `Let the stick spring back to centre in one clean motion, then leave the cyclic `
+            + `alone for a full ${quiet} while the helicopter holds the bank.`,
+          `Roll back out the same way — firm, steady, back to centre, then a full ${quiet} `
+            + 'with the stick alone. Rolling in counts one way and rolling out counts the other.',
+          `Every turn gives one stop each way. ${needed} clean turns is the minimum; fly ${spare} `
+            + 'or so, because a correction inside the quiet second throws that stop away.'
+        ]
+        : [
+          `At a safe height in forward flight, pull back with a firm, steady input — at least `
+            + `${commandDps}°/s, held for ${briefHold}–${longHold} s (${holdSeconds} s is the `
+            + `floor). The nose comes up roughly ${lowDegrees}–${highDegrees}°.`,
+          `Let the stick spring back to centre in one clean motion, then leave the cyclic alone `
+            + `for a full ${quiet} while the helicopter climbs.`,
+          `Push forward the same way to bring the nose back down, then a full ${quiet} with `
+            + 'the stick alone. Pulling up counts one way and pushing over counts the other.',
+          `Every climb gives one stop each way. ${needed} clean climbs is the minimum; fly `
+            + `${spare} or so, because a correction inside the quiet second throws that stop away.`
+        ]),
+      note
+    });
+  }
+
+  // Hover and scale: possible, not comfortable for everyone, never required.
+  const roll = axis === 'roll';
+  const ways = roll ? ['left', 'right'] : ['forward', 'back'];
+  return Object.freeze({
+    axis,
+    style,
+    optional: true,
+    title: roll ? 'Roll: tip it sideways in a hover (optional)' : 'Pitch: tip it forward and back in a hover (optional)',
+    steps: Object.freeze([
+      `Only if you are comfortable with it: hover at a safe height with plenty of room `
+        + `${roll ? 'on both sides' : 'ahead and behind'}.`,
+      `Tip it ${roll ? 'sideways' : 'forward'} with a quick, firm input — at least `
+        + `${commandDps}°/s held for about ${briefHold} s (${holdSeconds} s is the floor), `
+        + `roughly ${lowDegrees}° — then let the stick spring back to centre in one clean motion.`,
+      `Leave the cyclic alone for a full ${quiet}. The helicopter will start to drift; `
+        + 'catch it only after the second is up.',
+      `${needed} ${ways[0]} and ${needed} ${ways[1]}, with a calm hover in between.`
+    ]),
+    skipped: `Skipping this is fine. A normal hover still gives the vibration check, head `
+      + `speed, the tail and the I term; only ${axis} P and D need these stops.`,
+    note
+  });
+}
+
+/**
+ * The manoeuvre that would produce hold evidence, i.e. I-term evidence.
+ *
+ * @param {string} axis
+ * @param {object} [options] `{style}` — see `stopManoeuvre`. A hover or sport
+ *   brief is the same on all three axes, because one steady stretch of flight
+ *   is a hold on every axis at once; the caller may show it once.
+ */
+export function holdManoeuvre(axis, options = {}) {
   const limits = evidence.EVIDENCE_LIMITS ?? {};
   const settleSeconds = round((limits.holdSettleUs ?? 1_000_000) / 1e6, 1);
   const measureSeconds = round((limits.minimumHoldMeasureUs ?? 400_000) / 1e6, 1);
@@ -683,6 +856,37 @@ export function holdManoeuvre(axis) {
   const needed = limits.minimumHolds ?? 2;
   const offAxis = limits.offAxisCommandLimitDps ?? 30;
 
+  const style = styleOf(options);
+  if (style === 'hover' || style === 'sport') {
+    const band = limits.holdSetpointBandDps ?? 15;
+    const comparison = limits.minimumComparisonHolds ?? 5;
+    // One kind of hold only — a heading held, never "or a steady turn". A flight
+    // mixing held headings with steady turns is refused by the before/after
+    // comparison (flight-history.mjs compares like with like), so a brief that
+    // offered both would produce exactly the flight the next step cannot use.
+    return Object.freeze({
+      axis,
+      style,
+      optional: false,
+      title: style === 'hover'
+        ? 'Steady hovering (counts for roll, pitch and tail at once)'
+        : 'Steady cruising (counts for roll, pitch and tail at once)',
+      steps: Object.freeze([
+        style === 'hover'
+          ? `Hover calmly on one heading for at least ${totalSeconds} s at a time. The first `
+            + `${settleSeconds} s of each is discarded, leaving ${measureSeconds} s that count.`
+          : `Fly straight and level at a steady speed for at least ${totalSeconds} s at a time. `
+            + `The first ${settleSeconds} s of each is discarded, leaving ${measureSeconds} s `
+            + 'that count.',
+        `Keep every correction small — within about ${band}°/s — and no stick on any axis `
+          + `above ${offAxis}°/s. One firm input ends that stretch.`,
+        `${needed} such stretches ${needed === 1 ? 'is' : 'are'} enough for this flight. `
+          + `${comparison} or more lets the next flight be compared with this one.`
+      ]),
+      note: 'This says what to fly so there is something to measure. It is not a change '
+        + 'to your aircraft or your setup.'
+    });
+  }
   return Object.freeze({
     axis,
     title: `To capture hold evidence on ${axis}`,
