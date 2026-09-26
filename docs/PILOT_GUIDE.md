@@ -98,6 +98,33 @@ each other.
 If in doubt, exaggerate. A bigger, firmer, more clearly released input is easier
 to measure and safer to fly than a marginal one.
 
+### Not a 3D pilot? You do not need to be
+
+Everything above is the full-strength version. Most of what RotorLens measures
+is in ordinary flying, and the app will describe it that way: under **Your next
+flight**, pick **Hover & scale**, **Sport** or **3D**. The choice changes only
+how each manoeuvre is described. Every flight is judged by the same numbers.
+
+- **Tail:** stop a pirouette. Spin at least one full turn every four and a half
+  seconds, let the stick spring back to centre so the tail stops, and leave it
+  alone for a full second. Twice each way.
+- **I term:** hover calmly on one heading, or cruise straight and level, for
+  five seconds or more at a time, with small corrections only. One steady
+  stretch counts for roll, pitch and tail at once. Five of them lets the next
+  flight be compared with this one.
+- **Roll (sport):** roll into a turn with a firm, steady input for a quarter to
+  half a second — roughly 20–40° of bank — let the stick spring back, and leave
+  it for a second while the helicopter holds the bank. Roll back out the same
+  way. Every turn gives one stop each way.
+- **Pitch (sport):** pull up into a climb the same way, let go for a second,
+  then push over to level and let go again.
+- **Roll and pitch from a hover** are optional. If you would rather not tip the
+  helicopter and let go of it, skip them: the vibration check, head speed, the
+  tail and the I term all still come from a normal hover. Only roll and pitch P
+  and D need those stops.
+
+Fly all of it at a safe height, with plenty of room, on one governor setting.
+
 ---
 
 ## Reading what it tells you
@@ -108,7 +135,14 @@ below a mechanical finding is not worth acting on until the mechanical one is
 resolved.
 
 **At most one card is marked START HERE.** That is the one change to make. Not
-the first of several — the only one. Change it, fly again, and see.
+the first of several — the only one. Change it, fly again, and see. The change
+itself is also the first line of the panel — "Lower roll D, one step" — with
+the reason under it.
+
+When there is no change to make, the first line says so, and **Your next
+flight** underneath is one checklist of what the next log needs to contain.
+Findings that came back fine, and notes about what to fly, are folded to one
+line each; tap one to see the reasoning and the numbers behind it.
 
 Each card carries:
 

@@ -2298,6 +2298,205 @@ test('the engine and shell run in a real browser', {
     assert.equal(drawn.pwned, false, 'a finding\'s text must never execute');
     assert.equal(drawn.injected, 0, 'a finding\'s text must not create elements');
 
+    // 12b. THE ANSWER LINE, AND THE NEXT FLIGHT AS ONE CHECKLIST.
+    //
+    // The change itself belongs at the top of the panel, not only the symptom;
+    // and the common answer on a real flight — "fly this next" — is one
+    // checklist in the words of the flying the pilot actually does, not six
+    // cards of detector language. A flying style changes the words only.
+    const planned = await client.send('Runtime.evaluate', {
+      expression: `(async () => {
+        const app = await import('/ui/app.mjs');
+        const engine = await import('/src/analysis/recommendations.mjs');
+        const flat = value => String(value).replace(/\\s+/g, ' ').trim();
+        const holder = document.createElement('div');
+        const textOf = html => { holder.innerHTML = html; return flat(holder.textContent); };
+
+        const finding = fields => Object.assign({
+          rung: 'evidence', axis: null, kind: 'next-flight', adjust: null, direction: null,
+          confidence: 'none', headline: 'h', reasoning: 'r', basis: [], confirm: null,
+          candidates: [], codes: [], actNow: false
+        }, fields);
+
+        // -- the answer line
+        const lower = app.answerHtml({findings: [finding({
+          id: 'D_TOO_HIGH', rung: 'gain-D', axis: 'yaw', kind: 'adjustment',
+          adjust: 'yaw D', direction: 'decrease', actNow: true
+        })], withheld: []});
+
+        const mechanical = (status, peaks) => ({
+          status, reasonCodes: ['X'],
+          tuningEvidenceGate: {status: 'blocked', reasonCodes: ['X']},
+          harmonicCorrelation: {state: 'evaluated'},
+          attentionThreshold: {bandRmsDps: 8, basis: 'experimental-synthetic-calibration'},
+          range: {startTimeUs: 0, endTimeUs: 1e10}, analyzedBandHz: [5, 450],
+          axes: ['roll', 'pitch', 'yaw'].map(axis => ({
+            axis, source: 'gyroRAW', available: true,
+            medianNoisePsdDps2PerHz: 0.0002, broadbandRmsDps: 1.2,
+            peaks: axis === 'roll' ? peaks : []
+          }))
+        });
+        const rotorResult = engine.buildRecommendations({axes: {}, records: [],
+          mechanical: mechanical('attention', [{frequencyHz: 30, bandRmsDps: 11,
+            bandwidthHz: 1.5, persistenceRatio: 0.9, attentionEligible: true,
+            harmonicMatch: {rotor: 'main', order: 1}}])});
+        const shakingResult = engine.buildRecommendations({axes: {}, records: [],
+          mechanical: mechanical('attention', [])});
+        const unmeasuredResult = engine.buildRecommendations({axes: {}, records: [],
+          mechanical: mechanical('insufficient', [])});
+
+        const held = app.answerHtml({findings: [finding({id: 'NO_HOLD_EVIDENCE', axis: 'roll'})],
+          withheld: [{axis: 'roll', reason: 'GATES_NOT_PASSED', sentence: 's',
+            gateStatus: {airframe: 'permitted', headspeed: 'blocked', stability: 'blocked'}}]});
+
+        // -- the checklist
+        const asks = {findings: [
+          finding({id: 'NO_HOLD_EVIDENCE', axis: 'roll'}),
+          finding({id: 'NO_HOLD_EVIDENCE', axis: 'pitch'}),
+          finding({id: 'HOLD_EVIDENCE_PROVISIONAL', axis: 'yaw'}),
+          finding({id: 'STOP_EVIDENCE_INCOMPLETE', axis: 'roll', headline: 'ROLL-STATUS'}),
+          finding({id: 'STOP_EVIDENCE_INCOMPLETE', axis: 'pitch', headline: 'PITCH-STATUS'}),
+          finding({id: 'STOP_EVIDENCE_INCOMPLETE', axis: 'yaw', headline: 'YAW-STATUS'}),
+          finding({id: 'RINGING_SOURCE_UNKNOWN', rung: 'gain-D', axis: 'roll',
+            confirm: 'SETTLE-IT-THIS-WAY'})
+        ], withheld: []};
+        const plans = {};
+        for (const style of ['hover', 'sport', '3d']) {
+          holder.innerHTML = app.nextFlightHtml(asks, {style});
+          plans[style] = {
+            text: flat(holder.textContent),
+            items: holder.querySelectorAll('ol.plan > li').length,
+            optional: holder.querySelectorAll('ol.plan > li.optional details').length,
+            pressed: [...holder.querySelectorAll('button[aria-pressed="true"]')]
+              .map(button => button.dataset.style),
+            findingsInside: holder.querySelectorAll('.finding').length
+          };
+        }
+        holder.innerHTML = app.nextFlightHtml(asks, {style: null, peaks: {roll: 30, pitch: 20}});
+        const gentleDefault = [...holder.querySelectorAll('button[aria-pressed="true"]')]
+          .map(button => button.dataset.style);
+        holder.innerHTML = app.nextFlightHtml(asks, {style: null, peaks: {roll: 300, pitch: 20}});
+        const firmDefault = [...holder.querySelectorAll('button[aria-pressed="true"]')]
+          .map(button => button.dataset.style);
+
+        // -- the picker on the live page re-describes, and analyses nothing
+        const saved = {
+          recommendations: app.state.recommendations,
+          style: app.state.flyingStyle,
+          peaks: app.state.recommendationPeaks,
+          run: app.state.recommendationRun
+        };
+        const live = document.getElementById('next-flight');
+        app.state.recommendations = asks;
+        app.state.recommendationPeaks = {roll: 300, pitch: 300};
+        app.state.flyingStyle = null;
+        live.innerHTML = app.nextFlightHtml(asks, {style: null, peaks: {roll: 300, pitch: 300}});
+        live.querySelector('button[data-style="hover"]').click();
+        const clicked = {
+          style: app.state.flyingStyle,
+          pressed: [...live.querySelectorAll('button[aria-pressed="true"]')]
+            .map(button => button.dataset.style),
+          saysJudgedTheSame: /judged by the same numbers/.test(live.textContent),
+          ranAnalysis: app.state.recommendationRun !== saved.run,
+          smallButtons: [...live.querySelectorAll('button')]
+            .filter(button => button.offsetParent !== null
+              && button.getBoundingClientRect().height < 44).length
+        };
+        app.state.recommendations = saved.recommendations;
+        app.state.flyingStyle = saved.style;
+        app.state.recommendationPeaks = saved.peaks;
+        live.innerHTML = '';
+
+        return JSON.stringify({
+          lower: textOf(lower),
+          rotor: textOf(app.answerHtml(rotorResult)),
+          rotorIds: rotorResult.findings.map(entry => entry.id),
+          shaking: textOf(app.answerHtml(shakingResult)),
+          unmeasured: textOf(app.answerHtml(unmeasuredResult)),
+          unmeasuredIds: unmeasuredResult.findings.map(entry => entry.id),
+          held: textOf(held),
+          nothingToFly: app.nextFlightHtml({findings: [finding({id: 'AIRFRAME_CLEAR',
+            rung: 'airframe', kind: 'observation'})], withheld: []}, {style: 'sport'}),
+          plans, gentleDefault, firmDefault, clicked,
+          folded: {
+            observation: app.foldedCard(finding({kind: 'observation'})),
+            nextFlight: app.foldedCard(finding({kind: 'next-flight'})),
+            blocker: app.foldedCard(finding({kind: 'blocker'})),
+            adjustment: app.foldedCard(finding({kind: 'adjustment'})),
+            actNowBlocker: app.foldedCard(finding({kind: 'blocker', actNow: true}))
+          }
+        });
+      })()`,
+      awaitPromise: true,
+      returnByValue: true
+    }, sessionId);
+
+    assert.equal(planned.exceptionDetails, undefined,
+      `the answer or next-flight renderer threw: ${JSON.stringify(planned.exceptionDetails)}`);
+    const plan = JSON.parse(planned.result.value);
+
+    assert.match(plan.lower, /Start here/);
+    assert.match(plan.lower, /Lower yaw D, one step/,
+      'the change itself must be the answer at the top, not only the symptom');
+    assert.deepEqual(plan.rotorIds.filter(id => id.startsWith('AIRFRAME')),
+      ['AIRFRAME_ROTOR_ORDER_VIBRATION']);
+    assert.match(plan.rotor, /Look at the main rotor/);
+    assert.match(plan.rotor, /blade tracking and balance/);
+    assert.doesNotMatch(plan.rotor, /shaking/);
+    assert.match(plan.shaking, /Look at the airframe/);
+    assert.ok(!plan.unmeasuredIds.includes('AIRFRAME_VIBRATION_PRESENT'),
+      'a range that could not be measured must not be reported as vibration: '
+      + plan.unmeasuredIds.join(', '));
+    assert.doesNotMatch(plan.unmeasured, /shaking|has a vibration/,
+      'and the answer line must not say so either');
+    assert.match(plan.held, /Nothing to change yet/);
+    assert.match(plan.held, /held back until there is a steady head speed/,
+      'what was measured and withheld must be said at the top, with what it waits for');
+
+    assert.equal(plan.nothingToFly, '', 'a flight that asks for nothing draws no checklist');
+
+    for (const style of ['hover', 'sport', '3d']) {
+      const drawnPlan = plan.plans[style];
+      assert.deepEqual(drawnPlan.pressed, [style]);
+      assert.equal(drawnPlan.findingsInside, 0,
+        'the checklist is not a finding card, and must not be counted as one');
+      for (const status of ['ROLL-STATUS', 'PITCH-STATUS', 'YAW-STATUS']) {
+        assert.ok(drawnPlan.text.includes(status),
+          `${style}: the engine's own status line for each ask must be on the checklist`);
+      }
+      assert.ok(drawnPlan.text.includes('SETTLE-IT-THIS-WAY'),
+        `${style}: a manoeuvre that separates two causes keeps the engine's words`);
+    }
+    assert.match(plan.plans.hover.text, /Steady hovering/);
+    assert.match(plan.plans.hover.text, /stop a pirouette/);
+    assert.equal(plan.plans.hover.optional, 2,
+      'from a hover, roll and pitch stops are offered folded, never required');
+    assert.match(plan.plans.hover.text, /Skipping this is fine/);
+    assert.match(plan.plans.sport.text, /roll into and out of turns/);
+    assert.match(plan.plans.sport.text, /pull up, then level out/);
+    assert.equal(plan.plans.sport.optional, 0);
+    assert.equal(plan.plans['3d'].items, plan.plans.sport.items + 2,
+      '3D keeps one hold brief per axis, as the detector language has always had it');
+    assert.match(plan.plans['3d'].text, /Roll: hold it steady/);
+    assert.match(plan.plans['3d'].text, /Hold a steady roll attitude/);
+
+    assert.deepEqual(plan.gentleDefault, ['hover'],
+      'a flight with no firm cyclic input defaults to the hover brief');
+    assert.deepEqual(plan.firmDefault, ['sport']);
+
+    assert.equal(plan.clicked.style, 'hover');
+    assert.deepEqual(plan.clicked.pressed, ['hover']);
+    assert.equal(plan.clicked.saysJudgedTheSame, true,
+      'a chosen style must say it changes the description and not the judgement');
+    assert.equal(plan.clicked.ranAnalysis, false,
+      'picking a style re-describes; it must never re-run or change the analysis');
+    assert.equal(plan.clicked.smallButtons, 0, 'the style buttons must be 44px targets');
+
+    assert.deepEqual(plan.folded, {
+      observation: true, nextFlight: true, blocker: false, adjustment: false,
+      actNowBlocker: false
+    }, 'only measurements and next-flight notes fold; a blocker and the change never do');
+
     // 13. IMPORT PROGRESS, on the events MainActivity actually sends.
     //
     // Reading a full dataflash over USB takes over two minutes, and the app used

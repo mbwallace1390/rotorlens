@@ -271,6 +271,65 @@
   table.basis td.v { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
   table.basis .src { display: block; color: var(--muted); font-size: 11.5px; margin-top: 2px; }
   .gate-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+  #recommend-status .flights { display: block; margin: 0 0 8px; color: var(--text); }
+  #recommend-status .flights button { margin-top: 6px; display: block; }
+  p.tip {
+    font-size: 13.5px; margin: 12px 0 0; padding: 9px 11px;
+    border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 7px;
+  }
+  /* The change itself in the one-line answer: the same words as the card's
+     change box, so the top of the panel and the card cannot disagree. */
+  #recommend-answer .do {
+    display: block; font-size: 19px; font-weight: 700; color: var(--accent);
+    margin: 2px 0 6px;
+  }
+  #recommend-answer .held {
+    display: block; font-size: 13.5px; font-weight: 400; color: var(--muted);
+    margin-top: 6px;
+  }
+  /* A folded card: the pills and the plain sentence in view, the rest behind a
+     tap. Same edge colour as an open card of its kind, so the ladder still
+     reads as one list. */
+  details.finding.folded { padding: 0; }
+  details.finding.folded > summary {
+    list-style: none; cursor: pointer; padding: 11px 14px; min-height: 44px;
+  }
+  details.finding.folded > summary::-webkit-details-marker { display: none; }
+  details.finding.folded > summary .plain { font-size: 14.5px; margin: 0; }
+  details.finding.folded > summary .plain::after {
+    content: ' \25B8'; color: var(--accent);
+  }
+  details.finding.folded[open] > summary .plain::after { content: ' \25BE'; }
+  details.finding.folded > :not(summary) { margin-left: 14px; margin-right: 14px; }
+  details.finding.folded[open] { padding-bottom: 12px; }
+  /* Your next flight. */
+  #next-flight:empty { display: none; }
+  .next-flight {
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-left: 4px solid #a371f7; border-radius: 8px;
+    padding: 12px 14px; margin: 10px 0 14px;
+  }
+  .next-flight h3 { margin: 0 0 8px; color: var(--text); font-size: 15px; }
+  .style-pick { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 6px; }
+  .style-pick > span { flex: 1 1 100%; font-size: 12.5px; }
+  .style-pick button { flex: 1 1 0; min-width: 0; padding: 8px 6px; }
+  .style-pick button[aria-pressed="true"] {
+    border-color: var(--accent); background: rgba(74,168,255,.12); color: var(--text);
+    font-weight: 600;
+  }
+  ol.plan { margin: 10px 0 0; padding-left: 20px; }
+  ol.plan > li { margin: 0 0 14px; }
+  ol.plan .plan-title { font-size: 15px; font-weight: 600; margin: 0 0 3px; }
+  ol.plan .plan-status { font-size: 12.5px; margin: 0 0 6px; }
+  ol.plan .plan-skip { font-size: 12.5px; margin: 6px 0 0; }
+  ol.plan li.optional .plan-title { color: var(--muted); }
+  ol.plan li.optional summary {
+    cursor: pointer; min-height: 44px; display: flex; align-items: center;
+    list-style: none;
+  }
+  ol.plan li.optional summary::-webkit-details-marker { display: none; }
+  ol.plan li.optional summary::after { content: ' \25B8'; color: var(--accent); margin-left: 6px; }
+  ol.plan li.optional details[open] > summary::after { content: ' \25BE'; }
 
   /* ---------------------------------------------------------------------
      Flight window.
@@ -609,6 +668,13 @@
 
     <p class="privacy"><b>Nothing leaves this device.</b> The log is decoded locally.</p>
 
+    <!-- The one setting that decides whether a log can produce advice at all,
+         said before the first log rather than after it comes back empty. See
+         docs/PILOT_GUIDE.md, "Turn on the unfiltered gyro". -->
+    <p class="tip"><b>Before you fly:</b> add <b>gyroRAW</b> to the Blackbox fields in the
+      Rotorflight configurator. Without it RotorLens cannot check your helicopter for
+      vibration, and every tuning change waits on that check.</p>
+
     <details class="help">
       <summary>How do I get the log off my helicopter?</summary>
       <div>
@@ -661,6 +727,10 @@
          which matters second. Populated in `measureRecommendations`. -->
     <p id="recommend-answer" class="answer"></p>
     <div id="recommend-status" class="muted" style="font-size:13px"></div>
+    <!-- The next flight, as one checklist, between the answer and the ladder
+         of findings it summarises. Outside #recommend on purpose: that element
+         is the engine's findings in the engine's order, and nothing else. -->
+    <div id="next-flight"></div>
     <div id="recommend"></div>
   </section>
 

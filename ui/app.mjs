@@ -82,9 +82,14 @@ import {
   describeHoldCapture,
   describeStopCapture,
   directionalObservations,
+  FLYING_STYLE_LABELS,
+  FLYING_STYLES,
+  holdManoeuvre,
   indexAtOrAfter,
+  likelyFlyingStyle,
   niceStep,
   resolveAxisSignals,
+  stopManoeuvre,
   summarizeAxis,
   TERM_VIEWS
 } from '../src/analysis/axis-report.mjs';
@@ -221,6 +226,15 @@ const state = {
   // Bumped on every run so a slow run whose window has since moved can retire
   // itself instead of painting stale advice.
   recommendationRun: 0,
+  // Peak commanded rate per axis over the analysed window, kept so the next-
+  // flight plan can pick a default flying style without re-reading the log.
+  recommendationPeaks: null,
+  // How the pilot flies — 'hover', 'sport' or '3d' — or null until he says.
+  // It changes only how the next-flight plan DESCRIBES a manoeuvre; nothing it
+  // touches is a threshold. Held for the life of the page and no longer: the
+  // privacy policy promises no browser storage, and a preference is not worth
+  // a new native file.
+  flyingStyle: null,
 
   // ---- flight history ---------------------------------------------------
   // The store, as `src/analysis/flight-history.mjs` plain data. Read once from
@@ -474,6 +488,8 @@ function retireCurrentFile(name) {
   $('recommend').innerHTML = '';
   $('recommend-status').textContent = '';
   $('recommend-answer').innerHTML = '';
+  state.recommendationPeaks = null;
+  renderNextFlight();
   state.answerScrolled = false;
   forgetCandidateFlight();
   closeCurrentLog();
@@ -2004,9 +2020,18 @@ const PLAIN_ENGLISH = {
   AIRFRAME_CLEAR: () =>
     'Your helicopter is running smoothly enough for the rest of this to mean something.',
   AIRFRAME_VIBRATION_PRESENT: () =>
-    'Your helicopter is shaking. Nothing about the tune can be judged until that stops — '
-    + 'vibration looks exactly like a badly set D term, and chasing it with gains makes it '
-    + 'worse.',
+    'Your helicopter has a vibration the tune cannot be judged over. Nothing about the gains '
+    + 'can be read until it is found — vibration looks exactly like a badly set D term, and '
+    + 'chasing it with gains makes it worse.',
+  AIRFRAME_ROTOR_ORDER_VIBRATION: () =>
+    'The vibration in this flight comes from your rotor itself — it sits exactly on the '
+    + 'rotor\'s own speed, or a multiple of it. Check blade tracking and balance before '
+    + 'anything in the tune. The level it is judged against has not yet been checked on real '
+    + 'helicopters, so this may be normal for yours; a tracked, balanced head is what tells '
+    + 'you.',
+  AIRFRAME_VIBRATION_NOT_MEASURED: () =>
+    'The vibration check could not measure this flight, so the airframe has not been ruled '
+    + 'out yet. That is a gap in the measurement, not a sign of vibration.',
   AIRFRAME_BROADBAND_ELEVATED: () =>
     'The gyro is noisy across the whole range, not at one frequency. That is the airframe '
     + 'or the mounting, and it swamps the measurements a tune is judged on.',
@@ -2300,8 +2325,32 @@ export function findingHtml(finding, context = {}) {
   parts.push(basisTable(finding.basis));
   parts.push(codeList(finding.codes, 'Machine codes for this finding'));
 
+  // FOLDED, NOT HIDDEN. A measurement that came back fine, or a note about what
+  // the next flight should contain, keeps every word it had — the sentence and
+  // both pills stay in view, and the why, the basis and the manoeuvre are one
+  // tap away. Drawn open, a real flight's ladder ran 4,000-7,800 px on a phone,
+  // and the one card that mattered sat under two screens of "this was fine".
+  // Blockers and the one change to make are never folded. The engine's order
+  // is untouched: a folded card is still the card at its index.
+  if (foldedCard(finding)) {
+    // Never the act-now card, so `parts` opens with the step line and the plain
+    // sentence — the two things that stay in view.
+    const [step, plain, ...rest] = parts;
+    return `<details class="finding folded kind-${esc(finding.kind)}">`
+      + `<summary>${step}${plain}</summary>`
+      + rest.join('') + '</details>';
+  }
+
   return `<div class="finding kind-${esc(finding.kind)}${finding.actNow ? ' act-now' : ''}">` +
     parts.join('') + '</div>';
+}
+
+/**
+ * Whether a card is drawn folded. See `findingHtml`. Exported for the tests.
+ */
+export function foldedCard(finding) {
+  return !finding.actNow
+    && (finding.kind === 'observation' || finding.kind === 'next-flight');
 }
 
 /**
@@ -2392,6 +2441,248 @@ export function recommendationsHtml(result, coverage = {}, learning = null) {
   }
 
   return parts.join('');
+}
+
+// ---------------------------------------------------------------------------
+// Your next flight
+//
+// On a real flight the common answer is not a change, it is "this flight could
+// not tell". The engine says so per axis and per kind of evidence, which is
+// right for the engine and was the wrong shape for a pilot: three to six cards,
+// each 700-1,000 px tall on a phone, each with its own paragraph of detector
+// language, repeated per axis. This draws the same asks as ONE checklist, in the
+// words of the flying the pilot actually does.
+//
+// Nothing here decides anything. What is asked for comes from the engine's own
+// next-flight findings; how each manoeuvre is described comes from
+// `stopManoeuvre` / `holdManoeuvre`, which read the detector's thresholds. The
+// flying style changes the description only — a hover pilot and a 3D pilot are
+// judged by the same numbers.
+// ---------------------------------------------------------------------------
+
+/** Findings the checklist draws in its own words. Everything else keeps its card's. */
+const STOP_ASK = 'STOP_EVIDENCE_INCOMPLETE';
+const HOLD_ASKS = new Set(['NO_HOLD_EVIDENCE', 'HOLD_EVIDENCE_PROVISIONAL']);
+
+function manoeuvreStepsHtml(brief) {
+  return `<ol class="steps">${brief.steps.map(step => `<li>${esc(step)}</li>`).join('')}</ol>`;
+}
+
+function planItemHtml({title, status, brief, optional, skipped}) {
+  const body = (status ? `<p class="muted plan-status">${esc(status)}</p>` : '')
+    + (brief ? manoeuvreStepsHtml(brief) : '')
+    + (skipped ? `<p class="muted plan-skip">${esc(skipped)}</p>` : '');
+  // An optional item is folded: offered, one tap away, and not in the way of
+  // the pilot who has already decided to skip it.
+  if (optional) {
+    return `<li class="plan-item optional"><details><summary class="plan-title">`
+      + `${esc(title)}</summary>${body}</details></li>`;
+  }
+  return `<li class="plan-item"><p class="plan-title">${esc(title)}</p>${body}</li>`;
+}
+
+/**
+ * The next flight, as one checklist. Empty string when this flight asks for
+ * nothing more.
+ *
+ * Pure and exported, so every style and every combination of asks is reachable
+ * from a hand-built result in a test.
+ *
+ * @param {object} result a `buildRecommendations` result
+ * @param {object} [options]
+ * @param {string|null} [options.style] 'hover' | 'sport' | '3d'; null picks one
+ *   from `peaks` and says it was picked
+ * @param {object|null} [options.peaks] peak commanded rate per axis, deg/s
+ */
+export function nextFlightHtml(result, options = {}) {
+  const findings = result?.findings ?? [];
+  const chosen = FLYING_STYLES.includes(options.style) ? options.style : null;
+  const style = chosen ?? likelyFlyingStyle(options.peaks ?? {});
+
+  const stopAxes = AXIS_ORDER.filter(axis =>
+    findings.some(finding => finding.id === STOP_ASK && finding.axis === axis));
+  const holdAxes = AXIS_ORDER.filter(axis =>
+    findings.some(finding => HOLD_ASKS.has(finding.id) && finding.axis === axis));
+  const settles = findings.filter(finding => finding.kind === 'next-flight'
+    && finding.id !== STOP_ASK && !HOLD_ASKS.has(finding.id) && finding.confirm);
+  const acted = findings.find(finding => finding.actNow) ?? null;
+
+  if (stopAxes.length === 0 && holdAxes.length === 0 && settles.length === 0) {
+    return '';
+  }
+
+  const items = [];
+  if (acted) {
+    items.push(planItemHtml({
+      title: acted.kind === 'adjustment'
+        ? 'First, the one change at the top — and nothing else.'
+        : 'First, the one thing at the top.',
+      status: 'Then, on the same flight:'
+    }));
+  }
+
+  // Steady flight first: it is the one every pilot can fly, and for a hover or
+  // sport pilot one steady stretch counts on every axis at once.
+  if (holdAxes.length > 0) {
+    if (style === '3d') {
+      for (const axis of holdAxes) {
+        const brief = holdManoeuvre(axis);
+        items.push(planItemHtml({title: `${AXIS_TITLE[axis]}: hold it steady`, brief}));
+      }
+    } else {
+      const brief = holdManoeuvre(holdAxes[0], {style});
+      items.push(planItemHtml({
+        title: brief.title,
+        status: `Needed for: ${holdAxes.map(axis => AXIS_THING[axis]).join(', ')}.`,
+        brief
+      }));
+    }
+  }
+
+  // The tail before the cyclic: a pirouette stop is the stop most pilots
+  // already fly, whatever their style.
+  for (const axis of ['yaw', 'roll', 'pitch'].filter(axis => stopAxes.includes(axis))) {
+    const ask = findings.find(finding => finding.id === STOP_ASK && finding.axis === axis);
+    const brief = style === '3d' ? stopManoeuvre(axis) : stopManoeuvre(axis, {style});
+    items.push(planItemHtml({
+      title: style === '3d' ? `${AXIS_TITLE[axis]}: stops each way` : brief.title,
+      status: ask?.headline ?? null,
+      brief,
+      optional: brief.optional === true,
+      skipped: brief.skipped ?? null
+    }));
+  }
+
+  // What the engine asked for in its own words: a manoeuvre that separates two
+  // causes is specific to that finding, and no style rewrites it.
+  for (const finding of settles) {
+    items.push(planItemHtml({
+      title: `${AXIS_TITLE[finding.axis] ?? 'This flight'}: ${plainEnglish(finding)}`,
+      status: finding.confirm
+    }));
+  }
+
+  const picker = FLYING_STYLES.map(value =>
+    `<button type="button" data-style="${esc(value)}" aria-pressed="${value === style}">`
+    + `${esc(FLYING_STYLE_LABELS[value])}</button>`).join('');
+
+  const measuredCyclic = [options.peaks?.roll, options.peaks?.pitch].some(Number.isFinite);
+  const why = chosen
+    ? 'This changes only how each manoeuvre is described. Every flight is judged by the '
+      + 'same numbers.'
+    : (!measuredCyclic
+      ? 'A starting point. '
+      : style === 'hover'
+        ? 'Picked from this flight: nothing in it reached the firm input a stop needs. '
+        : 'Picked from this flight: it contains firm cyclic inputs. ')
+      + 'Change it to match how you fly — it changes only how each manoeuvre is described.';
+
+  return `<div class="next-flight">`
+    + `<h3>Your next flight</h3>`
+    + `<div class="style-pick" role="group" aria-label="How do you fly?">`
+    + `<span class="muted">How do you fly?</span>${picker}</div>`
+    + `<p class="muted" style="font-size:12.5px">${esc(why)}</p>`
+    + `<ol class="plan">${items.join('')}</ol>`
+    + `<p class="muted" style="font-size:12.5px">Fly these at a safe height, with the head `
+    + 'speed held on one governor setting for the whole flight. Then open the new log here.'
+    + '</p></div>';
+}
+
+/** The word a pilot uses for an axis at the start of a line. */
+const AXIS_TITLE = {roll: 'Roll', pitch: 'Pitch', yaw: 'Tail'};
+
+/** A blocker's `adjust`, where the bare word does not read as a sentence. */
+const LOOK_AT = {airframe: 'the airframe', governor: 'the governor'};
+
+/** The five gates, as the thing each one waits for. */
+const GATE_WORDS = {
+  airframe: 'the vibration check',
+  completeness: 'enough stops each way',
+  agreement: 'the two directions agreeing',
+  headspeed: 'a steady head speed',
+  stability: 'an answer that holds however it is measured'
+};
+
+function listWords(words) {
+  return words.length <= 1
+    ? (words[0] ?? '')
+    : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
+}
+
+/**
+ * One sentence for "something was seen and not turned into advice", or ''.
+ *
+ * Without it the answer read "nothing to change" while a measured fault sat
+ * 3,000 px further down in the withheld list, under a green head-speed pill —
+ * the governor-droop fixture, where the whole-flight head speed is fine and the
+ * stops themselves were measured on a drooping rotor. Both are true; the answer
+ * has to say the second one too.
+ */
+export function heldBackLine(result) {
+  const entries = (result?.withheld ?? [])
+    .filter(entry => entry.reason === 'GATES_NOT_PASSED');
+  if (entries.length === 0) {
+    return '';
+  }
+  const axes = [...new Set(entries.map(entry => AXIS_THING[entry.axis] ?? entry.axis)
+    .filter(Boolean))];
+  const gates = [...new Set(entries.flatMap(entry =>
+    Object.entries(entry.gateStatus ?? {})
+      .filter(([, status]) => status === 'blocked')
+      .map(([gate]) => GATE_WORDS[gate] ?? gate)))];
+  return `Something was measured on ${listWords(axes) || 'this flight'} and held back`
+    + (gates.length > 0 ? ` until there is ${listWords(gates)}` : '')
+    + '. The list below says what it was.';
+}
+
+/**
+ * The one line at the top of the panel: the change, the thing to look at, or
+ * plainly that there is neither. Exported for the tests.
+ *
+ * The change itself is named here, not only the symptom. "Your roll shakes for
+ * a moment every time you stop" is a diagnosis; "Lower roll D, one step" is the
+ * answer the pilot opened the app for, and it used to sit 1,400 px below the
+ * symptom, after two cards saying what was fine.
+ */
+export function answerHtml(result) {
+  const findings = result?.findings ?? [];
+  const actNow = findings.find(finding => finding.actNow) ?? null;
+  if (actNow) {
+    let action = '';
+    if (actNow.kind === 'adjustment' && actNow.direction) {
+      action = `<span class="do">${actNow.direction === 'increase'
+        ? '&#9650; Increase' : '&#9660; Lower'} ${esc(actNow.adjust ?? '')}, one step</span>`;
+    } else if (actNow.kind === 'blocker' && actNow.adjust) {
+      action = `<span class="do">Look at ${esc(LOOK_AT[actNow.adjust] ?? actNow.adjust)}</span>`;
+    }
+    return '<span class="lead">Start here</span>' + action + esc(plainEnglish(actNow));
+  }
+  if (findings.length === 0) {
+    return '<span class="lead">Nothing measurable</span>' +
+      'This flight produced nothing to say — check the Fields panel for what the log carries.';
+  }
+  const held = heldBackLine(result);
+  const asks = findings.some(finding => finding.kind === 'next-flight');
+  return '<span class="lead">Nothing to change yet</span>'
+    + 'This flight does not earn a single change.'
+    + (asks
+      ? ' What the next flight needs to contain is just below.'
+      : ' Work down the list below in order.')
+    + (held ? `<span class="held">${esc(held)}</span>` : '');
+}
+
+/** Draws (or clears) the next-flight checklist for the result on screen. */
+function renderNextFlight() {
+  const box = $('next-flight');
+  if (!box) {
+    return;
+  }
+  box.innerHTML = state.recommendations
+    ? nextFlightHtml(state.recommendations, {
+      style: state.flyingStyle,
+      peaks: state.recommendationPeaks
+    })
+    : '';
 }
 
 /**
@@ -2561,6 +2852,9 @@ async function collectRecommendationMaterial(scoped, session) {
   return {
     result,
     historyAxes,
+    // For the next-flight plan's default style only. Never a threshold.
+    peaks: Object.fromEntries(AXIS_ORDER.map(axis =>
+      [axis, axisSummaries[axis]?.peakCommandDps ?? null])),
     coverage: {
       analysed: Object.keys(axes),
       skipped,
@@ -2629,6 +2923,8 @@ async function measureRecommendations() {
   // the pilot supersedes mid-flight-window drag, must not leave last window's
   // "Start here" sitting over a panel that is being rebuilt.
   $('recommend-answer').innerHTML = '';
+  state.recommendationPeaks = null;
+  renderNextFlight();
   box.innerHTML = '<p class="muted">Working out what this flight can and cannot tell you. ' +
     'On a long log this takes a few seconds.</p>';
   // The before/after is measured over the same window as the advice above it, so
@@ -2689,17 +2985,9 @@ async function measureRecommendations() {
   // engine's contract, so this says exactly one thing or says plainly that
   // there is no one thing — never a list, which is the state the pilot cannot
   // act on and the reason the rule exists.
-  const answer = $('recommend-answer');
-  const actNow = produced.result.findings.find(finding => finding.actNow);
-  if (actNow) {
-    answer.innerHTML = '<span class="lead">Start here</span>' + esc(plainEnglish(actNow));
-  } else if (produced.result.findings.length > 0) {
-    answer.innerHTML = '<span class="lead">Nothing to change yet</span>' +
-      'This flight does not earn a single change. Work down the list below in order.';
-  } else {
-    answer.innerHTML = '<span class="lead">Nothing measurable</span>' +
-      'This flight produced nothing to say — check the Fields panel for what the log carries.';
-  }
+  state.recommendationPeaks = produced.peaks ?? null;
+  $('recommend-answer').innerHTML = answerHtml(produced.result);
+  renderNextFlight();
 
   // Once per opened log, put that sentence on screen without the pilot hunting
   // for it.
@@ -2723,7 +3011,19 @@ async function measureRecommendations() {
   }
 
   const seconds = ((state.window.endUs - state.window.startUs) / 1e6).toFixed(1);
-  line.innerHTML =
+  // A dataflash dump is dozens of flights and the one analysed is the first,
+  // which is often a bench run. The picker that changes that sits below the
+  // whole advice panel, so say here that there are others and take the pilot
+  // to it. Which flight opens by default is left as it is — the lazy-decoding
+  // design and its tests are built on the first — and this only makes the rest
+  // findable.
+  const flights = state.result?.sessions?.length ?? 0;
+  const others = flights > 1
+    ? `<span class="flights">This file holds ${flights} flights; this is flight ` +
+      `${state.sessionIndex + 1}. <button type="button" id="pick-flight">Pick another ` +
+      `flight</button></span>`
+    : '';
+  line.innerHTML = others +
     `Measured over the ${esc(seconds)} s flight window below, on ` +
     `${esc(produced.coverage.analysed.join(', ') || 'no axis')}. ` +
     `Took ${Math.round(performance.now() - started)} ms on this device.` +
@@ -4670,6 +4970,21 @@ function renderAxisPanel() {
   const summary = summarizeAxis(windowedSession(), signals);
   state.axisSummary = summary;
 
+  // A session can carry the right columns and no samples at all — a truncated
+  // header block decodes to exactly that. `summarizeAxis` answers null, and
+  // reading it threw here, which stopped the analysis below it from ever
+  // running: the pilot got a blank "What to change" and no reason.
+  if (summary === null) {
+    $('axis-stats').innerHTML = '';
+    $('axis-note').innerHTML =
+      `<span class="error">There are no samples of ${esc(axis)} in this flight window to ` +
+      'measure.</span> If the whole flight is empty, the log stopped before any frames ' +
+      'were written; try another flight from the list.';
+    $('axis-plot-caption').textContent = '';
+    clearAxisPlot();
+    resetVibration();
+    return;
+  }
   const noise = summary.unfilteredHighFrequencyRmsDps === null
     ? `${text(summary.gyroHighFrequencyRmsDps)}°/s`
     : `${text(summary.gyroHighFrequencyRmsDps)} / ${text(summary.unfilteredHighFrequencyRmsDps)}°/s`;
@@ -6024,10 +6339,35 @@ $('file').addEventListener('change', event => {
  */
 $('session').addEventListener('change', async event => {
   const index = Number(event.target.value);
+  // A new flight gets its own answer pulled into view, the same as a new file.
+  // Without this the answer for the flight just picked landed 8,500 px above a
+  // pilot still looking at the picker.
+  state.answerScrolled = false;
   beginDecodeProgress(state.fileName ?? '', sessionSpanBytes(index), 1);
   await openSession(index);
   endDecodeProgress();
   renderLogStatus();
+});
+$('recommend-status').addEventListener('click', event => {
+  if (!event.target.closest('#pick-flight')) {
+    return;
+  }
+  const picker = $('session');
+  const header = document.querySelector('header');
+  const clearance = (header ? header.getBoundingClientRect().height : 0) + 12;
+  const target = $('session-panel').getBoundingClientRect().top + window.scrollY - clearance;
+  window.scrollTo({top: Math.max(0, target), behavior: 'smooth'});
+  picker.focus({preventScroll: true});
+});
+$('next-flight').addEventListener('click', event => {
+  const button = event.target.closest('button[data-style]');
+  if (!button || !FLYING_STYLES.includes(button.dataset.style)) {
+    return;
+  }
+  // Copy only: nothing is re-analysed, because nothing the style touches is
+  // measured. The same flight, described for a different pilot.
+  state.flyingStyle = button.dataset.style;
+  renderNextFlight();
 });
 $('field').addEventListener('change', renderPlot);
 $('analyse').addEventListener('click', analyse);
