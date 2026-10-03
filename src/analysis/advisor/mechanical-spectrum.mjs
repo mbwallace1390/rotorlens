@@ -241,8 +241,24 @@ var MAX_ATTENTION_UNSUPPORTED_GAP_RATIO = 0.35;
 // order at order 1 or 2 should suppress tuning at all, or should route to "get
 // your blades tracked": this module already carries the evidence to tell those
 // two cases apart, and on 29 of 33 flights that is the case it is deciding.
+//
+// ANSWERED 2 October 2026, by the owner: it routes. The threshold itself is
+// unchanged, and so is this module — a rotor-order peak above it still reads
+// `attention` and `tuningEvidenceGate` still says `blocked`, because that is
+// what was measured. The routing lives one layer up, in
+// `rotorOrderToneAssessment` in `recommendation-gates.mjs`: when EVERY
+// attention-level peak is main-rotor order 1 or 2, on unfiltered gyro, with the
+// rotor compared and no other reason code, the airframe gate reports it as an
+// observation ("check tracking and balance") instead of withholding the gains.
+// Anything else above the threshold still blocks, and so does a rotor-order tone
+// more than three times it (`GAIN_GATE_THRESHOLDS.rotorOrderToneCeilingMultiple`,
+// a safety backstop). The rule reads every attention-level peak, which is why
+// `detectPeaks` never caps them.
 var ATTENTION_BAND_RMS_THRESHOLD_DPS = 8;
 var ATTENTION_THRESHOLD_BASIS = "experimental-synthetic-calibration";
+// Caps the peaks BELOW the attention level only, at five of their own however
+// many attention-eligible peaks are listed beside them. Every attention-eligible
+// peak is listed however many there are; see `detectPeaks`.
 var MAX_PEAKS_PER_AXIS = 5;
 var TARGET_FREQUENCY_RESOLUTION_HZ = 2;
 
@@ -931,6 +947,9 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
         // Require the absolute 8 deg/s band-RMS gate to pass in the same
         // minimum number of individual windows before it can block tuning.
         var attentionSupportingWindowCount = 0;
+        // Band power summed over the windows that reached the level, for the
+        // tone's size WHILE PRESENT (see `attentionWindowBandRmsDps` below).
+        var attentionWindowBandPowerSum = 0;
         var firstAttentionWindow = null;
         var lastAttentionWindow = null;
         var attentionWindowStarts = [];
@@ -946,6 +965,7 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
             if (Math.sqrt(Math.max(0, attentionBandPower))
                     >= ATTENTION_BAND_RMS_THRESHOLD_DPS) {
                 attentionSupportingWindowCount++;
+                attentionWindowBandPowerSum += attentionBandPower;
                 if (firstAttentionWindow === null) {
                     firstAttentionWindow = attentionWindowIndex;
                 }
@@ -1002,6 +1022,22 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
             bandwidthHz: bandwidth.bandwidthHz,
             bandPowerDps2: bandPower,
             bandRmsDps: Math.sqrt(Math.max(0, bandPower)),
+            // The tone's size WHILE PRESENT: its band RMS over the windows in
+            // which it reached the attention level, null when it reached it in
+            // none. `bandRmsDps` above is the Welch average over EVERY window, so
+            // for a tone present a third of the flight it is pulled far below the
+            // size the tone has when it is there — review of 2 October 2026: a
+            // once-per-rev at four times the level, present 30% of the flight,
+            // averaged under three times it. Judged window by window, the same way
+            // attention eligibility is. It is at least the level (every window in
+            // it is) and at least `bandRmsDps` (those windows are the loudest), and
+            // equals `bandRmsDps` for a tone above the level throughout. Its
+            // resolution is one analysis window: a tone switching on and off
+            // faster than that is never seen whole, and reads smaller.
+            attentionWindowBandRmsDps: attentionSupportingWindowCount > 0
+                ? Math.sqrt(Math.max(0,
+                    attentionWindowBandPowerSum / attentionSupportingWindowCount))
+                : null,
             supportingWindowCount: supportingWindowCount,
             evaluatedWindowCount: windowPsd.length,
             persistenceRatio: persistenceRatio,
@@ -1017,26 +1053,88 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
             harmonicMatch: null
         });
     }
-    candidates.sort(function(left, right) {
+    var byRank = function(left, right) {
         if (right.persistenceRatio !== left.persistenceRatio) {
             return right.persistenceRatio - left.persistenceRatio;
         }
         return right.prominenceDb - left.prominenceDb;
-    });
-    var selected = [];
-    candidates.forEach(function(candidate) {
-        var tooClose = selected.some(function(existing) {
+    };
+    candidates.sort(byRank);
+    var tooCloseToSelected = function(selected, candidate) {
+        return selected.some(function(existing) {
             var separation = Math.max(
                 frequencyResolutionHz * 2,
                 Math.min(candidate.frequencyHz, existing.frequencyHz) * 0.025
             );
             return Math.abs(candidate.frequencyHz - existing.frequencyHz) < separation;
         });
-        if (!tooClose && selected.length < MAX_PEAKS_PER_AXIS) {
+    };
+    // ATTENTION-LEVEL PEAKS ARE NEVER CAPPED. Review of 2 October 2026: the cap
+    // used to be applied to the ranked list BEFORE attention was looked at, so an
+    // attention-level peak ranked sixth on persistence and prominence was thrown
+    // away. Five small, steady rotor harmonics were enough to push an unmatched
+    // 20 deg/s tone off the list — and the rotor-order rule upstream then passed a
+    // flight carrying unexplained vibration — or to push the 1/rev itself off it,
+    // so the flight read "clear". So every attention-eligible candidate is listed
+    // first, uncapped.
+    //
+    // THE SUB-THRESHOLD PEAKS KEEP A CAP OF THEIR OWN, five as they always had.
+    // Round-2 review: they were first given only "whatever room is left", so each
+    // attention-level peak listed cost a small tone the old list held — and a
+    // small tone is the only input the tone-coincidence rule and the ambiguity
+    // note have. A sub-threshold main 2/rev pushed off by an attention-level
+    // 1/rev let D be diagnosed on a ring sitting exactly on that 2/rev. A small
+    // peak is dropped now only by the cap on small peaks, or by sitting closer to
+    // a listed peak than the analysis resolves — then that peak stands for it.
+    //
+    // The frequency merge still applies between attention-level peaks: two that
+    // are closer than the analysis can resolve are one entry. How many were merged
+    // is COUNTED and published (`attentionEligibleUnlistedCount`), so a caller
+    // reasoning about "every attention-level peak" can tell a complete list from
+    // one that is not, instead of assuming. Over the 43 real flight windows in the
+    // private corpus it is zero on every axis, and the listed peaks are identical
+    // to what the old order produced on every one of them.
+    var selected = [];
+    var unlistedEligible = 0;
+    var eligibleCount = 0;
+    candidates.forEach(function(candidate) {
+        if (candidate.attentionEligible !== true) {
+            return;
+        }
+        eligibleCount++;
+        if (tooCloseToSelected(selected, candidate)) {
+            unlistedEligible++;
+        } else {
             selected.push(candidate);
         }
     });
-    return { peaks: selected, globalNoiseFloor: globalFloor, maximumHz: maximumHz };
+    // Counted on its own: never `selected.length`, which includes the
+    // attention-level peaks above.
+    var subThresholdListed = 0;
+    candidates.forEach(function(candidate) {
+        if (candidate.attentionEligible !== true
+                && subThresholdListed < MAX_PEAKS_PER_AXIS
+                && !tooCloseToSelected(selected, candidate)) {
+            selected.push(candidate);
+            subThresholdListed++;
+        }
+    });
+    // Published in the same rank order as always, so a list nothing was dropped
+    // from reads exactly as it did, ties included.
+    var rankOf = new Map();
+    candidates.forEach(function(candidate, index) {
+        rankOf.set(candidate, index);
+    });
+    selected.sort(function(left, right) {
+        return rankOf.get(left) - rankOf.get(right);
+    });
+    return {
+        peaks: selected,
+        globalNoiseFloor: globalFloor,
+        maximumHz: maximumHz,
+        attentionEligibleCandidateCount: eligibleCount,
+        attentionEligibleUnlistedCount: unlistedEligible
+    };
 }
 
 async function spectrumForAxis(
@@ -1192,6 +1290,8 @@ async function spectrumForAxis(
         trailingFiniteGapUs: trailingFiniteGapUs,
         windowCoverageRatio: selection.candidates > 0
             ? windowStarts.length / selection.candidates : 0,
+        attentionEligibleCandidateCount: detected.attentionEligibleCandidateCount,
+        attentionEligibleUnlistedCount: detected.attentionEligibleUnlistedCount,
         peaks: detected.peaks
     };
 }
@@ -1390,6 +1490,9 @@ function compactPeak(peak) {
         bandwidthHz: round(peak.bandwidthHz, 2),
         bandPowerDps2: round(peak.bandPowerDps2, 4),
         bandRmsDps: round(peak.bandRmsDps, 3),
+        // Its size while present; see `detectPeaks`. Null when it never reached
+        // the attention level in any window.
+        attentionWindowBandRmsDps: round(peak.attentionWindowBandRmsDps, 3),
         supportingWindowCount: peak.supportingWindowCount,
         evaluatedWindowCount: peak.evaluatedWindowCount,
         persistenceRatio: round(peak.persistenceRatio, 3),
@@ -2057,6 +2160,11 @@ async function analyzeCollected(collected, range, options) {
             lastFiniteSampleTimeUs: round(axis.lastFiniteSampleTimeUs, 3),
             leadingFiniteGapUs: round(axis.leadingFiniteGapUs, 3),
             trailingFiniteGapUs: round(axis.trailingFiniteGapUs, 3),
+            // Every attention-eligible peak is in `peaks` except those merged into
+            // a listed one closer than the analysis resolves; this many were. A
+            // claim about EVERY attention-level peak holds only where it is 0.
+            attentionEligibleCandidateCount: axis.attentionEligibleCandidateCount,
+            attentionEligibleUnlistedCount: axis.attentionEligibleUnlistedCount,
             peaks: axis.peaks.map(compactPeak)
         };
     });
@@ -2170,6 +2278,585 @@ async function analyzeMechanicalSpectrum(session, options) {
     return analyzeMechanicalTimeSeries(built, settings);
 }
 
+/* ------------------------------------------------------------ the whole window */
+
+/*
+ * A flight window longer than one analysis accepts, measured whole.
+ *
+ * One analysis is capped at MAX_INPUT_SAMPLES (262,144, inclusive) and at
+ * MAX_SELECTION_DURATION_US (262.144 s). Audit of 2 October 2026: the app clamped
+ * the window by DURATION alone, so at Rotorflight's own 993 us interval (1007 Hz)
+ * a 262 s window still held 263,834 samples and came back
+ * SELECTION_SAMPLE_LIMIT_EXCEEDED — "not measured" — and at 2 kHz anything over
+ * about 131 s did. An ordinary five-minute pack was never measured, and with it
+ * every gain finding was blocked. Where the clamp did hold, a stop after 262 s
+ * fell outside the measured range and blocked everything anyway.
+ *
+ * So a long window is split into the fewest roughly equal stretches that each
+ * fit both caps, analysed one after another, and combined CONSERVATIVELY: the
+ * worst stretch speaks for the flight. Nothing is averaged across stretches,
+ * because averaging is how a fault confined to the last two minutes disappears.
+ *
+ *   status         attention > insufficient > clear
+ *   gate           permitted only if every stretch was permitted
+ *   correlation    evaluated only if every stretch was evaluated
+ *   reason codes   the union
+ *   peaks          every stretch's, each carrying the stretch it was measured in
+ *   amplitudes     the largest; coverage ratios the smallest
+ *   head speed     each stretch's own median, and their range; no single median
+ *                  or fundamental, since none was measured across the window; a
+ *                  spread bounded from above across the whole window
+ *   peak lists     complete only if every stretch's was
+ *
+ * A window one analysis already accepts is never split: its result IS that
+ * analysis's result, field for field, so nothing that fits today reads
+ * differently tomorrow.
+ *
+ * Measurements only, like everything else in this file.
+ */
+
+/**
+ * Share of each cap a stretch is planned to fill once a split is needed. A
+ * boundary sample is shared by the two stretches either side of it, and the
+ * resampled count of a stretch depends on that stretch's own median interval,
+ * so planning to exactly the cap would leave a stretch to meet it on rounding.
+ */
+var CHUNK_CAP_MARGIN = 0.95;
+
+/** How many times a plan is re-split after a stretch still met a cap. */
+var MAX_CHUNK_PLAN_ESCALATIONS = 8;
+
+/** How many larger stretch counts the planner tries before settling. */
+var MAX_CHUNK_PLAN_SEARCH = 64;
+
+/** The codes that mean "this stretch was too big", not "this flight is bad". */
+var CHUNK_CAP_REASONS = Object.freeze([
+    "SELECTION_SAMPLE_LIMIT_EXCEEDED",
+    "SELECTION_DURATION_LIMIT_EXCEEDED",
+    "RESAMPLED_SAMPLE_LIMIT_EXCEEDED"
+]);
+
+function hitsChunkCap(result) {
+    return (result.reasonCodes || []).some(function(code) {
+        return CHUNK_CAP_REASONS.indexOf(code) !== -1;
+    });
+}
+
+/**
+ * Splits `range` into `count` stretches of roughly equal sample count.
+ *
+ * Interior boundaries sit ON a sample, which both neighbouring stretches then
+ * include, so the stretches tile the window with nothing between them. Returns
+ * null when a boundary cannot be placed on a finite, strictly later timestamp;
+ * the caller then analyses the window whole, exactly as before.
+ */
+function splitIntoStretches(times, range, firstIndex, sampleCount, count) {
+    var stretches = [];
+    var previousIndex = firstIndex;
+    var previousTimeUs = range.startTimeUs;
+    for (var stretch = 1; stretch <= count; stretch++) {
+        var index = stretch === count
+            ? firstIndex + sampleCount - 1
+            : firstIndex + Math.round(stretch * (sampleCount - 1) / count);
+        var endTimeUs = stretch === count ? range.endTimeUs : times[index];
+        if (!Number.isFinite(endTimeUs) || !(endTimeUs > previousTimeUs)) {
+            return null;
+        }
+        stretches.push({
+            startTimeUs: previousTimeUs,
+            endTimeUs: endTimeUs,
+            plannedSampleCount: index - previousIndex + 1
+        });
+        previousIndex = index;
+        previousTimeUs = endTimeUs;
+    }
+    return stretches;
+}
+
+function stretchFits(stretch) {
+    return stretch.plannedSampleCount <= MAX_INPUT_SAMPLES
+        && stretch.endTimeUs - stretch.startTimeUs <= MAX_SELECTION_DURATION_US;
+}
+
+/**
+ * The fewest roughly equal stretches that each fit both caps.
+ *
+ * One stretch — the window itself — whenever the window fits as it is, which is
+ * what keeps every window that fits today byte-identical. `minimumCount` is how
+ * a plan is re-split when a stretch still met a cap the plan could not see in
+ * advance (the resampled count, which depends on that stretch's own median
+ * interval).
+ */
+function planMechanicalStretches(times, range, minimumCount) {
+    var firstIndex = lowerBound(times, range.startTimeUs);
+    var sampleCount = upperBound(times, range.endTimeUs) - firstIndex;
+    var durationUs = range.endTimeUs - range.startTimeUs;
+    var fitsWhole = sampleCount <= MAX_INPUT_SAMPLES && durationUs <= MAX_SELECTION_DURATION_US;
+    if ((fitsWhole && !(minimumCount > 1)) || sampleCount < 2) {
+        return [range];
+    }
+    var count = Math.max(
+        2,
+        minimumCount || 1,
+        Math.ceil(sampleCount / Math.floor(MAX_INPUT_SAMPLES * CHUNK_CAP_MARGIN)),
+        Math.ceil(durationUs / (MAX_SELECTION_DURATION_US * CHUNK_CAP_MARGIN))
+    );
+    var lastPlan = null;
+    for (var attempt = 0; attempt < MAX_CHUNK_PLAN_SEARCH && count < sampleCount; attempt++) {
+        var plan = splitIntoStretches(times, range, firstIndex, sampleCount, count);
+        if (plan === null) {
+            return lastPlan || [range];
+        }
+        lastPlan = plan;
+        if (plan.every(stretchFits)) {
+            return plan;
+        }
+        count++;
+    }
+    // A single interval longer than the duration cap cannot be split away. The
+    // stretch holding it comes back over the cap, and so the flight comes back
+    // insufficient: a missing measurement, said as one.
+    return lastPlan || [range];
+}
+
+function finiteValues(values) {
+    return values.filter(Number.isFinite);
+}
+
+function sumOf(values) {
+    return values.reduce(function(total, value) { return total + value; }, 0);
+}
+
+/** The extreme of a field, but only when every stretch measured it. */
+function everyStretch(values, pick) {
+    var finite = finiteValues(values);
+    return finite.length === values.length && finite.length > 0
+        ? pick.apply(null, finite) : null;
+}
+
+function combineRpmEvidence(evidences, field, range) {
+    var present = evidences.map(function(evidence) {
+        return evidence || unavailableRpmEvidence(field, "NOT_EVALUATED");
+    });
+    var trustworthy = present.every(function(evidence) {
+        return evidence.trustworthy === true;
+    });
+    var untrusted = present.filter(function(evidence) {
+        return evidence.trustworthy !== true;
+    });
+    // A measured reason is a fact about the log and outranks "not read".
+    var worst = untrusted.filter(function(evidence) {
+        return evidence.state === "unavailable";
+    })[0] || untrusted[0] || null;
+    // NO HEAD SPEED IS INVENTED FOR THE WINDOW. Review of 2 October 2026: this
+    // took the median of the stretch medians and the largest within-stretch
+    // spread, so a stretch at 1500 rpm and one at 1800 came back as a
+    // "trustworthy" 1650 rpm — a speed the rotor never turned at — with a spread
+    // of 0.0024, while the window itself ran 1498 to 1802. Every peak is matched
+    // against the head speed of its OWN stretch, so no decision rested on those
+    // two numbers; the published measurement did, and it was false.
+    //
+    // So the window publishes what was measured: each stretch's median, their
+    // range, and no single median or fundamental, because none was measured
+    // across the window.
+    var stretchMedians = present.map(function(evidence) {
+        return Number.isFinite(evidence.medianRpm) ? evidence.medianRpm : null;
+    });
+    var medians = finiteValues(stretchMedians);
+    var spreads = finiteValues(present.map(function(evidence) {
+        return evidence.relativeSpread;
+    }));
+    var p05s = finiteValues(present.map(function(evidence) { return evidence.p05Rpm; }));
+    var p95s = finiteValues(present.map(function(evidence) { return evidence.p95Rpm; }));
+    var lowestP05 = p05s.length > 0 ? Math.min.apply(null, p05s) : null;
+    var highestP95 = p95s.length > 0 ? Math.max.apply(null, p95s) : null;
+    var lowestMedian = medians.length > 0 ? Math.min.apply(null, medians) : null;
+    // The spread across the window, bounded from above rather than estimated.
+    // The window's own 95th percentile is no higher than the highest stretch's,
+    // its 5th no lower than the lowest stretch's, and its median no lower than
+    // the lowest stretch median — so this is never steadier than the window was,
+    // and never steadier than any one stretch.
+    var acrossSpread = lowestP05 !== null && highestP95 !== null && lowestMedian > 0
+        ? (highestP95 - lowestP05) / lowestMedian : null;
+    var relativeSpread = acrossSpread !== null
+        ? Math.max.apply(null, [acrossSpread].concat(spreads))
+        : (spreads.length > 0 ? Math.max.apply(null, spreads) : null);
+    var coverages = finiteValues(present.map(function(evidence) {
+        return evidence.coverageRatio;
+    }));
+    return {
+        field: field,
+        available: present.every(function(evidence) { return evidence.available === true; }),
+        trustworthy: trustworthy,
+        state: trustworthy ? "trustworthy" : worst.state,
+        reasonCode: trustworthy ? null : worst.reasonCode,
+        sampleCount: sumOf(finiteValues(present.map(function(evidence) {
+            return evidence.sampleCount;
+        }))),
+        coverageRatio: coverages.length > 0 ? Math.min.apply(null, coverages) : 0,
+        medianRpm: null,
+        // One entry per stretch, in time order; null where a stretch read none.
+        stretchMedianRpm: stretchMedians,
+        medianRpmRange: medians.length > 0
+            ? [lowestMedian, Math.max.apply(null, medians)] : null,
+        p05Rpm: lowestP05,
+        p95Rpm: highestP95,
+        fundamentalHz: null,
+        relativeSpread: relativeSpread,
+        timeRangeUs: [range.startTimeUs, range.endTimeUs]
+    };
+}
+
+function combineHarmonicCorrelation(correlations) {
+    var present = correlations.map(function(correlation) {
+        return correlation || harmonicCorrelationAvailability(null);
+    });
+    var rotors = ["headspeed", "tailspeed"];
+    var evaluatedRotors = rotors.filter(function(rotor) {
+        return present.every(function(correlation) {
+            return (correlation.evaluatedRotors || []).indexOf(rotor) !== -1;
+        });
+    });
+    var everyEvaluated = evaluatedRotors.length > 0 && present.every(function(correlation) {
+        return correlation.evaluated === true;
+    });
+    var state = everyEvaluated
+        ? "evaluated"
+        : (present.some(function(correlation) { return correlation.state === "unavailable"; })
+            || present.every(function(correlation) { return correlation.evaluated === true; })
+            ? "unavailable"
+            : "not-evaluated");
+    var unavailableRotors = [];
+    rotors.forEach(function(rotor) {
+        if (everyEvaluated && evaluatedRotors.indexOf(rotor) !== -1) {
+            return;
+        }
+        var reasons = [];
+        present.forEach(function(correlation) {
+            (correlation.unavailableRotors || []).forEach(function(entry) {
+                if (entry.field === rotor && entry.reasonCode) {
+                    reasons.push(entry.reasonCode);
+                }
+            });
+        });
+        var measured = reasons.filter(function(code) { return code !== "NOT_EVALUATED"; });
+        unavailableRotors.push(Object.freeze({
+            field: rotor,
+            reasonCode: measured[0] || reasons[0] || "NOT_EVALUATED"
+        }));
+    });
+    return Object.freeze({
+        state: state,
+        evaluated: everyEvaluated,
+        evaluatedRotors: Object.freeze(everyEvaluated ? evaluatedRotors : []),
+        unavailableRotors: Object.freeze(unavailableRotors)
+    });
+}
+
+var AXIS_COUNT_FIELDS = Object.freeze([
+    "windowCount", "candidateWindowCount", "totalPossibleWindowCount", "validWindowCount"
+]);
+var AXIS_COVERAGE_FIELDS = Object.freeze([
+    "windowCoverageRatio", "validWindowCoverageRatio",
+    "finiteSampleCoverageRatio", "finiteTimeSpanCoverageRatio"
+]);
+var AXIS_AMPLITUDE_FIELDS = Object.freeze([
+    "rmsDps", "broadbandPowerDps2", "broadbandRmsDps", "medianNoisePsdDps2PerHz"
+]);
+var ATTENTION_COUNT_FIELDS = Object.freeze([
+    "attentionEligibleCandidateCount", "attentionEligibleUnlistedCount"
+]);
+
+function combineAxes(results) {
+    var combined = [];
+    AXIS_NAMES.forEach(function(name) {
+        var entries = results.map(function(result) {
+            return (result.axes || []).filter(function(axis) { return axis.axis === name; })[0]
+                || null;
+        });
+        var present = entries.filter(Boolean);
+        if (present.length === 0) {
+            return;
+        }
+        var available = entries.every(function(entry) {
+            return entry !== null && entry.available === true;
+        });
+        var axis = { axis: name, source: present[0].source };
+        var kinds = present.map(function(entry) { return entry.amplitudeKind; })
+            .filter(function(kind) { return kind !== undefined; });
+        if (kinds.length > 0) {
+            axis.amplitudeKind = kinds[0];
+        }
+        axis.available = available;
+        if (!available) {
+            // The first stretch that could not measure this axis says why. A
+            // stretch that returned no axes at all failed before any axis was
+            // looked at, so its own first reason is the reason.
+            for (var index = 0; index < entries.length; index++) {
+                var entry = entries[index];
+                if (entry === null) {
+                    axis.reasonCode = (results[index].reasonCodes || [])[0]
+                        || "GYRO_COVERAGE_INSUFFICIENT";
+                    break;
+                }
+                if (entry.available !== true) {
+                    axis.reasonCode = entry.reasonCode || "GYRO_COVERAGE_INSUFFICIENT";
+                    break;
+                }
+            }
+        } else {
+            axis.sampleCount = sumOf(finiteValues(present.map(function(entry) {
+                return entry.sampleCount;
+            })));
+            // The loudest stretch, never an average: a floor raised for the last
+            // two minutes is a raised floor.
+            AXIS_AMPLITUDE_FIELDS.forEach(function(field) {
+                axis[field] = everyStretch(
+                    present.map(function(entry) { return entry[field]; }), Math.max
+                );
+            });
+        }
+        AXIS_COUNT_FIELDS.forEach(function(field) {
+            axis[field] = sumOf(finiteValues(present.map(function(entry) { return entry[field]; })));
+        });
+        // Whether the peak list holds every attention-level peak is known for the
+        // window only when every stretch measured this axis and said so; a
+        // stretch that did not leaves it unknown, never zero.
+        ATTENTION_COUNT_FIELDS.forEach(function(field) {
+            axis[field] = everyStretch(entries.map(function(entry) {
+                return entry && entry.available === true ? entry[field] : null;
+            }), function() {
+                return sumOf(Array.prototype.slice.call(arguments));
+            });
+        });
+        AXIS_COVERAGE_FIELDS.forEach(function(field) {
+            var values = finiteValues(present.map(function(entry) { return entry[field]; }));
+            axis[field] = values.length > 0 ? Math.min.apply(null, values) : 0;
+        });
+        axis.firstFiniteSampleTimeUs = present[0].firstFiniteSampleTimeUs === undefined
+            ? null : present[0].firstFiniteSampleTimeUs;
+        axis.lastFiniteSampleTimeUs = present[present.length - 1].lastFiniteSampleTimeUs
+            === undefined ? null : present[present.length - 1].lastFiniteSampleTimeUs;
+        axis.leadingFiniteGapUs = entries[0] && entries[0].leadingFiniteGapUs !== undefined
+            ? entries[0].leadingFiniteGapUs : null;
+        axis.trailingFiniteGapUs = entries[entries.length - 1]
+            && entries[entries.length - 1].trailingFiniteGapUs !== undefined
+            ? entries[entries.length - 1].trailingFiniteGapUs : null;
+        axis.peaks = [];
+        entries.forEach(function(entry, index) {
+            if (!entry) {
+                return;
+            }
+            var result = results[index];
+            (entry.peaks || []).forEach(function(peak) {
+                var copy = Object.assign({}, peak);
+                // Where it was measured, and what the rotor comparison was THERE:
+                // a peak in a stretch whose head speed was steady was genuinely
+                // compared, whatever happened in the stretch beside it.
+                copy.chunkRangeUs = [result.range.startTimeUs, result.range.endTimeUs];
+                copy.chunkHarmonicCorrelation = result.harmonicCorrelation
+                    || harmonicCorrelationAvailability(null);
+                axis.peaks.push(copy);
+            });
+        });
+        combined.push(axis);
+    });
+    return combined;
+}
+
+function combineQuality(results, sampleCount) {
+    var qualities = results.map(function(result) { return result.quality || {}; });
+    var field = function(name) {
+        return qualities.map(function(quality) { return quality[name]; });
+    };
+    return {
+        status: qualities.every(function(quality) { return quality.status === "accepted"; })
+            ? "accepted" : "insufficient",
+        chunkCount: results.length,
+        sourceSampleCount: sampleCount,
+        measuredSampleRateHz: everyStretch(field("measuredSampleRateHz"), Math.min),
+        medianIntervalUs: everyStretch(field("medianIntervalUs"), Math.max),
+        p95IntervalUs: everyStretch(field("p95IntervalUs"), Math.max),
+        selectedTimestampSpanCoverageRatio:
+            everyStretch(field("selectedTimestampSpanCoverageRatio"), Math.min),
+        validWindowCoverageRatio: everyStretch(field("validWindowCoverageRatio"), Math.min),
+        finiteSampleCoverageRatio: everyStretch(field("finiteSampleCoverageRatio"), Math.min),
+        finiteTimeSpanCoverageRatio: everyStretch(field("finiteTimeSpanCoverageRatio"), Math.min),
+        frequencyResolutionHz: everyStretch(field("frequencyResolutionHz"), Math.max),
+        maximumAnalyzedFrequencyHz: everyStretch(field("maximumAnalyzedFrequencyHz"), Math.min),
+        minimumCoverageRatio: MIN_VALID_WINDOW_COVERAGE_RATIO,
+        maximumInputSamples: MAX_INPUT_SAMPLES,
+        maximumSelectionDurationUs: MAX_SELECTION_DURATION_US,
+        maximumWelchWindowsPerAxis: MAX_WELCH_WINDOWS,
+        attentionBandRmsThresholdDps: ATTENTION_BAND_RMS_THRESHOLD_DPS,
+        attentionThresholdBasis: ATTENTION_THRESHOLD_BASIS
+    };
+}
+
+/**
+ * Combines consecutive stretch results into one result for the whole window.
+ *
+ * `results` are raw results from `analyzeMechanicalTimeSeries`, in time order,
+ * over stretches that tile `timeRangeUs`. One result comes back unchanged. More
+ * than one come back as a single result of the same shape whose `range` spans
+ * the window, combined so that the worst stretch speaks for the flight — see the
+ * table at the head of this section — plus `chunks`, one line per stretch.
+ *
+ * Exported so the combination can be checked on its own. A caller measuring a
+ * window should use `analyzeMechanicalWindow`, which plans the stretches.
+ */
+function combineMechanicalResults(results, timeRangeUs) {
+    if (!Array.isArray(results) || results.length === 0) {
+        throw codedError(
+            TypeError,
+            "MECHANICAL_RESULTS_REQUIRED",
+            "At least one analysed stretch is required"
+        );
+    }
+    if (results.length === 1) {
+        return results[0];
+    }
+    var first = results[0];
+    var last = results[results.length - 1];
+    var range = {
+        startTimeUs: timeRangeUs && Number.isFinite(timeRangeUs.startTimeUs)
+            ? timeRangeUs.startTimeUs : first.range.startTimeUs,
+        endTimeUs: timeRangeUs && Number.isFinite(timeRangeUs.endTimeUs)
+            ? timeRangeUs.endTimeUs : last.range.endTimeUs
+    };
+    var statuses = results.map(function(result) { return result.status; });
+    var status = statuses.indexOf("attention") !== -1
+        ? "attention"
+        : (statuses.every(function(value) { return value === "clear"; }) ? "clear" : "insufficient");
+    var reasons = [];
+    results.forEach(function(result) {
+        (result.reasonCodes || []).forEach(function(code) { addReason(reasons, code); });
+    });
+    var counts = results.map(function(result) { return result.range && result.range.sampleCount; });
+    // Interior boundaries sit on a sample both neighbours include; count it once.
+    var sampleCount = counts.every(Number.isFinite)
+        ? sumOf(counts) - (results.length - 1) : null;
+
+    var combined = baseResult(range, status, reasons, sampleCount);
+    var permitted = results.every(function(result) {
+        return result.tuningEvidenceGate && result.tuningEvidenceGate.status === "permitted";
+    });
+    combined.tuningEvidenceGate = permitted
+        ? { status: "permitted", reasonCodes: [] }
+        : { status: "blocked", reasonCodes: reasons.slice() };
+
+    var bands = results.map(function(result) { return result.analyzedBandHz; });
+    combined.analyzedBandHz = bands.every(function(band) {
+        return Array.isArray(band) && band.length === 2
+            && Number.isFinite(band[0]) && Number.isFinite(band[1]);
+    })
+        ? [
+            Math.max.apply(null, bands.map(function(band) { return band[0]; })),
+            Math.min.apply(null, bands.map(function(band) { return band[1]; }))
+        ]
+        : null;
+    var folds = results.map(function(result) { return result.aliasingFoldFrequencyHz; });
+    if (folds.every(Number.isFinite)) {
+        combined.aliasingFoldFrequencyHz = Math.min.apply(null, folds);
+    }
+    combined.quality = combineQuality(results, sampleCount);
+    combined.rpmEvidence = {
+        headspeed: combineRpmEvidence(results.map(function(result) {
+            return result.rpmEvidence && result.rpmEvidence.headspeed;
+        }), "headspeed", range),
+        tailspeed: combineRpmEvidence(results.map(function(result) {
+            return result.rpmEvidence && result.rpmEvidence.tailspeed;
+        }), "tailspeed", range)
+    };
+    combined.harmonicCorrelation = combineHarmonicCorrelation(results.map(function(result) {
+        return result.harmonicCorrelation;
+    }));
+    combined.axes = combineAxes(results);
+    // Each stretch's findings already carry the time range they describe.
+    combined.findings = [];
+    results.forEach(function(result) {
+        (result.findings || []).forEach(function(finding) { combined.findings.push(finding); });
+    });
+    combined.chunks = results.map(function(result) {
+        return {
+            startTimeUs: result.range.startTimeUs,
+            endTimeUs: result.range.endTimeUs,
+            durationUs: result.range.durationUs,
+            sampleCount: result.range.sampleCount,
+            status: result.status,
+            reasonCodes: (result.reasonCodes || []).slice(),
+            tuningEvidenceGate: result.tuningEvidenceGate ? result.tuningEvidenceGate.status : null,
+            harmonicCorrelationState: result.harmonicCorrelation
+                ? result.harmonicCorrelation.state : null
+        };
+    });
+    return combined;
+}
+
+/**
+ * Measures a whole window, however long, as one result.
+ *
+ * Takes what `analyzeMechanicalTimeSeries` and `analyzeMechanicalSpectrum` take
+ * — a series from `buildMechanicalSeries` or a decoded session — and the same
+ * options, and refuses the same caller errors with the same codes. A window one
+ * analysis accepts is handed to that analysis unchanged. A longer one is
+ * measured in consecutive stretches, AWAITED ONE AT A TIME so that only one
+ * stretch's samples are ever collected at once, and combined by
+ * `combineMechanicalResults`.
+ *
+ * This is the entry point for anything that measures the flight window: the
+ * recommendation path and the vibration panel both come through here, so the
+ * two cannot measure different seconds of the same flight.
+ *
+ * @param {object} sessionOrSeries a session from `decodeLog`, or the result of
+ *   `buildMechanicalSeries`
+ * @param {object} options as `analyzeMechanicalTimeSeries`
+ */
+async function analyzeMechanicalWindow(sessionOrSeries, options) {
+    var settings = options || {};
+    checkCancelled(settings);
+    var series = sessionOrSeries;
+    if (!(sessionOrSeries && sessionOrSeries.gyroSources)) {
+        series = buildMechanicalSeries(sessionOrSeries);
+        if (!series.usable) {
+            return analyzeMechanicalSpectrum(sessionOrSeries, settings);
+        }
+    }
+    var times = series && series.timeUs;
+    if (!times || typeof times.length !== "number" || times.length === 0) {
+        return analyzeMechanicalTimeSeries(series, settings);
+    }
+    requireGyroSources(series);
+    var range = normalizeRange(settings.timeRangeUs, times[0], times[times.length - 1]);
+
+    var minimumCount = 1;
+    for (var escalation = 0; ; escalation++) {
+        var plan = planMechanicalStretches(times, range, minimumCount);
+        var finalAttempt = escalation >= MAX_CHUNK_PLAN_ESCALATIONS;
+        if (plan.length === 1) {
+            // Exactly the call a single analysis makes, so its result is exactly
+            // the result a single analysis returns.
+            var whole = await analyzeMechanicalTimeSeries(series, settings);
+            if (!hitsChunkCap(whole) || finalAttempt) {
+                return whole;
+            }
+            minimumCount = 2;
+            continue;
+        }
+        var results = [];
+        for (var index = 0; index < plan.length; index++) {
+            checkCancelled(settings);
+            results.push(await analyzeMechanicalTimeSeries(series, Object.assign({}, settings, {
+                timeRangeUs: { startTimeUs: plan[index].startTimeUs, endTimeUs: plan[index].endTimeUs }
+            })));
+        }
+        if (!results.some(hitsChunkCap) || finalAttempt) {
+            return combineMechanicalResults(results, range);
+        }
+        minimumCount = plan.length + 1;
+    }
+}
+
 /* ------------------------------------------------------------ the UI boundary */
 
 var VIBRATION_SUMMARY_SCHEMA_VERSION = 1;
@@ -2263,16 +2950,26 @@ function peakRotorAttribution(peak, correlation) {
  * @returns {Promise<object>} see `VIBRATION_SUMMARY_SCHEMA_VERSION`
  */
 async function summarizeMechanicalVibration(sessionOrSeries, options) {
-    var isSeries = Boolean(sessionOrSeries && sessionOrSeries.gyroSources);
-    var result = isSeries
-        ? await analyzeMechanicalTimeSeries(sessionOrSeries, options)
-        : await analyzeMechanicalSpectrum(sessionOrSeries, options);
+    // The whole window, however long. A window one analysis accepts is analysed
+    // exactly as it always was; a longer one is measured in stretches and
+    // combined, the same way the recommendation path measures it, so the panel
+    // and the airframe finding cannot be about different seconds.
+    return summarizeMechanicalResult(await analyzeMechanicalWindow(sessionOrSeries, options));
+}
 
+/**
+ * The summary shape for an already-computed raw result.
+ *
+ * Pure. A result combined from several stretches adds `chunks` to the summary,
+ * and each peak from one adds `chunkRangeUs`; a single-stretch result adds
+ * neither, so its summary is the one it always was.
+ */
+function summarizeMechanicalResult(result) {
     var correlation = result.harmonicCorrelation;
     var headspeed = result.rpmEvidence.headspeed;
     var tailspeed = result.rpmEvidence.tailspeed;
 
-    return {
+    var view = {
         schemaVersion: VIBRATION_SUMMARY_SCHEMA_VERSION,
         engineVersion: result.engineVersion,
         // True of every field below, and asserted by the test suite rather than
@@ -2337,7 +3034,7 @@ async function summarizeMechanicalVibration(sessionOrSeries, options) {
                 // which starts at about 33 s of selection at any log rate.
                 windowCoverageRatio: axis.windowCoverageRatio,
                 peaks: axis.peaks.map(function(peak) {
-                    return {
+                    var summary = {
                         frequencyHz: peak.frequencyHz,
                         amplitudeDps: peak.bandRmsDps,
                         bandwidthHz: peak.bandwidthHz,
@@ -2346,13 +3043,43 @@ async function summarizeMechanicalVibration(sessionOrSeries, options) {
                         // Above the experimental threshold published above, not
                         // above any limit Rotorflight or anyone else has set.
                         aboveAttentionThreshold: peak.attentionEligible === true,
-                        rotorHarmonic: peakRotorAttribution(peak, correlation)
+                        // Judged against the rotor comparison of the stretch the
+                        // peak was measured in, when it came from one.
+                        rotorHarmonic: peakRotorAttribution(
+                            peak, peak.chunkHarmonicCorrelation || correlation
+                        )
                     };
+                    if (Array.isArray(peak.chunkRangeUs)) {
+                        summary.chunkRangeUs = peak.chunkRangeUs.slice();
+                    }
+                    return summary;
                 })
             };
         }),
         sources: result.sources
     };
+    // A window measured in stretches has no one head speed; each stretch's is
+    // published instead, beside their range. Absent on a single analysis, whose
+    // summary is unchanged.
+    ["headspeed", "tailspeed"].forEach(function(rotor) {
+        var evidence = result.rpmEvidence[rotor];
+        if (Array.isArray(evidence.stretchMedianRpm)) {
+            view.rotorCorrelation[rotor].stretchMedianRpm = evidence.stretchMedianRpm.slice();
+            view.rotorCorrelation[rotor].medianRpmRange = Array.isArray(evidence.medianRpmRange)
+                ? evidence.medianRpmRange.slice() : null;
+        }
+    });
+    if (Array.isArray(result.chunks)) {
+        view.chunks = result.chunks.map(function(chunk) {
+            return {
+                startTimeUs: chunk.startTimeUs,
+                endTimeUs: chunk.endTimeUs,
+                status: chunk.status,
+                reasonCodes: chunk.reasonCodes.slice()
+            };
+        });
+    }
+    return view;
 }
 
 var MECHANICAL_SOURCES = SOURCES;
@@ -2380,16 +3107,23 @@ var MECHANICAL_CONSTANTS = Object.freeze({
     minimumAttentionOccupiedBuckets: MIN_ATTENTION_OCCUPIED_BUCKETS,
     maximumAttentionUnsupportedGapRatio: MAX_ATTENTION_UNSUPPORTED_GAP_RATIO,
     attentionBandRmsThresholdDps: ATTENTION_BAND_RMS_THRESHOLD_DPS,
-    attentionThresholdBasis: ATTENTION_THRESHOLD_BASIS
+    attentionThresholdBasis: ATTENTION_THRESHOLD_BASIS,
+    // Share of each cap a stretch is planned to, once a window must be split.
+    chunkCapMargin: CHUNK_CAP_MARGIN
 });
 
 export {
   analyzeMechanicalSpectrum,
   analyzeMechanicalTimeSeries,
+  // A whole flight window, however long: the entry point for anything that
+  // measures the window, so every caller measures the same seconds.
+  analyzeMechanicalWindow,
+  combineMechanicalResults,
   // The documented entry point for a screen. Everything above it is the full
   // measurement record; this is the shape a UI can render without reading any
   // of it.
   summarizeMechanicalVibration,
+  summarizeMechanicalResult,
   VIBRATION_SUMMARY_SCHEMA_VERSION,
   MECHANICAL_SOURCES,
   MECHANICAL_CONSTANTS,

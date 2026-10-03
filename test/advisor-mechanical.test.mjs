@@ -47,8 +47,12 @@ import {
   summarizeMechanicalVibration,
   VIBRATION_SUMMARY_SCHEMA_VERSION
 } from '../src/analysis/advisor/mechanical-spectrum.mjs';
+// The whole-window entry points, reached through the namespace so that a module
+// missing one fails the tests that need it rather than every test in this file.
+import * as spectrum from '../src/analysis/advisor/mechanical-spectrum.mjs';
 import {makePackage} from '../src/analysis/advisor/evidence-contract.mjs';
 import {detectPitchPumps} from '../src/analysis/advisor/deterministic-metrics.mjs';
+import {evaluateAirframeGate} from '../src/analysis/advisor/recommendation-gates.mjs';
 
 /**
  * The real log is never committed — it declares GPS home coordinates — so it is
@@ -1317,6 +1321,440 @@ test('the selection cap is not a stationarity gate and does not pretend to be', 
   );
   assert.ok(result.rpmEvidence.headspeed.relativeSpread > 0.12);
 });
+
+/* ------------------------------------------- a whole flight, longer than one cap */
+
+/**
+ * A long three-axis flight at a real logging rate.
+ *
+ * Audit of 2 October 2026: the analyser caps one analysis at 262,144 samples
+ * and 262.144 s, and the app clamped by DURATION alone. A Rotorflight log at its
+ * own 993 us interval (1007 Hz) over 4m20s, or a 2 kHz log over 2m11s, came
+ * back SELECTION_SAMPLE_LIMIT_EXCEEDED — "not measured" — and every gain on an
+ * ordinary pack was blocked. Long flights are now measured whole, in stretches.
+ *
+ * `tones` carry their own `fromS`/`toS`, and `thin` drops samples from `fromS`
+ * on (keeping every `every`-th), which is what a logger that cannot keep up
+ * produces.
+ */
+function longFlight({rateHz, seconds, tones = [], thin = null, headspeedRpm = 1800, seed = 11}) {
+  const next = rng(seed);
+  const intervalUs = 1e6 / rateHz;
+  const total = Math.round(rateHz * seconds);
+  const timeUs = [];
+  const roll = [];
+  const pitch = [];
+  const yaw = [];
+  const head = [];
+  for (let index = 0; index < total; index += 1) {
+    const stamp = Math.round(index * intervalUs);
+    const at = stamp / 1e6;
+    if (thin && at >= thin.fromS && index % thin.every !== 0) {
+      continue;
+    }
+    let tone = 0;
+    for (const entry of tones) {
+      if (at >= (entry.fromS ?? 0) && at <= (entry.toS ?? Infinity)) {
+        tone += entry.amp * Math.sin(2 * Math.PI * entry.hz * at);
+      }
+    }
+    timeUs.push(stamp);
+    roll.push(tone + (next() - 0.5));
+    pitch.push(tone * 0.5 + (next() - 0.5));
+    yaw.push(next() - 0.5);
+    head.push(headspeedRpm + (next() - 0.5) * 8);
+  }
+  return {
+    timeUs: Float64Array.from(timeUs),
+    gyro: {roll: Float64Array.from(roll), pitch: Float64Array.from(pitch), yaw: Float64Array.from(yaw)},
+    gyroSources: UNFILTERED,
+    headspeedRpm: Float64Array.from(head),
+    tailspeedRpm: new Float64Array(timeUs.length).fill(Number.NaN)
+  };
+}
+
+test('a flight longer than one analysis accepts is measured whole, not refused', async () => {
+  const caps = MECHANICAL_CONSTANTS;
+  for (const [rateHz, seconds] of [[1007, 300], [2000, 150]]) {
+    const series = longFlight({rateHz, seconds});
+    const whole = wholeRange(series);
+    const label = `${rateHz} Hz for ${seconds} s (${series.timeUs.length} samples)`;
+    assert.ok(series.timeUs.length > caps.maximumInputSamples,
+      `${label}: the fixture must be over the per-analysis sample cap, or this proves nothing`);
+
+    // The panel's entry point.
+    const view = await summarizeMechanicalVibration(series, whole);
+    assert.notEqual(view.status, 'insufficient',
+      `${label}: the vibration panel refused a whole flight: ${view.reasonCodes}`);
+    assert.ok(!view.reasonCodes.some(code => /LIMIT_EXCEEDED/.test(code)), `${label}: ${view.reasonCodes}`);
+    assert.equal(view.range.startTimeUs, whole.timeRangeUs.startTimeUs);
+    assert.equal(view.range.endTimeUs, whole.timeRangeUs.endTimeUs,
+      `${label}: the measurement must cover the whole window, not its first 262 s`);
+
+    // The recommendation path's entry point: a real verdict on the whole window.
+    const result = await spectrum.analyzeMechanicalWindow(series, whole);
+    assert.equal(result.status, 'clear', `${label}: ${result.reasonCodes}`);
+    assert.equal(result.tuningEvidenceGate.status, 'permitted');
+    assert.equal(result.harmonicCorrelation.state, 'evaluated');
+    assert.equal(result.range.startTimeUs, whole.timeRangeUs.startTimeUs);
+    assert.equal(result.range.endTimeUs, whole.timeRangeUs.endTimeUs);
+
+    // The fewest stretches that fit, each inside BOTH caps, contiguous, covering it all.
+    assert.equal(result.chunks.length, 2, `${label}: ${result.chunks.length} stretches`);
+    for (const chunk of result.chunks) {
+      assert.ok(chunk.sampleCount <= caps.maximumInputSamples, `${label}: ${chunk.sampleCount}`);
+      assert.ok(chunk.endTimeUs - chunk.startTimeUs <= caps.maximumSelectionDurationUs);
+      assert.equal(chunk.status, 'clear', `${label}: ${chunk.reasonCodes}`);
+    }
+    assert.equal(result.chunks[0].startTimeUs, whole.timeRangeUs.startTimeUs);
+    assert.equal(result.chunks.at(-1).endTimeUs, whole.timeRangeUs.endTimeUs);
+    for (let index = 1; index < result.chunks.length; index += 1) {
+      assert.equal(result.chunks[index].startTimeUs, result.chunks[index - 1].endTimeUs,
+        `${label}: stretch ${index} does not start where the one before it ended`);
+    }
+    // Shared boundary samples are counted once.
+    assert.equal(result.range.sampleCount, series.timeUs.length);
+
+    // And the airframe gate now covers a stop five seconds before the end.
+    const gate = evaluateAirframeGate(result, {eventTimesUs: [whole.timeRangeUs.endTimeUs - 5e6]});
+    assert.ok(!gate.codes.includes('MECHANICAL_RANGE_EXCLUDES_EVENTS'), `${label}: ${gate.codes}`);
+    assert.equal(gate.status, 'permitted', `${label}: ${gate.codes}`);
+  }
+});
+
+test('vibration found only in the LAST stretch of a long flight still blocks it', async () => {
+  // 71 Hz is no order of a 1800 rpm head, and 26 deg/s is well over the
+  // threshold: unexplained vibration, present only after 160 s.
+  const series = longFlight({
+    rateHz: 1007, seconds: 300, tones: [{hz: 71, amp: 26, fromS: 160}], seed: 12
+  });
+  const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+  assert.deepEqual(result.chunks.map(chunk => chunk.status), ['clear', 'attention'],
+    'the fixture must put the vibration in the last stretch only');
+  assert.equal(result.status, 'attention', 'attention anywhere is attention for the flight');
+  assert.equal(result.tuningEvidenceGate.status, 'blocked');
+  const gate = evaluateAirframeGate(result);
+  assert.equal(gate.status, 'blocked');
+  assert.ok(gate.codes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED'), `${gate.codes}`);
+
+  // The peak is kept, with the stretch it was measured in.
+  const roll = result.axes.find(axis => axis.axis === 'roll');
+  const peak = roll.peaks.find(entry => Math.abs(entry.frequencyHz - 71) < 2 && entry.attentionEligible);
+  assert.ok(peak, `the 71 Hz peak was dropped: ${JSON.stringify(roll.peaks.map(p => p.frequencyHz))}`);
+  assert.deepEqual(peak.chunkRangeUs,
+    [result.chunks[1].startTimeUs, result.chunks[1].endTimeUs]);
+
+  const view = await summarizeMechanicalVibration(series, wholeRange(series));
+  assert.equal(view.status, 'attention');
+  assert.ok(view.axes.find(axis => axis.axis === 'roll').peaks
+    .some(entry => entry.aboveAttentionThreshold && entry.chunkRangeUs));
+});
+
+test('a logging gap only in the LAST stretch still makes the flight unmeasured', async () => {
+  // From 250 s the logger keeps one sample in six: a ~6 ms interval against a
+  // ~1 ms median, which no spectrum may be transformed across.
+  const series = longFlight({rateHz: 1007, seconds: 300, thin: {fromS: 250, every: 6}, seed: 13});
+  const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+  assert.equal(result.chunks.length, 2);
+  assert.equal(result.chunks[0].status, 'clear', `${result.chunks[0].reasonCodes}`);
+  assert.equal(result.chunks[1].status, 'insufficient', `${result.chunks[1].reasonCodes}`);
+  assert.equal(result.status, 'insufficient', 'a stretch that could not be measured is not clear');
+  assert.ok(result.reasonCodes.includes('TIMING_GAPS_EXCESSIVE'), `${result.reasonCodes}`);
+  assert.equal(result.tuningEvidenceGate.status, 'blocked');
+  assert.notEqual(result.harmonicCorrelation.state, 'evaluated',
+    'the rotor was not compared over the stretch that was not measured');
+  const gate = evaluateAirframeGate(result);
+  assert.equal(gate.status, 'blocked');
+  assert.ok(gate.codes.includes('MECHANICAL_EVIDENCE_NOT_MEASURED'), `${gate.codes}`);
+});
+
+test('a window one analysis accepts is analysed exactly as before', async () => {
+  // Single stretch: byte-for-byte the result the single analysis returns, and
+  // no stretch bookkeeping added to it or to the summary.
+  for (const [rateHz, seconds] of [[1000, 20], [1007, 260]]) {
+    const series = longFlight({
+      rateHz, seconds, tones: [{hz: 30, amp: 14}, {hz: 83, amp: 6}], seed: 14
+    });
+    const whole = wholeRange(series);
+    const direct = await analyzeMechanicalTimeSeries(series, whole);
+    const windowed = await spectrum.analyzeMechanicalWindow(series, whole);
+    assert.notEqual(direct.status, 'insufficient', `${rateHz}/${seconds}: ${direct.reasonCodes}`);
+    assert.deepEqual(windowed, direct, `${rateHz} Hz for ${seconds} s`);
+    assert.equal(windowed.chunks, undefined);
+
+    const view = await summarizeMechanicalVibration(series, whole);
+    assert.ok(!('chunks' in view));
+    assert.ok(view.axes.every(axis => axis.peaks.every(peak => !('chunkRangeUs' in peak))));
+  }
+});
+
+test('stretches combine conservatively: worst measurement, weakest correlation', async () => {
+  // 40 s: a steady head and a quiet airframe for 20 s, then a head speed that
+  // ramps 30% and a noisier airframe. Each half is analysed on its own and the
+  // two are combined; every field must take the worse of the two.
+  const rateHz = 1000;
+  const count = rateHz * 40;
+  const next = rng(15);
+  const timeUs = new Float64Array(count);
+  const roll = new Float64Array(count);
+  const head = new Float64Array(count);
+  for (let index = 0; index < count; index += 1) {
+    timeUs[index] = index * 1000;
+    const late = index >= count / 2;
+    roll[index] = (next() - 0.5) * (late ? 6 : 1) + 3 * Math.sin(2 * Math.PI * 47 * index / rateHz);
+    head[index] = late ? 1800 * (1 + 0.3 * (index - count / 2) / (count / 2)) : 1800;
+  }
+  const series = {
+    timeUs, gyro: {roll, pitch: roll, yaw: roll}, gyroSources: UNFILTERED,
+    headspeedRpm: head, tailspeedRpm: new Float64Array(count).fill(Number.NaN)
+  };
+  const early = await analyzeMechanicalTimeSeries(series,
+    {timeRangeUs: {startTimeUs: 0, endTimeUs: 20_000_000}});
+  const late = await analyzeMechanicalTimeSeries(series,
+    {timeRangeUs: {startTimeUs: 20_000_000, endTimeUs: timeUs[count - 1]}});
+  assert.equal(early.harmonicCorrelation.state, 'evaluated');
+  assert.equal(late.harmonicCorrelation.state, 'unavailable');
+
+  const combined = spectrum.combineMechanicalResults(
+    [early, late], {startTimeUs: 0, endTimeUs: timeUs[count - 1]});
+  assert.equal(combined.range.startTimeUs, 0);
+  assert.equal(combined.range.endTimeUs, timeUs[count - 1]);
+  assert.equal(combined.harmonicCorrelation.evaluated, false,
+    'correlation is evaluated for the flight only if it was for every stretch');
+  assert.equal(combined.rpmEvidence.headspeed.reasonCode, 'RPM_UNSTABLE_IN_SELECTION');
+  // Never steadier than either stretch, and never steadier than the window
+  // itself, measured from the column. This used to pin the spread EQUAL to the
+  // larger stretch's, which is the understatement: two steady stretches at two
+  // different head speeds each have a tiny spread, and the window does not.
+  assert.ok(combined.rpmEvidence.headspeed.relativeSpread >= Math.max(
+    early.rpmEvidence.headspeed.relativeSpread, late.rpmEvidence.headspeed.relativeSpread));
+  assert.ok(combined.rpmEvidence.headspeed.relativeSpread
+    >= headspeedSpread(series, 0, timeUs[count - 1]) - 1e-12);
+  for (const axis of combined.axes) {
+    const parts = [early, late].map(result => result.axes.find(entry => entry.axis === axis.axis));
+    assert.equal(axis.medianNoisePsdDps2PerHz,
+      Math.max(...parts.map(part => part.medianNoisePsdDps2PerHz)), 'the worse noise floor');
+    assert.equal(axis.broadbandRmsDps, Math.max(...parts.map(part => part.broadbandRmsDps)));
+    assert.equal(axis.windowCoverageRatio, Math.min(...parts.map(part => part.windowCoverageRatio)));
+  }
+  // Status precedence: attention over insufficient over clear.
+  const statusOf = (...statuses) => spectrum.combineMechanicalResults(
+    statuses.map(status => (status === 'attention' ? {...early, status: 'attention',
+      tuningEvidenceGate: {status: 'blocked', reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY']}}
+      : status === 'insufficient' ? {...early, status: 'insufficient',
+        tuningEvidenceGate: {status: 'blocked', reasonCodes: ['TIMING_GAPS_EXCESSIVE']}}
+        : early)),
+    {startTimeUs: 0, endTimeUs: timeUs[count - 1]});
+  assert.equal(statusOf('clear', 'clear').status, 'clear');
+  assert.equal(statusOf('clear', 'clear').tuningEvidenceGate.status, 'permitted');
+  assert.equal(statusOf('clear', 'insufficient').status, 'insufficient');
+  assert.equal(statusOf('insufficient', 'attention').status, 'attention');
+  assert.equal(statusOf('attention', 'clear').tuningEvidenceGate.status, 'blocked');
+  assert.equal(statusOf('clear', 'insufficient').tuningEvidenceGate.status, 'blocked');
+});
+
+test('a head speed combined from stretches is none that no stretch had, and never steadier '
+  + 'than the window', async () => {
+  // Review of 2 October 2026: one stretch at 1500 rpm and the next at 1800 came
+  // back as a "trustworthy" 1650 rpm with a spread of 0.0024 — a head speed the
+  // rotor never turned at, and a steadiness the window never had. Swept over
+  // random stretch counts, head speeds, and jitter.
+  const random = rng(31);
+  for (let trial = 0; trial < 24; trial += 1) {
+    const stretches = 2 + (trial % 2);
+    const perStretchS = 6;
+    const rateHz = 1000;
+    const count = rateHz * perStretchS * stretches;
+    const sameSpeed = trial % 4 === 0;
+    const base = 1400 + random() * 800;
+    const medians = Array.from({length: stretches}, () => (sameSpeed ? base : 1400 + random() * 800));
+    const jitters = Array.from({length: stretches}, () => 2 + random() * 40);
+    const timeUs = new Float64Array(count);
+    const roll = new Float64Array(count);
+    const head = new Float64Array(count);
+    for (let index = 0; index < count; index += 1) {
+      timeUs[index] = index * 1000;
+      const stretch = Math.min(stretches - 1, Math.floor(index / (rateHz * perStretchS)));
+      roll[index] = 3 * Math.sin(2 * Math.PI * 47 * index / rateHz) + (random() - 0.5);
+      head[index] = medians[stretch] + (random() - 0.5) * 2 * jitters[stretch];
+    }
+    const series = {
+      timeUs, gyro: {roll, pitch: roll, yaw: roll}, gyroSources: UNFILTERED,
+      headspeedRpm: head, tailspeedRpm: new Float64Array(count).fill(Number.NaN)
+    };
+    const results = [];
+    for (let stretch = 0; stretch < stretches; stretch += 1) {
+      const startTimeUs = stretch * perStretchS * 1e6;
+      const endTimeUs = stretch === stretches - 1
+        ? timeUs[count - 1] : (stretch + 1) * perStretchS * 1e6;
+      results.push(await analyzeMechanicalTimeSeries(series, {timeRangeUs: {startTimeUs, endTimeUs}}));
+    }
+    const whole = {startTimeUs: 0, endTimeUs: timeUs[count - 1]};
+    const combined = spectrum.combineMechanicalResults(results, whole);
+    const headspeed = combined.rpmEvidence.headspeed;
+    const label = `trial ${trial}: medians ${medians.map(value => Math.round(value))}`;
+    const stretchMedians = results.map(result => result.rpmEvidence.headspeed.medianRpm);
+    assert.ok(stretchMedians.every(Number.isFinite), label);
+
+    // Never steadier than the window, measured independently from the column.
+    const windowSpread = headspeedSpread(series, whole.startTimeUs, whole.endTimeUs);
+    assert.ok(headspeed.relativeSpread >= windowSpread - 1e-9,
+      `${label}: published spread ${headspeed.relativeSpread} understates the window's ${windowSpread}`);
+    for (const result of results) {
+      assert.ok(headspeed.relativeSpread >= result.rpmEvidence.headspeed.relativeSpread - 1e-12,
+        `${label}: steadier than one of its own stretches`);
+    }
+    // No single head speed was measured across the window, so none is published:
+    // the stretches' own medians are, beside their range.
+    assert.equal(headspeed.medianRpm, null, `${label}: ${headspeed.medianRpm}`);
+    assert.equal(headspeed.fundamentalHz, null, label);
+    assert.deepEqual(headspeed.stretchMedianRpm, stretchMedians, label);
+    assert.deepEqual(headspeed.medianRpmRange,
+      [Math.min(...stretchMedians), Math.max(...stretchMedians)], label);
+    // Each stretch was still compared against its OWN head speed, and was steady
+    // enough to be: the matching per stretch is unchanged by any of this.
+    assert.ok(results.every(result => result.harmonicCorrelation.state === 'evaluated'), label);
+    assert.equal(combined.harmonicCorrelation.state, 'evaluated', label);
+
+    // And the panel says the same.
+    const view = spectrum.summarizeMechanicalResult(combined).rotorCorrelation.headspeed;
+    assert.equal(view.medianRpm, null, label);
+    assert.equal(view.fundamentalHz, null, label);
+    assert.deepEqual(view.stretchMedianRpm, stretchMedians, label);
+    assert.equal(view.relativeSpread, headspeed.relativeSpread, label);
+  }
+});
+
+/** MAX_PEAKS_PER_AXIS in mechanical-spectrum.mjs, which caps sub-threshold peaks only. */
+const SUB_THRESHOLD_PEAK_CAP = 5;
+
+test('an attention-level tone crowded by small whole-flight tones is never read as clear',
+  async () => {
+    // Review of 2 October 2026: five peaks per axis were kept on persistence and
+    // prominence before attention was judged, so enough small, steady tones
+    // pushed an attention-level tone off the list and the flight read clear.
+    const random = rng(44);
+    const small = [60, 90, 120, 150, 180, 210, 240, 255, 285, 315, 345];
+    const uncounted = [];
+    for (let crowd = 0; crowd <= small.length; crowd += 1) {
+      for (const loudHz of [30, 75]) {
+        const tones = [{hz: loudHz, amp: 20}];
+        for (let index = 0; index < crowd; index += 1) {
+          tones.push({hz: small[index], amp: 3 + random() * 3, phase: random() * 6});
+        }
+        const series = toneSeries({rateHz: 1000, seconds: 20, tones, seed: 900 + crowd});
+        series.headspeedRpm = new Float64Array(series.timeUs.length).fill(1800);
+        const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+        const label = `${loudHz} Hz at 20 deg/s among ${crowd} small tones`;
+        assert.equal(result.status, 'attention', `${label}: read ${result.status}`);
+        assert.equal(result.tuningEvidenceGate.status, 'blocked', label);
+        for (const axis of result.axes) {
+          assert.ok(axis.peaks.some(peak => peak.attentionEligible === true
+            && Math.abs(peak.frequencyHz - loudHz) <= 3), `${label}: ${axis.axis} lost it`);
+          // Small tones keep a cap of their own. UPDATED in round 3: this line
+          // used to pin "small tones fill only the room the cap leaves", which was
+          // the bug — every attention-level peak listed cost a small tone the old
+          // list held, and a small tone is the only thing the tone-coincidence
+          // rule can see a rotor order by. Every small tone here is steady and
+          // well clear of its neighbours, so the list holds each of them, up to
+          // the cap, however many attention-level peaks are listed beside them.
+          const smallListed = axis.peaks.filter(peak => peak.attentionEligible !== true);
+          assert.equal(smallListed.length, Math.min(SUB_THRESHOLD_PEAK_CAP, crowd),
+            `${label}: ${axis.axis} lists ${smallListed.length} small tones `
+            + `${JSON.stringify(smallListed.map(peak => peak.frequencyHz))}`);
+          if (axis.attentionEligibleUnlistedCount !== 0 || !(axis.attentionEligibleCandidateCount >= 1)) {
+            uncounted.push(`${label}: ${axis.axis} ${axis.attentionEligibleUnlistedCount}`
+              + `/${axis.attentionEligibleCandidateCount}`);
+          }
+        }
+      }
+    }
+    // Every axis says of its own list that it is complete, as a measured count.
+    assert.deepEqual(uncounted, []);
+  });
+
+test('a tone\'s size while present is measured window by window, and its flight average never '
+  + 'stands in for it', async () => {
+    // Round-2 review: `bandRmsDps` is the Welch average over every window, while
+    // attention is judged window by window. A once-per-rev at four times the
+    // level, present for a third of the flight, averages under three times it.
+    // `attentionWindowBandRmsDps` is the RMS over the windows in which the tone
+    // reached the attention level: its size while present.
+    const rateHz = 1000;
+    const seconds = 60;
+    const build = ({hz, amp, onS, periodS, seed}) => {
+      const next = rng(seed);
+      const count = rateHz * seconds;
+      const timeUs = new Float64Array(count);
+      const roll = new Float64Array(count);
+      const quiet = new Float64Array(count);
+      for (let index = 0; index < count; index += 1) {
+        const at = index / rateHz;
+        timeUs[index] = Math.round(at * 1e6);
+        const on = (at % periodS) < onS;
+        roll[index] = (on ? amp * Math.sin(2 * Math.PI * hz * at) : 0) + (next() - 0.5);
+        quiet[index] = next() - 0.5;
+      }
+      return {timeUs, gyro: {roll, pitch: quiet, yaw: quiet}, gyroSources: UNFILTERED,
+        headspeedRpm: new Float64Array(count).fill(1800),
+        tailspeedRpm: new Float64Array(count).fill(Number.NaN)};
+    };
+    const peakAt = async (options, hz) => {
+      const series = build(options);
+      const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+      return result.axes.find(axis => axis.axis === 'roll').peaks
+        .find(peak => Math.abs(peak.frequencyHz - hz) <= 3) ?? null;
+    };
+    let intermittent = 0;
+    for (const hz of [30, 75]) {
+      for (const amp of [20, 42]) {
+        // The same tone present throughout: what it measures while present.
+        const steady = await peakAt({hz, amp, onS: 1, periodS: 1, seed: 3 + amp}, hz);
+        assert.ok(steady?.attentionEligible, `${hz} Hz at ${amp}: steady reference`);
+        assert.ok(Math.abs(steady.attentionWindowBandRmsDps - steady.bandRmsDps) <= 0.002,
+          `${hz} Hz at ${amp}: a tone above the level throughout is its own average: `
+          + `${steady.attentionWindowBandRmsDps} vs ${steady.bandRmsDps}`);
+        for (const presence of [0.3, 0.45, 0.6]) {
+          for (const periodS of [6, 10]) {
+            const label = `${hz} Hz at ${amp} (steady ${steady.bandRmsDps} deg/s), present `
+              + `${presence * 100}% in ${periodS} s cycles`;
+            const peak = await peakAt({hz, amp, onS: presence * periodS, periodS,
+              seed: 11 + amp + periodS}, hz);
+            assert.ok(peak?.attentionEligible, `${label}: ${JSON.stringify(peak)}`);
+            intermittent += 1;
+            // The fixture is the hole: its flight average is well under its size.
+            assert.ok(peak.bandRmsDps <= 0.85 * steady.bandRmsDps, `${label}: ${peak.bandRmsDps}`);
+            // Its size while present is the size it has while present — within
+            // the share the half-second windows at each switch take off it — and
+            // never less than its average, nor under the level it was above.
+            const size = peak.attentionWindowBandRmsDps;
+            assert.ok(size >= 0.85 * steady.bandRmsDps && size <= 1.02 * steady.bandRmsDps,
+              `${label}: size while present ${size}`);
+            assert.ok(size >= peak.bandRmsDps, `${label}: ${size} under its average ${peak.bandRmsDps}`);
+            assert.ok(size >= 8, `${label}: ${size} is under the level it was above`);
+          }
+        }
+      }
+    }
+    assert.equal(intermittent, 24);
+
+    // Pulses shorter than one analysis window: no window sees the tone whole, so
+    // the size while present is what the windows saw — never above the truth,
+    // never under the average, never under the level it was above.
+    for (const amp of [20, 42]) {
+      const peak = await peakAt({hz: 30, amp, onS: 0.3, periodS: 1, seed: 71 + amp}, 30);
+      const truth = amp / Math.SQRT2;
+      assert.ok(peak?.attentionEligible, `pulsed ${amp}: ${JSON.stringify(peak)}`);
+      assert.ok(peak.attentionWindowBandRmsDps <= truth
+        && peak.attentionWindowBandRmsDps >= peak.bandRmsDps
+        && peak.attentionWindowBandRmsDps >= 8, `pulsed ${amp}: ${JSON.stringify(peak)}`);
+    }
+
+    // A tone that never reached the level in any window has no size while present.
+    const quietPeak = await peakAt({hz: 30, amp: 4, onS: 1, periodS: 1, seed: 5}, 30);
+    assert.ok(quietPeak && quietPeak.attentionEligible === false, JSON.stringify(quietPeak));
+    assert.equal(quietPeak.attentionWindowBandRmsDps, null);
+  });
 
 test('a missing or out-of-bounds range is refused, never guessed', async () => {
   const series = toneSeries({rateHz: 1000, seconds: 10, tones: [{hz: 50, amp: 5}], seed: 55});

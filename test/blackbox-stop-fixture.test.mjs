@@ -34,7 +34,7 @@ import {
   describeStopCapture, directionalObservations, resolveAxisSignals, summarizeAxis
 } from '../src/analysis/axis-report.mjs';
 import {
-  MECHANICAL_CONSTANTS, analyzeMechanicalTimeSeries, buildMechanicalSeries, sessionTimeBounds
+  MECHANICAL_CONSTANTS, analyzeMechanicalWindow, buildMechanicalSeries, sessionTimeBounds
 } from '../src/analysis/advisor/mechanical-spectrum.mjs';
 import {analyseAxisEvidence, buildRecommendations} from '../src/analysis/recommendations.mjs';
 import {buildFixtures} from '../tools/generate-fixtures.mjs';
@@ -665,13 +665,16 @@ async function analyseFixture(file) {
     const [session] = (await decodeFixture(file)).sessions;
     assert.deepEqual(session.errors, [], `${file} must decode clean`);
 
+    // The whole window, the way ui/app.mjs measures it since 2 October 2026. It
+    // used to be clamped to the duration cap here because the app clamped it;
+    // these fixtures all fit one analysis, so the result is the same either way,
+    // and this keeps the harness on the app's real entry point.
     const bounds = sessionTimeBounds(session);
-    const startTimeUs = bounds.startTimeUs;
-    const endTimeUs = startTimeUs + Math.min(
-      bounds.endTimeUs - startTimeUs, MECHANICAL_CONSTANTS.maximumSelectionDurationUs
-    );
-    const mechanical = await analyzeMechanicalTimeSeries(
-      buildMechanicalSeries(session), {timeRangeUs: {startTimeUs, endTimeUs}}
+    assert.ok(bounds.durationUs <= MECHANICAL_CONSTANTS.maximumSelectionDurationUs,
+      `${file} is longer than one analysis; the expectations below assume it is not`);
+    const mechanical = await analyzeMechanicalWindow(
+      buildMechanicalSeries(session),
+      {timeRangeUs: {startTimeUs: bounds.startTimeUs, endTimeUs: bounds.endTimeUs}}
     );
 
     const axes = {};

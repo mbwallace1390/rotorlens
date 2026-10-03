@@ -55,6 +55,9 @@ import {
   buildMechanicalSeries,
   sessionTimeBounds
 } from '../src/analysis/advisor/mechanical-spectrum.mjs';
+// The app's entry point for a flight window, reached through the namespace so a
+// module missing it fails only the tests that need it.
+import * as spectrum from '../src/analysis/advisor/mechanical-spectrum.mjs';
 
 const REAL_LOG = process.env.ROTORLENS_REAL_LOG;
 const STOP_FIXTURE = new URL(
@@ -238,12 +241,32 @@ const REACHABILITY = [
   ['MECHANICAL_EVIDENCE_GATE_BLOCKED', () => evaluateAirframeGate(mechanicalStub({
     status: 'attention', tuningEvidenceGate: {status: 'blocked', reasonCodes: ['X']}
   }))],
+  // Split from the code above on 2 October 2026: "vibration was measured" and
+  // "vibration could not be measured" were one code, so a 40 Hz log was told
+  // its range "shows vibration".
+  ['MECHANICAL_EVIDENCE_NOT_MEASURED', () => evaluateAirframeGate(mechanicalStub({
+    status: 'insufficient', reasonCodes: ['TIMING_GAPS_EXCESSIVE'],
+    tuningEvidenceGate: {status: 'blocked', reasonCodes: ['TIMING_GAPS_EXCESSIVE']}
+  }))],
   ['ROTOR_CORRELATION_UNAVAILABLE', () => evaluateAirframeGate(mechanicalStub({
     harmonicCorrelation: {state: 'unavailable'}
   }))],
   ['ROTOR_CORRELATION_NOT_ATTEMPTED', () => evaluateAirframeGate(mechanicalStub({
     harmonicCorrelation: {state: 'not-evaluated'}
   }))],
+  // A window measured in stretches, compared against the rotor in one of them
+  // and not in the other. "Never compared" would be false about the first.
+  ['ROTOR_CORRELATION_PARTIAL', () => evaluateAirframeGate(mechanicalStub({
+    harmonicCorrelation: {state: 'not-evaluated'},
+    chunks: [
+      {status: 'clear', harmonicCorrelationState: 'evaluated'},
+      {status: 'insufficient', harmonicCorrelationState: 'not-evaluated'}
+    ]
+  }))],
+  // Main-rotor 1/rev or 2/rev, and nothing else, but past the severity ceiling.
+  ['MAIN_ROTOR_ORDER_TONE_LARGE', () => evaluateAirframeGate(withAxis(rotorOrderOnlyStub(),
+    'roll', entry => ({...entry, peaks: [{...entry.peaks[0], bandRmsDps: 30,
+      attentionWindowBandRmsDps: 30}, entry.peaks[1]]})))],
   ['MECHANICAL_RANGE_EXCLUDES_EVENTS', () => evaluateAirframeGate(
     mechanicalStub({range: {startTimeUs: 0, endTimeUs: 1_000}}), {eventTimesUs: [9_000_000]}
   )],
@@ -445,6 +468,639 @@ test('the airframe gate blocks when the vibration check covered other seconds', 
   assert.ok(holdElsewhere.codes.includes('MECHANICAL_RANGE_EXCLUDES_HOLDS'));
   assert.equal(holdElsewhere.measured.rangeContainsHolds, false);
 });
+
+/**
+ * A gyro series the real analyser cannot measure, for a named reason.
+ *
+ * Built rather than stubbed: what is being pinned is what `evaluateAirframeGate`
+ * makes of a result the analyser actually returns, and a stub could only
+ * agree with whatever shape its author remembered.
+ */
+function unmeasurableSeries(kind) {
+  const rateHz = kind === 'low-rate' ? 40 : 1000;
+  const count = rateHz * 20;
+  const timeUs = [];
+  const roll = [];
+  for (let index = 0; index < count; index += 1) {
+    // Keep 15 samples, drop 10: one 11 ms hole every 25 ms of flight. The
+    // median interval stays 1 ms and the 95th percentile does not.
+    if (kind === 'gaps' && index % 25 >= 15) {
+      continue;
+    }
+    timeUs.push(Math.round((index * 1e6) / rateHz));
+    roll.push(6 * Math.sin(2 * Math.PI * 47 * index / rateHz) + ((index * 7919) % 13) / 13);
+  }
+  const values = Float64Array.from(roll);
+  return {
+    timeUs: Float64Array.from(timeUs),
+    gyro: {roll: values, pitch: values, yaw: values},
+    gyroSources: {roll: 'gyroRAW', pitch: 'gyroRAW', yaw: 'gyroRAW'},
+    // A rock-steady head: nothing about the rotor speed moved.
+    headspeedRpm: new Float64Array(timeUs.length).fill(1800),
+    tailspeedRpm: new Float64Array(timeUs.length).fill(Number.NaN)
+  };
+}
+
+test('a vibration check that could not measure is never reported as vibration measured',
+  async () => {
+    for (const [kind, reason] of [
+      ['low-rate', 'SAMPLE_RATE_UNAVAILABLE'],
+      ['gaps', 'TIMING_GAPS_EXCESSIVE']
+    ]) {
+      const series = unmeasurableSeries(kind);
+      const mechanical = await analyzeMechanicalTimeSeries(series, {
+        timeRangeUs: {startTimeUs: series.timeUs[0], endTimeUs: series.timeUs.at(-1)}
+      });
+      // The fixture must genuinely be unmeasurable, for the named reason.
+      assert.equal(mechanical.status, 'insufficient', `${kind}: ${mechanical.reasonCodes}`);
+      assert.ok(mechanical.reasonCodes.includes(reason), `${kind}: ${mechanical.reasonCodes}`);
+
+      const gate = evaluateAirframeGate(mechanical);
+      assert.equal(gate.status, 'blocked', 'an unmeasured airframe still blocks every gain');
+      assert.ok(gate.codes.includes('MECHANICAL_EVIDENCE_NOT_MEASURED'),
+        `${kind}: expected the not-measured code, got [${gate.codes.join(', ')}]`);
+      assert.ok(!gate.codes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED'),
+        `${kind}: "this range shows vibration" is false when nothing was measured`);
+      for (const entry of describeGateBlock(gate)) {
+        assert.doesNotMatch(entry.sentence, /shows (?:measured )?vibration|shaking/i,
+          `${kind}: ${entry.code} claims vibration that was never measured: ${entry.sentence}`);
+        // The head speed was constant. Nothing may say it moved.
+        assert.doesNotMatch(entry.sentence, /moved too much/i,
+          `${kind}: ${entry.code} blames a head speed that never moved: ${entry.sentence}`);
+      }
+    }
+  });
+
+/* =====================================================================
+ * PART 3b — the rotor-order exception (owner decision, 2 October 2026).
+ *
+ * The 8 deg/s attention level is synthetic-calibrated and fires on 32 of 33
+ * real flights, mostly from the main rotor's own once- and twice-per-rev. When
+ * EVERYTHING above it is one of those two tones, measured on unfiltered gyro
+ * against a rotor speed that was actually compared, it is reported instead of
+ * blocking. Anything else still blocks. Each disqualifier below must block on
+ * its own, or it is decoration.
+ * ===================================================================== */
+
+/** A result whose only attention-level energy is main-rotor 1/rev and 2/rev. */
+function rotorOrderOnlyStub(overrides = {}) {
+  // A tone above the level in every window: its size while present IS its
+  // flight average. The rule judges the ceiling on the size while present, so a
+  // peak without one is the unknown case and is refused.
+  const peak = (frequencyHz, order, bandRmsDps) => ({
+    frequencyHz, bandRmsDps, attentionWindowBandRmsDps: bandRmsDps, attentionPersistenceRatio: 1,
+    bandwidthHz: 2, persistenceRatio: 1, attentionEligible: true,
+    harmonicMatch: {rotor: 'main', order, predictedHz: 30 * order, deltaHz: 0.7, toleranceHz: 2.9}
+  });
+  return mechanicalStub({
+    status: 'attention',
+    reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY', 'MAIN_ROTOR_HARMONIC_CORRELATION'],
+    tuningEvidenceGate: {
+      status: 'blocked',
+      reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY', 'MAIN_ROTOR_HARMONIC_CORRELATION']
+    },
+    harmonicCorrelation: {state: 'evaluated', evaluated: true},
+    rpmEvidence: {headspeed: {relativeSpread: 0.01, state: 'trustworthy', medianRpm: 1800}},
+    axes: ['roll', 'pitch', 'yaw'].map(axis => ({
+      axis, source: 'gyroRAW', available: true,
+      // The analyser's own statement that the list below holds every
+      // attention-level peak it found. Without it, "every attention peak is
+      // the rotor" is a claim about a list that may have been cut short.
+      attentionEligibleUnlistedCount: 0,
+      peaks: axis === 'yaw'
+        ? [peak(29.3, 1, 11.2), {...peak(44, 1, 3), attentionEligible: false, harmonicMatch: null}]
+        : [peak(29.3, 1, 13.8), peak(60.5, 2, 9.1)]
+    })),
+    ...overrides
+  });
+}
+
+function withAxis(stub, axisName, change) {
+  return {...stub, axes: stub.axes.map(entry => (entry.axis === axisName ? change(entry) : entry))};
+}
+
+test('main-rotor 1/rev and 2/rev above the experimental threshold are reported, not blocked',
+  () => {
+    const gate = evaluateAirframeGate(rotorOrderOnlyStub());
+    assert.equal(gate.status, 'permitted',
+      `rotor-order tones alone must not block; got [${gate.codes.join(', ')}]`);
+    assert.deepEqual([...gate.codes], []);
+    assert.equal(gate.measured.rotorOrderTonesOnly, true);
+    assert.ok(gate.observations.includes('MAIN_ROTOR_ORDER_TONE_ABOVE_EXPERIMENTAL_THRESHOLD'),
+      'the tone is reported as a non-blocking observation');
+    // The basis a finding needs: which axis, which order, how big, at what head speed.
+    const tones = gate.measured.rotorOrderTones;
+    assert.equal(tones.length, 5, JSON.stringify(tones));
+    assert.deepEqual(tones.map(tone => `${tone.axis}:${tone.order}`).sort(),
+      ['pitch:1', 'pitch:2', 'roll:1', 'roll:2', 'yaw:1']);
+    for (const tone of tones) {
+      assert.equal(tone.rotor, 'main');
+      assert.ok(tone.bandRmsDps >= 8, `${tone.axis} ${tone.bandRmsDps}`);
+      assert.equal(tone.headspeedRpm, 1800, 'head speed is the one the tone was matched against');
+    }
+    // The sub-threshold, unmatched yaw tone is not part of the attention set.
+    assert.ok(!tones.some(tone => tone.frequencyHz === 44));
+
+    // And through the interlock: the airframe gate is not the one blocking.
+    const events = symmetricEvents();
+    const verdict = evaluateGainRecommendationGates({
+      axis: 'yaw', metric: 'trackingRmsDps', mechanical: rotorOrderOnlyStub(),
+      capture: captureFor(events), evidence: evidenceFor(events), events,
+      sweep: unanimousSweep()
+    });
+    assert.equal(verdict.mayRecommend, true,
+      `blocked by ${verdict.blockedBy.join(', ')}: ${verdict.sentences.map(s => s.code)}`);
+  });
+
+test('anything other than main-rotor 1/rev or 2/rev still blocks, each on its own', () => {
+  const disqualifiers = [
+    ['an attention peak matching no rotor order', stub => withAxis(stub, 'roll', entry => ({
+      ...entry, peaks: [{...entry.peaks[0], harmonicMatch: null}, entry.peaks[1]]
+    }))],
+    ['an attention peak matched to the TAIL rotor', stub => withAxis(stub, 'pitch', entry => ({
+      ...entry,
+      peaks: [{...entry.peaks[0], harmonicMatch: {...entry.peaks[0].harmonicMatch, rotor: 'tail'}},
+        entry.peaks[1]]
+    }))],
+    ['an attention peak on main-rotor order 3', stub => withAxis(stub, 'roll', entry => ({
+      ...entry,
+      peaks: [entry.peaks[0], {...entry.peaks[1], harmonicMatch: {
+        ...entry.peaks[1].harmonicMatch, order: 3, predictedHz: 90}}]
+    }))],
+    ['rotor correlation not evaluated',
+      stub => ({...stub, harmonicCorrelation: {state: 'unavailable', evaluated: false}})],
+    ['rotor correlation never attempted',
+      stub => ({...stub, harmonicCorrelation: {state: 'not-evaluated', evaluated: false}})],
+    ['one axis measured on the FILTERED gyro', stub => withAxis(stub, 'yaw', entry => ({
+      ...entry, source: 'gyroADC-filtered'
+    }))],
+    ['one axis not available', stub => withAxis(stub, 'pitch', entry => ({
+      ...entry, available: false
+    }))],
+    ['one axis missing altogether',
+      stub => ({...stub, axes: stub.axes.filter(entry => entry.axis !== 'yaw')})],
+    ['any other reason code on the result (a gap in part of the window)', stub => ({
+      ...stub, reasonCodes: [...stub.reasonCodes, 'TIMING_GAPS_EXCESSIVE']
+    })],
+    ['a reason code only the upstream gate carries', stub => ({
+      ...stub, tuningEvidenceGate: {
+        status: 'blocked', reasonCodes: [...stub.tuningEvidenceGate.reasonCodes, 'FILTERED_GYRO_SOURCE_USED']
+      }
+    })],
+    ['one analysed stretch that could not be measured', stub => ({
+      ...stub, chunks: [{status: 'attention'}, {status: 'insufficient'}]
+    })],
+    ['attention status with no attention-eligible peak to explain it', stub => ({
+      ...stub, axes: stub.axes.map(entry => ({...entry, peaks: []}))
+    })],
+    // The peak list is what the rule reads. One that left out an attention-level
+    // peak, or does not say whether it did, cannot support "every one is the rotor".
+    ['an attention-level peak the analyser found but did not list', stub => withAxis(stub,
+      'pitch', entry => ({...entry, attentionEligibleUnlistedCount: 1}))],
+    ['a peak list that does not say whether it is complete', stub => withAxis(stub,
+      'yaw', entry => {
+        const {attentionEligibleUnlistedCount: omitted, ...rest} = entry;
+        return rest;
+      })],
+    ['a tone whose size was not measured', stub => withAxis(stub, 'roll', entry => ({
+      ...entry, peaks: [{...entry.peaks[0], bandRmsDps: null}, entry.peaks[1]]
+    }))],
+    // The ceiling is judged on the size while present; without it a tone present
+    // a third of the flight cannot be told from one present throughout.
+    ['a tone whose size while present was not measured', stub => withAxis(stub, 'roll', entry => ({
+      ...entry, peaks: [{...entry.peaks[0], attentionWindowBandRmsDps: null}, entry.peaks[1]]
+    }))],
+    ['no attention level published to judge the tones against', stub => ({
+      ...stub, attentionThreshold: undefined
+    })]
+  ];
+
+  for (const [name, mutate] of disqualifiers) {
+    const gate = evaluateAirframeGate(mutate(rotorOrderOnlyStub()));
+    assert.equal(gate.status, 'blocked', `${name} must still block`);
+    assert.ok(gate.codes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED'),
+      `${name}: expected the measured-vibration block, got [${gate.codes.join(', ')}]`);
+    assert.equal(gate.measured.rotorOrderTonesOnly, false, name);
+    assert.deepEqual([...gate.observations], [], `${name}: no rotor-order observation`);
+    // Why the rule did not apply is published, so the card can say it.
+    assert.equal(typeof gate.measured.rotorOrderRefusal, 'string',
+      `${name}: the refusal must name its reason`);
+  }
+
+  // Not-attention is not this rule's business at all: an unmeasured result
+  // carrying main-order peaks is still a missing measurement.
+  const unmeasured = evaluateAirframeGate(rotorOrderOnlyStub({status: 'insufficient'}));
+  assert.equal(unmeasured.status, 'blocked');
+  assert.ok(unmeasured.codes.includes('MECHANICAL_EVIDENCE_NOT_MEASURED'));
+  assert.equal(unmeasured.measured.rotorOrderTonesOnly, false);
+});
+
+/* ---------------------------------------------------------------------------
+ * The rule reads a peak LIST, and a list can be cut short. Review of 2 October
+ * 2026: the analyser kept five peaks per axis, ranked by persistence and then
+ * prominence, BEFORE it asked which of them were attention-level. An unmatched
+ * tone above the level that ranked sixth was thrown away and the rule passed
+ * the flight; with enough small whole-flight tones, the 1/rev itself was thrown
+ * away and the flight read "clear".
+ * ------------------------------------------------------------------------- */
+
+/** Deterministic PRNG, so a failing configuration is reproducible from its seed. */
+function rng(seed) {
+  let state = (seed >>> 0) || 1;
+  return () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+}
+
+/**
+ * Gyro tones under a steady 1800 rpm head — the real analyser's input. `tones`
+ * go on roll over quiet pitch and yaw; `axisTones` gives each axis its own set.
+ * A tone may carry `fromS`/`toS` to be present for only part of the window,
+ * which is what sets its persistence and so its rank.
+ */
+function toneFlight({tones = [], axisTones = null, seed, rateHz = 1000, seconds = 20}) {
+  const random = rng(seed);
+  const count = Math.round(rateHz * seconds);
+  const sets = axisTones ?? {roll: tones, pitch: [], yaw: []};
+  const timeUs = new Float64Array(count);
+  const gyro = {roll: new Float64Array(count), pitch: new Float64Array(count),
+    yaw: new Float64Array(count)};
+  const head = new Float64Array(count);
+  for (let index = 0; index < count; index += 1) {
+    const at = index / rateHz;
+    timeUs[index] = Math.round(at * 1e6);
+    for (const axis of ['roll', 'pitch', 'yaw']) {
+      let value = 0;
+      for (const tone of sets[axis]) {
+        if (at >= (tone.fromS ?? 0) && at <= (tone.toS ?? Infinity)) {
+          value += tone.amp * Math.sin(2 * Math.PI * tone.hz * at + (tone.phase ?? 0));
+        }
+      }
+      gyro[axis][index] = value + (random() - 0.5);
+    }
+    head[index] = 1800 + (random() - 0.5) * 4;
+  }
+  return {
+    timeUs,
+    gyro,
+    gyroSources: {roll: 'gyroRAW', pitch: 'gyroRAW', yaw: 'gyroRAW'},
+    headspeedRpm: head,
+    tailspeedRpm: new Float64Array(count).fill(Number.NaN)
+  };
+}
+
+const wholeWindow = series => ({
+  timeRangeUs: {startTimeUs: series.timeUs[0], endTimeUs: series.timeUs[series.timeUs.length - 1]}
+});
+
+// At 1800 rpm the head turns at 30 Hz. These sit on its orders 2 to 8...
+const MAIN_ORDER_HZ = Object.freeze([60, 90, 120, 150, 180, 210, 240]);
+// ...and these sit half-way between two orders, or past the eighth: 15 Hz from
+// anything the head predicts, so the analyser's own match leaves them unmatched.
+const OFF_ORDER_HZ = Object.freeze([45, 75, 105, 135, 165, 195, 225, 255, 285, 315, 345, 375, 405]);
+/** MAX_PEAKS_PER_AXIS in mechanical-spectrum.mjs: the cap this hole lived behind. */
+const LISTED_PEAK_CAP = 5;
+
+test('an unexplained attention-level peak is never cut from the list, at any rank, and the '
+  + 'rotor-order rule never passes over it', async () => {
+  const random = rng(2026);
+  const pick = list => list.splice(Math.floor(random() * list.length), 1)[0];
+  const ranksSeen = new Set();
+  const unlisted = [];
+  let configuration = 0;
+  /**
+   * One axis's peak set: the main 1/rev for the whole flight, `ahead` small
+   * whole-flight tones (rotor orders and not), and one or two small tones present
+   * for under half of it — plus, on the chosen axis, THE tone.
+   */
+  const peakSet = (ahead, oneRevDps, hiddenHz) => {
+    const orders = [...MAIN_ORDER_HZ];
+    const offOrder = OFF_ORDER_HZ.filter(hz => hz !== hiddenHz);
+    const tones = [{hz: 30, amp: oneRevDps}];
+    for (let index = 0; index < ahead; index += 1) {
+      const pool = random() < 0.6 && orders.length > 0 ? orders : offOrder;
+      tones.push({hz: pick(pool), amp: 2.5 + random() * 3.5, phase: random() * 6});
+    }
+    if (hiddenHz !== null) {
+      // Matching no rotor order, above the attention level, present for 62-85%
+      // of the window: sustained enough to be attention-eligible, short enough to
+      // rank behind every whole-flight tone on persistence.
+      tones.push({hz: hiddenHz, amp: 20 + random() * 6, toS: 20 * (0.62 + random() * 0.23)});
+    }
+    const behind = Math.min(1 + Math.floor(random() * 2), 12 - tones.length);
+    for (let index = 0; index < behind; index += 1) {
+      tones.push({hz: pick(offOrder), amp: 2.5 + random() * 3, fromS: 20 * (0.52 + random() * 0.1)});
+    }
+    return tones;
+  };
+  for (let ahead = 0; ahead <= 9; ahead += 1) {
+    for (const oneRevDps of [20, 5]) {
+      for (let repeat = 0; repeat < 2; repeat += 1) {
+        configuration += 1;
+        const hiddenAxis = ['roll', 'pitch', 'yaw'][configuration % 3];
+        const hiddenHz = OFF_ORDER_HZ[Math.floor(random() * OFF_ORDER_HZ.length)];
+        // Every axis gets its own random set; only one carries the tone.
+        const axisTones = {};
+        for (const axis of ['roll', 'pitch', 'yaw']) {
+          axisTones[axis] = axis === hiddenAxis
+            ? peakSet(ahead, oneRevDps, hiddenHz)
+            : peakSet(Math.floor(random() * 10), oneRevDps, null);
+        }
+        const tones = axisTones[hiddenAxis];
+        assert.ok(tones.length >= 3 && tones.length <= 12, `${tones.length} tones`);
+
+        const series = toneFlight({axisTones, seed: 7000 + configuration});
+        const mechanical = await spectrum.analyzeMechanicalWindow(series, wholeWindow(series));
+        const carrier = mechanical.axes.find(axis => axis.axis === hiddenAxis);
+        const listed = JSON.stringify(carrier.peaks.map(peak => [peak.frequencyHz,
+          peak.persistenceRatio, peak.attentionEligible,
+          peak.harmonicMatch ? peak.harmonicMatch.order : null]));
+        const label = `configuration ${configuration}: ${ahead} small tones ahead on `
+          + `${hiddenAxis}, 1/rev at ${oneRevDps} deg/s, unexplained tone at ${hiddenHz} Hz; `
+          + `listed ${listed}`;
+
+        const hidden = carrier.peaks.find(peak => Math.abs(peak.frequencyHz - hiddenHz) <= 3);
+        assert.ok(hidden && hidden.attentionEligible === true && hidden.harmonicMatch === null,
+          `${label}: the unexplained attention-level tone is not in the list`);
+        // Its rank is set by construction: behind the 1/rev and every small
+        // whole-flight tone, on persistence. The listed list can no longer show
+        // that rank — that is the fix — so the construction is checked on what it
+        // does show: every whole-flight tone listed outranks it.
+        const wholeFlight = tones.filter(tone => tone.fromS === undefined && tone.toS === undefined);
+        for (const peak of carrier.peaks) {
+          if (wholeFlight.some(tone => Math.abs(tone.hz - peak.frequencyHz) <= 3)) {
+            assert.ok(peak.persistenceRatio > hidden.persistenceRatio,
+              `${label}: a whole-flight tone does not outrank the hidden one`);
+          }
+        }
+        ranksSeen.add(wholeFlight.length);
+        if (oneRevDps === 20) {
+          for (const axis of mechanical.axes) {
+            assert.ok(axis.peaks.some(peak => peak.attentionEligible === true
+              && peak.harmonicMatch?.rotor === 'main' && peak.harmonicMatch.order === 1),
+            `${label}: the attention-level 1/rev is not in the ${axis.axis} list`);
+          }
+        }
+        assert.equal(mechanical.status, 'attention',
+          `${label}: an attention-level tone was measured and the flight reads ${mechanical.status}`);
+
+        const gate = evaluateAirframeGate(mechanical);
+        assert.equal(gate.measured.rotorOrderTonesOnly, false,
+          `${label}: the rotor-order rule passed a flight carrying unexplained vibration`);
+        assert.equal(gate.status, 'blocked', label);
+        assert.ok(gate.codes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED'), `${label}: ${gate.codes}`);
+
+        // The list says of itself that it holds every attention-level peak.
+        for (const axis of mechanical.axes) {
+          if (axis.attentionEligibleUnlistedCount !== 0) {
+            unlisted.push(`${label}: ${axis.axis} ${axis.attentionEligibleUnlistedCount}`);
+          }
+        }
+      }
+    }
+  }
+  assert.deepEqual(unlisted, [], 'every axis must publish a measured zero');
+  // The sweep must actually have reached the ranks the cap used to cut, and
+  // every rank from the second to the eleventh, or it proves nothing about them.
+  const ranks = [...ranksSeen].sort((left, right) => left - right);
+  for (let rank = 1; rank <= 10; rank += 1) {
+    assert.ok(ranksSeen.has(rank), `no configuration put the tone at rank ${rank}: ${ranks}`);
+  }
+  assert.ok(ranks.at(-1) >= LISTED_PEAK_CAP, `${ranks}`);
+});
+
+test('a peak list that held more attention-level peaks than it shows is never read as complete',
+  () => {
+    // The analyser merges two attention-level peaks closer together than it can
+    // resolve into one entry. It publishes how many it merged; the rule reads that
+    // count and refuses on anything but a measured zero.
+    for (const [name, count] of [['one merged', 1], ['three merged', 3], ['not published', undefined],
+      ['not a number', Number.NaN]]) {
+      const gate = evaluateAirframeGate(withAxis(rotorOrderOnlyStub(), 'roll',
+        entry => ({...entry, attentionEligibleUnlistedCount: count})));
+      assert.equal(gate.status, 'blocked', name);
+      assert.equal(gate.measured.rotorOrderTonesOnly, false, name);
+      assert.equal(gate.measured.rotorOrderRefusal, 'ATTENTION_PEAK_LIST_INCOMPLETE', name);
+    }
+    assert.equal(evaluateAirframeGate(rotorOrderOnlyStub()).status, 'permitted',
+      'the control: a list that says it is complete');
+  });
+
+/* ---------------------------------------------------------------------------
+ * The severity ceiling. Decided 2 October 2026 as a safety refinement of the
+ * owner's rotor-order rule: a once- or twice-per-rev is reported rather than
+ * blocking only while it is at most three times the experimental level. Past
+ * that it is the size a badly out-of-track or out-of-balance head produces, and
+ * it blocks again — as its own measurement, not as "unexplained".
+ * ------------------------------------------------------------------------- */
+
+test('a main-rotor tone past three times the attention level blocks again, on its own code',
+  async () => {
+    assert.equal(GAIN_GATE_THRESHOLDS.rotorOrderToneCeilingMultiple, 3,
+      'the ceiling is a safety backstop decided as a number, and is pinned as one');
+    const outcomes = {reported: 0, large: 0};
+    for (const [order, frequencyHz] of [[1, 30], [2, 60]]) {
+      for (let amplitude = 14; amplitude <= 74; amplitude += 4) {
+        const series = toneFlight({tones: [{hz: frequencyHz, amp: amplitude}],
+          seed: 400 + amplitude * 3 + order});
+        const mechanical = await spectrum.analyzeMechanicalWindow(series, wholeWindow(series));
+        const label = `order ${order} at ${amplitude} deg/s`;
+        const attention = mechanical.axes.flatMap(axis =>
+          axis.peaks.filter(peak => peak.attentionEligible === true));
+        // The fixture must be the rule's own case: every attention peak a
+        // main-rotor tone of this order, and the list complete.
+        assert.ok(attention.length > 0 && attention.every(peak =>
+          peak.harmonicMatch?.rotor === 'main' && peak.harmonicMatch.order === order),
+        `${label}: ${JSON.stringify(attention.map(peak => [peak.frequencyHz, peak.harmonicMatch]))}`);
+        // Judged on the tone's size WHILE PRESENT, which for a tone above the
+        // level in every window is its flight average to the rounding.
+        for (const peak of attention) {
+          assert.ok(Math.abs(peak.attentionWindowBandRmsDps - peak.bandRmsDps) <= 0.002,
+            `${label}: a steady tone's size while present is its average: ${JSON.stringify(peak)}`);
+        }
+        const worst = Math.max(...attention.map(peak => peak.attentionWindowBandRmsDps));
+        const ceilingDps = 3 * mechanical.attentionThreshold.bandRmsDps;
+
+        const gate = evaluateAirframeGate(mechanical);
+        if (worst <= ceilingDps) {
+          outcomes.reported += 1;
+          assert.equal(gate.status, 'permitted', `${label} (${worst} deg/s): ${gate.codes}`);
+          assert.equal(gate.measured.rotorOrderTonesOnly, true, label);
+          assert.deepEqual([...gate.measured.rotorOrderTonesLarge], [], label);
+        } else {
+          outcomes.large += 1;
+          assert.equal(gate.status, 'blocked', `${label} (${worst} deg/s) passed the airframe`);
+          assert.deepEqual([...gate.codes], ['MAIN_ROTOR_ORDER_TONE_LARGE'], label);
+          assert.equal(gate.measured.rotorOrderTonesOnly, false, label);
+          assert.deepEqual([...gate.measured.rotorOrderTones], [], label);
+          assert.ok(gate.measured.rotorOrderTonesLarge.some(tone =>
+            tone.aboveLevelBandRmsDps === worst),
+          `${label}: the tone that crossed the ceiling must be published`);
+          assert.equal(gate.measured.rotorOrderToneCeilingDps, ceilingDps, label);
+          assert.deepEqual([...gate.observations], [], label);
+        }
+      }
+    }
+    assert.ok(outcomes.reported >= 4 && outcomes.large >= 4,
+      `the sweep must straddle the ceiling: ${JSON.stringify(outcomes)}`);
+
+    // The boundary itself, to the hundredth: at the ceiling is reported, past it
+    // is not. A steady tone: its size while present is its average.
+    const sized = (whilePresent, average = whilePresent) => withAxis(rotorOrderOnlyStub(), 'roll',
+      entry => ({...entry, peaks: [{...entry.peaks[0], bandRmsDps: average,
+        attentionWindowBandRmsDps: whilePresent}, entry.peaks[1]]}));
+    assert.equal(evaluateAirframeGate(sized(24)).status, 'permitted');
+    assert.deepEqual([...evaluateAirframeGate(sized(24.01)).codes], ['MAIN_ROTOR_ORDER_TONE_LARGE']);
+    // An intermittent tone is judged on its size while present, never on the
+    // flight average its quiet stretches pull down (round-2 review: a 1/rev at
+    // 3.5-5.3 times the level, present for a third of the flight, averaged
+    // under the ceiling and was waved through).
+    assert.equal(evaluateAirframeGate(sized(24, 13.2)).status, 'permitted');
+    assert.deepEqual([...evaluateAirframeGate(sized(24.01, 13.2)).codes],
+      ['MAIN_ROTOR_ORDER_TONE_LARGE']);
+    assert.deepEqual([...evaluateAirframeGate(sized(42.4, 22.3)).codes],
+      ['MAIN_ROTOR_ORDER_TONE_LARGE']);
+    // And it scales with the published level, not with a copy of the number 8.
+    assert.deepEqual([...evaluateAirframeGate({...sized(24.01),
+      attentionThreshold: {bandRmsDps: 10, basis: 'experimental-synthetic-calibration'}}).codes], []);
+  });
+
+test('a main-rotor tone past the ceiling is named as large whatever else stops the rotor-order '
+  + 'rule', () => {
+    // Round-2 review: the ceiling was checked only after every completeness
+    // refusal had passed, so a 40 deg/s once-per-rev on a window with one stretch
+    // unmeasured was reported exactly like a 13.6 deg/s one — as vibration whose
+    // origin "could not be established". It still blocks; now it is also named.
+    const large = stub => withAxis(stub, 'roll', entry => ({...entry, peaks: [
+      {...entry.peaks[0], bandRmsDps: 40.8, attentionWindowBandRmsDps: 40.8}, entry.peaks[1]]}));
+    const others = [
+      ['one analysed stretch that could not be measured', 'STRETCH_NOT_MEASURED', stub => ({
+        ...stub, chunks: [{status: 'attention', harmonicCorrelationState: 'evaluated'},
+          {status: 'insufficient', harmonicCorrelationState: 'not-evaluated'}],
+        harmonicCorrelation: {state: 'not-evaluated', evaluated: false}})],
+      // A window in stretches whose other stretch's head speed moved: the tone's
+      // own stretch was compared and matched, the window as a whole was not.
+      ['the rotor not compared across all of the window', 'ROTOR_NOT_COMPARED', stub => ({
+        ...stub, harmonicCorrelation: {state: 'unavailable', evaluated: false}})],
+      ['another reason code on the result', 'REASON_CODE_OUTSIDE_ALLOW_LIST', stub => ({
+        ...stub, reasonCodes: [...stub.reasonCodes, 'TIMING_GAPS_EXCESSIVE']})],
+      ['another axis measured on the filtered gyro', 'AXIS_NOT_MEASURED_ON_UNFILTERED_GYRO',
+        stub => withAxis(stub, 'yaw', entry => ({...entry, source: 'gyroADC-filtered'}))],
+      ['a peak list that is not complete', 'ATTENTION_PEAK_LIST_INCOMPLETE',
+        stub => withAxis(stub, 'pitch', entry => ({...entry, attentionEligibleUnlistedCount: 1}))],
+      ['an attention peak matching no rotor order', 'ATTENTION_PEAK_NOT_MAIN_ORDER_1_OR_2',
+        stub => withAxis(stub, 'pitch', entry => ({...entry, peaks: [
+          {...entry.peaks[0], harmonicMatch: null}, entry.peaks[1]]}))]
+    ];
+    for (const [name, refusal, other] of others) {
+      const gate = evaluateAirframeGate(other(large(rotorOrderOnlyStub())));
+      assert.equal(gate.status, 'blocked', name);
+      assert.ok(gate.codes.includes('MAIN_ROTOR_ORDER_TONE_LARGE'),
+        `${name}: a 40.8 deg/s once-per-rev must be named as large: [${gate.codes}]`);
+      assert.equal(gate.codes[0], 'MAIN_ROTOR_ORDER_TONE_LARGE', `${name}: it leads: [${gate.codes}]`);
+      // The other condition still blocks on its own account, and is still named.
+      assert.ok(gate.codes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED'), `${name}: [${gate.codes}]`);
+      assert.equal(gate.measured.rotorOrderRefusal, refusal, name);
+      assert.equal(gate.measured.rotorOrderTonesOnly, false, name);
+      assert.ok(gate.measured.rotorOrderTonesLarge.some(tone => tone.axis === 'roll'
+        && tone.order === 1 && tone.aboveLevelBandRmsDps === 40.8),
+      `${name}: ${JSON.stringify(gate.measured.rotorOrderTonesLarge)}`);
+      assert.deepEqual([...gate.observations], [], name);
+      // The control: the same refusal without the large tone names no size.
+      const small = evaluateAirframeGate(other(rotorOrderOnlyStub()));
+      assert.ok(!small.codes.includes('MAIN_ROTOR_ORDER_TONE_LARGE'), `${name}: [${small.codes}]`);
+      assert.equal(small.measured.rotorOrderRefusal, refusal, `${name} (control)`);
+    }
+    // A tone the rule cannot call the rotor's is not called large: on a filtered
+    // axis, or matched to nothing.
+    for (const [name, mutate] of [
+      ['the large tone on a filtered axis', stub => withAxis(stub, 'roll', entry => ({
+        ...entry, source: 'gyroADC-filtered'}))],
+      ['the large tone matched to no rotor order', stub => withAxis(stub, 'roll', entry => ({
+        ...entry, peaks: [{...entry.peaks[0], harmonicMatch: null}, entry.peaks[1]]}))]
+    ]) {
+      const gate = evaluateAirframeGate(mutate(large(rotorOrderOnlyStub())));
+      assert.equal(gate.status, 'blocked', name);
+      assert.ok(!gate.codes.includes('MAIN_ROTOR_ORDER_TONE_LARGE'), `${name}: [${gate.codes}]`);
+    }
+  });
+
+test('the same tone measured in two stretches is one tone, at its worst', () => {
+  const peak = (bandRmsDps, chunkRangeUs) => ({
+    frequencyHz: 29.3, bandRmsDps, attentionWindowBandRmsDps: bandRmsDps,
+    attentionPersistenceRatio: 1, bandwidthHz: 2, persistenceRatio: 1, attentionEligible: true,
+    harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.7, toleranceHz: 2.9},
+    chunkRangeUs
+  });
+  const first = [0, 150_000_000];
+  const second = [150_000_000, 300_000_000];
+  const stub = rotorOrderOnlyStub({
+    range: {startTimeUs: 0, endTimeUs: 300_000_000},
+    chunks: [{status: 'attention', startTimeUs: 0, endTimeUs: 150_000_000},
+      {status: 'attention', startTimeUs: 150_000_000, endTimeUs: 300_000_000}],
+    axes: ['roll', 'pitch', 'yaw'].map(axis => ({
+      axis, source: 'gyroRAW', available: true, attentionEligibleUnlistedCount: 0,
+      peaks: axis === 'roll' ? [peak(13.5, first), peak(14.2, second)] : []
+    }))
+  });
+  const gate = evaluateAirframeGate(stub);
+  assert.equal(gate.status, 'permitted', `${gate.codes}`);
+  const tones = gate.measured.rotorOrderTones;
+  assert.equal(tones.length, 1, `one roll once-per-rev, not one per stretch: ${JSON.stringify(tones)}`);
+  assert.equal(tones[0].bandRmsDps, 14.2, 'the worst stretch speaks for it');
+  assert.deepEqual([...tones[0].chunkRangeUs], second, 'and names the stretch it was worst in');
+  assert.deepEqual(tones[0].chunkRangesUs.map(range => [...range]), [first, second],
+    'and every stretch it was measured in');
+});
+
+test('the measured-vibration sentence claims no rotor comparison that did not happen', () => {
+  // Raised whenever vibration was measured and the rotor-order rule did not
+  // apply — including when the rotor was never compared, and when every tone IS
+  // the main rotor and the rule refused on other grounds.
+  for (const [name, stub] of [
+    ['rotor not compared', rotorOrderOnlyStub({harmonicCorrelation: {state: 'unavailable'}})],
+    ['every tone the rotor, one stretch unmeasured', rotorOrderOnlyStub({
+      chunks: [{status: 'attention'}, {status: 'insufficient'}]})]
+  ]) {
+    const gate = evaluateAirframeGate(stub);
+    assert.ok(gate.codes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED'), `${name}: ${gate.codes}`);
+    const sentence = describeGateBlock(gate)
+      .find(entry => entry.code === 'MECHANICAL_EVIDENCE_GATE_BLOCKED').sentence;
+    assert.doesNotMatch(sentence, /not explained by|do(?:es)? not explain|once- or twice-per-rev/i,
+      `${name}: ${sentence}`);
+  }
+});
+
+test('a window compared against the rotor over part of its length says part, never "never"',
+  () => {
+    const partly = evaluateAirframeGate(mechanicalStub({
+      harmonicCorrelation: {state: 'not-evaluated', evaluated: false},
+      chunks: [
+        {status: 'clear', harmonicCorrelationState: 'evaluated'},
+        {status: 'insufficient', harmonicCorrelationState: 'not-evaluated'}
+      ]
+    }));
+    assert.equal(partly.status, 'blocked', 'part of a window is not the window');
+    assert.deepEqual([...partly.codes], ['ROTOR_CORRELATION_PARTIAL']);
+    // Counted as what they were: one stretch compared, of the one that was
+    // measured, of two. An unmeasured stretch is not a stretch "it was measured in".
+    assert.equal(partly.measured.rotorComparedStretchCount, 1);
+    assert.equal(partly.measured.measuredStretchCount, 1);
+    assert.equal(partly.measured.stretchCount, 2);
+    const sentence = describeGateBlock(partly)[0].sentence;
+    assert.match(sentence, /\bpart of\b/, sentence);
+    assert.doesNotMatch(sentence, /\bnever\b/, sentence);
+    // The control: no stretch compared is still "never".
+    const none = evaluateAirframeGate(mechanicalStub({
+      harmonicCorrelation: {state: 'not-evaluated', evaluated: false},
+      chunks: [
+        {status: 'insufficient', harmonicCorrelationState: 'not-evaluated'},
+        {status: 'insufficient', harmonicCorrelationState: 'not-evaluated'}
+      ]
+    }));
+    assert.deepEqual([...none.codes], ['ROTOR_CORRELATION_NOT_ATTEMPTED']);
+  });
 
 test('partial sample-level headspeed cannot pass behind a complete event mean', () => {
   const events = [
