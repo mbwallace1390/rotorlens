@@ -12,17 +12,16 @@ updates:
     directory: /android
     schedule:
       interval: monthly
-    # A major Android Gradle Plugin or Gradle wrapper release is a migration, not
-    # a bump: it needs regenerated dependency-verification metadata, the
-    # provenance hash pins, notices and legal output, a gradlew.bat renormalize
-    # and a real-handset check, none of which Dependabot can do. Grouped with
-    # everything else, it made the whole android-runtime PR unmergeable; #7 was
-    # Dependabot's fourth attempt at it, after #1 and #3. Take those majors by
-    # hand; minor and patch updates keep flowing below.
+    # A major release of anything in the Android build is a migration, not a
+    # bump: it needs regenerated dependency-verification metadata, the
+    # provenance hash pins, notices and legal output, and a real-handset check,
+    # none of which Dependabot can do. Ignoring only the Android Gradle Plugin
+    # and Gradle wrapper majors (#22) just moved the rest into their own
+    # unmergeable PRs: kotlin-stdlib 1.8 -> 2.4 (#23, #25) and foojay 0.10 -> 1.0
+    # (#24). Take every Gradle major by hand; minor and patch updates keep
+    # flowing below, and still need the verification metadata regenerated.
     ignore:
-      - dependency-name: "com.android.application"
-        update-types: ["version-update:semver-major"]
-      - dependency-name: "gradle-wrapper"
+      - dependency-name: "*"
         update-types: ["version-update:semver-major"]
     groups:
       android-runtime:
