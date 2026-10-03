@@ -32,7 +32,17 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 const read = relative => readFile(path.join(projectRoot, relative), 'utf8');
 const javaSource = name => read(`android/app/src/main/java/app/rotorlens/${name}`);
 
-const withoutXmlComments = xml => xml.replace(/<!--[\s\S]*?-->/g, '');
+// Repeated until nothing changes: one pass over `<!<!---->--` leaves a `<!--`.
+const withoutXmlComments = xml => {
+  let previous;
+  let current = xml;
+  do {
+    previous = current;
+    current = current.replace(/<!--[\s\S]*?-->/g, '');
+  } while (current !== previous);
+  // An unterminated comment runs to the end of the document.
+  return current.replace(/<!--[\s\S]*$/, '');
+};
 
 /**
  * Java with its comments removed and its string literals intact.
@@ -447,7 +457,8 @@ function callArguments(code, callee) {
   const calls = [];
   // A qualified or spaced call (`this.notifyFailure (`) is still a call; only
   // a longer identifier ending in the same name (`retryNotifyFailure(`) is not.
-  const opener = new RegExp(`(?<![\\w$])${callee.replace(/\./g, '\\.')}\\s*\\(`, 'g');
+  const escaped = callee.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const opener = new RegExp(`(?<![\\w$])${escaped}\\s*\\(`, 'g');
   for (const match of code.matchAll(opener)) {
     let depth = 1;
     let index = match.index + match[0].length;

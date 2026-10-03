@@ -217,7 +217,7 @@ function connect(endpoint) {
         return;
       }
       const handler = pending.get(message.id);
-      if (handler) {
+      if (typeof handler === 'function') {
         pending.delete(message.id);
         handler(message);
       }
@@ -476,7 +476,15 @@ test('the policy blocks nothing the viewer does, and blocks the network and inli
     assert.equal(probes.eval, 'EvalError', 'eval was not refused');
 
     const directives = probes.violations.map(entry => entry.directive);
-    const remote = probes.violations.filter(entry => entry.blocked.includes('csp-probe.example.com'));
+    // Compare the parsed host, not a substring: 'inline' and 'eval' are not URLs.
+    const blockedHost = blocked => {
+      try {
+        return new URL(blocked).hostname;
+      } catch {
+        return null;
+      }
+    };
+    const remote = probes.violations.filter(entry => blockedHost(entry.blocked) === 'csp-probe.example.com');
     assert.ok(remote.some(entry => entry.directive === 'connect-src'
         && entry.blocked.startsWith('https:')),
       `the remote fetch raised no connect-src violation: ${JSON.stringify(probes.violations)}`);
