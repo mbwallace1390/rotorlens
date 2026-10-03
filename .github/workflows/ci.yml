@@ -139,10 +139,14 @@ jobs:
       # High/critical advisories fail the build. Current upstream Firebase
       # graphs also carry documented moderate transitive advisories; do not use
       # `--force` to downgrade the pinned top-level SDKs around them.
-      - name: Audit the isolated dependency graphs
-        run: |
-          npm audit --audit-level=high --prefix backend/firebase
-          npm audit --omit=dev --audit-level=high --prefix backend/firebase/functions
+      - name: Audit emulator dependencies
+        run: npm audit --audit-level=high --prefix backend/firebase
+
+      # Report the separate Functions graph even when the emulator audit fails;
+      # either failing audit still fails this job.
+      - name: Audit Functions dependencies
+        if: ${{ !cancelled() }}
+        run: npm audit --omit=dev --audit-level=high --prefix backend/firebase/functions
 
       - name: Run the local-only Firestore and Functions proof
         run: npm test --prefix backend/firebase

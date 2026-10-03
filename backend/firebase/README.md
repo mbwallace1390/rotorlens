@@ -55,3 +55,28 @@ reviewed data terms, complete the configuration contract, choose a dedicated
 Firebase project, add IAM and retention controls, test real Play Integrity and
 App Attest flows, keep release-signing and debug credentials private, publish
 correct privacy/store declarations, and obtain an explicit deployment review.
+
+## Dependency audit status
+
+CI audits the emulator tooling and the separate Functions graph independently;
+high or critical advisories fail the job. Run the same checks locally:
+
+```text
+npm audit --audit-level=high --prefix backend/firebase
+npm audit --omit=dev --audit-level=high --prefix backend/firebase/functions
+```
+
+The October 2, 2026 compatible dependency refresh leaves the Functions graph
+with no reported advisories. The emulator graph still fails the high-severity
+gate: Firebase's Firestore SDK pins `@grpc/grpc-js` to `~1.9.0`, while Firebase
+CLI's proxy and watcher dependencies retain `basic-ftp` 5.3.1 and `braces`
+3.0.3. The relevant upstream advisories are
+[gRPC certificate validation](https://github.com/advisories/GHSA-m9gg-hp2v-232j),
+[FTP directory parsing](https://github.com/advisories/GHSA-c475-qrg2-pj4r), and
+[brace-parser recursion](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm).
+The brace-parser advisory has no published patched version at this review.
+
+Keep the audit gate enabled. Updating isolated tooling does not add these
+dependencies to the mobile app. Replacing incompatible transitive APIs or
+lowering the audit threshold is not part of this refresh; further upstream
+updates require a new dependency review and emulator proof.
