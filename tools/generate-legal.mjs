@@ -3,7 +3,7 @@
  *
  * Apache-2.0 section 4 obliges a distributor to hand every recipient the license
  * text and the attribution notices for what is *distributed*. RotorLens declares
- * one dependency and ships twenty-eight artifacts, so the only defensible source
+ * one dependency and ships twenty-seven artifacts, so the only defensible source
  * for Android's section of that screen is the resolved classpath — the same file
  * the provenance test checks the notices against. iOS and web have separate,
  * currently empty component lists and must not inherit Android's Maven notices.

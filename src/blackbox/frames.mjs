@@ -15,10 +15,46 @@
  */
 
 import {ByteReader} from './reader.mjs';
-import {DecodeError, DecodeErrorCode, corruptFrame} from './errors.mjs';
-import {Encoding, decodeGroup, groupSize} from './encodings.mjs';
+import {DecodeError, DecodeErrorCode, corruptFrame, truncated} from './errors.mjs';
+import {Encoding, decodeGroup, groupCapacity, groupSize} from './encodings.mjs';
 import {FrameType} from './headers.mjs';
 import {Predictor, predict} from './predictors.mjs';
+
+/**
+ * Field values a session may decode per byte of its frame stream, plus a floor
+ * so a tiny session is never refused.
+ *
+ * NULL (encoding 9) is valid and consumes no bytes, and a header may declare
+ * 1024 fields, so without this a crafted header turns every body byte into a
+ * 1024-cell frame: a 215 KB file decoded to ~200,000 samples and +1.66 GB of
+ * heap, on the main thread of a phone. The frame-count limit never saw it,
+ * because the count was not the problem — the width was.
+ *
+ * Measured headroom: 110 real Rotorflight sessions decode to 1.40-1.73 cells
+ * per body byte, and the densest frame any real field table can produce (every
+ * residual zero) is under 2. No non-NULL encoding packs more than 8 fields into
+ * a byte (TAG8_8SVB with an empty selector), so 16 is twice the format's own
+ * densest encoding and ~9x the densest real session. Every decoded field table
+ * frame counts, retained or not: S, G and H frames are thrown away after
+ * decoding, so a cap on retained samples alone would leave the CPU unbounded.
+ */
+const CELLS_PER_BODY_BYTE = 16;
+const CELL_BUDGET_FLOOR = 65_536;
+
+/**
+ * What unwritten flash reads back as.
+ *
+ * A capture cut by power-off or a full chip ends part-way through a frame, and
+ * on flash whatever follows was never written. The real 4.6 reference log ends
+ * with 13 bytes of a P frame and then 512 bytes of 0xFF. A 0xFF run can never
+ * terminate a variable-byte field, so the cut frame fails as "exceeded 32
+ * bits" instead of running out of input — and was reported as damage in the
+ * body of the log rather than as the capture stopping.
+ *
+ * Zero fill is deliberately NOT treated the same way: no log we hold ends in
+ * it, and zeros are ordinary values in every encoding.
+ */
+const ERASED_FLASH_BYTE = 0xff;
 
 const FRAME_MARKERS = new Set(
   [FrameType.INTRA, FrameType.INTER, FrameType.SLOW, FrameType.GPS, FrameType.GPS_HOME,
@@ -103,6 +139,8 @@ export class FrameDecoder {
   #homeBase = new Map();
   #gpsIndexes = null;
   #constants;
+  /** Start of the erased run that ends this session; found on first need. */
+  #erasedTailStart = null;
 
   constructor(session, bytes, limits = {}) {
     this.#session = session;
@@ -175,8 +213,13 @@ export class FrameDecoder {
       const encoding = fields[index].encoding;
 
       // Group encodings cover a run of consecutive fields sharing that encoding.
+      // Measure the run only as far as one group can reach: `groupSize` clamps
+      // to that capacity anyway, and walking the whole run for every field made
+      // a frame of 1024 NULL fields cost ~524,000 comparisons.
+      const capacity = groupCapacity(encoding);
       let run = 1;
-      while (index + run < fields.length && fields[index + run].encoding === encoding) {
+      while (run < capacity && index + run < fields.length &&
+          fields[index + run].encoding === encoding) {
         run += 1;
       }
 
@@ -340,6 +383,39 @@ export class FrameDecoder {
     return published ? fix : null;
   }
 
+  /**
+   * Whether the frame that just failed was cut off by unwritten flash.
+   *
+   * True only when the session ends in an unbroken run of erased bytes, the
+   * failed frame began at or before that run, and its reads went into it. Then
+   * nothing decodable follows — a resync would scan the run to the end and
+   * find no marker — so the failure is the capture stopping, not damage.
+   *
+   * It is deliberately false when a COMMITTED frame already consumed part of
+   * the run (the run starts before this frame does). Those bytes were decoded
+   * as values, and an erased byte is indistinguishable from a data byte that
+   * happens to be 0xFF, so calling that a clean cut would vouch for a sample
+   * the decoder cannot vouch for. That leaves one honest false alarm: a cut
+   * exactly on a frame boundary after a frame whose last byte is 0xFF still
+   * reads as damage, as it always has.
+   */
+  #cutByErasedTail(frameStart, sessionEnd) {
+    if (this.#erasedTailStart === null) {
+      // Measured once per decode, and only after a frame has failed. Linear in
+      // the length of the run, however long the unwritten remainder is.
+      let start = sessionEnd;
+      while (start > this.#session.dataOffset &&
+          this.#reader.at(start - 1) === ERASED_FLASH_BYTE) {
+        start -= 1;
+      }
+      this.#erasedTailStart = start;
+    }
+    // `offset > start` also implies the run is non-empty, since the reader
+    // never moves past `sessionEnd`.
+    const start = this.#erasedTailStart;
+    return start >= frameStart && this.#reader.offset > start;
+  }
+
   /** Scans forward to the next byte that could plausibly start a frame. */
   #resync(fromOffset) {
     let offset = fromOffset + 1;
@@ -392,6 +468,21 @@ export class FrameDecoder {
       ).toJSON());
     };
 
+    // Field values this session may decode, in proportion to the bytes that
+    // carry them — see CELLS_PER_BODY_BYTE. Charged before a frame is decoded,
+    // so the frame that would cross the line allocates nothing.
+    const cellBudget = CELLS_PER_BODY_BYTE * Math.max(0, sessionEnd - session.dataOffset) +
+      CELL_BUDGET_FLOOR;
+    let cellsDecoded = 0;
+    const overCellBudget = (table, frameStart) => {
+      cellsDecoded += table.fields.length;
+      if (cellsDecoded <= cellBudget) {
+        return false;
+      }
+      recordLimit('cell', cellBudget, frameStart);
+      return true;
+    };
+
     frameLoop: while (this.#reader.offset < sessionEnd) {
       if (recordsProcessed >= this.#limits.maxRecords) {
         recordLimit('record', this.#limits.maxRecords);
@@ -418,6 +509,9 @@ export class FrameDecoder {
             if (!mainIntra) {
               throw corruptFrame('Log declares no I frame fields', {offset: frameStart});
             }
+            if (overCellBudget(mainIntra, frameStart)) {
+              break frameLoop;
+            }
             const values = this.#decodeFields(mainIntra, false);
             // An I frame is absolute, so it is also the resync anchor: accept it
             // and restart prediction history from it.
@@ -437,6 +531,9 @@ export class FrameDecoder {
             }
             if (!mainInter || !this.#previous) {
               throw corruptFrame('P frame before any I frame', {offset: frameStart});
+            }
+            if (overCellBudget(mainInter, frameStart)) {
+              break frameLoop;
             }
             const values = this.#decodeFields(mainInter, true);
             if (!this.#isPlausibleMainFrame(values)) {
@@ -458,6 +555,9 @@ export class FrameDecoder {
             if (!table) {
               throw corruptFrame('Log declares no S frame fields', {offset: frameStart});
             }
+            if (overCellBudget(table, frameStart)) {
+              break frameLoop;
+            }
             this.#slow = this.#decodeFields(table, false);
             counts.S += 1;
             break;
@@ -471,6 +571,9 @@ export class FrameDecoder {
             const table = session.frames[FrameType.GPS_HOME];
             if (!table) {
               throw corruptFrame('Log declares no H frame fields', {offset: frameStart});
+            }
+            if (overCellBudget(table, frameStart)) {
+              break frameLoop;
             }
             const values = this.#decodeFields(table, false);
             this.#home = [values[0] ?? 0, values[1] ?? 0];
@@ -486,6 +589,9 @@ export class FrameDecoder {
             const table = session.frames[FrameType.GPS];
             if (!table) {
               throw corruptFrame('Log declares no G frame fields', {offset: frameStart});
+            }
+            if (overCellBudget(table, frameStart)) {
+              break frameLoop;
             }
             const values = this.#decodeFields(table, false);
             const fix = this.#publishGpsFix(table, values, samples.length);
@@ -532,9 +638,24 @@ export class FrameDecoder {
               {offset: frameStart}
             );
         }
-      } catch (error) {
-        if (!(error instanceof DecodeError)) {
-          throw error;
+      } catch (caught) {
+        if (!(caught instanceof DecodeError)) {
+          throw caught;
+        }
+
+        let error = caught;
+        if (error.code !== DecodeErrorCode.TRUNCATED &&
+            this.#cutByErasedTail(frameStart, sessionEnd)) {
+          // The capture stopped inside this frame and the rest of the session
+          // was never written. That is the end of the log, not damage in it,
+          // and the erased bytes are not frames to resync through: report it
+          // exactly as running out of input would be, and consume the run.
+          const erasedBytes = sessionEnd - this.#erasedTailStart;
+          error = truncated(
+            `Log ended mid-frame; the remaining ${erasedBytes} bytes are erased flash`,
+            {erasedBytes}
+          );
+          this.#reader.offset = sessionEnd;
         }
 
         if (errors.length < this.#limits.maxErrors) {

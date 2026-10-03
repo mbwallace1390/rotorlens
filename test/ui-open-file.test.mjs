@@ -97,6 +97,57 @@ async function waitForDevTools(port, attempts = 80) {
   throw new Error('Chromium DevTools endpoint never became ready');
 }
 
+/**
+ * Returns once the shell has loaded AND `ui/app.mjs` has finished running.
+ *
+ * Copied from test/ui-browser.test.mjs (test files do not import each other).
+ * It replaces a fixed 900 ms sleep after `Page.navigate`: until app.mjs has
+ * evaluated there is no listener on the file input or the host-file event, so
+ * on a loaded runner a test could hand the page a log that was silently
+ * dropped. Importing the page's own module URL resolves only once that module
+ * has run (the page and this import share one module instance) and rejects
+ * with its error if it threw. The deadline only names a page that never loads.
+ */
+async function waitForShell(client, sessionId, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastSeen = 'nothing evaluated yet';
+  while (Date.now() < deadline) {
+    let probe;
+    try {
+      probe = await client.send('Runtime.evaluate', {
+        expression: `(async () => {
+          if (location.pathname !== '/ui/' || document.readyState !== 'complete') {
+            return location.href + ' (' + document.readyState + ')';
+          }
+          const app = await import('/ui/app.mjs');
+          return typeof app.openFile === 'function' && document.getElementById('file')
+            ? 'ready'
+            : 'loaded without a wired file input';
+        })()`,
+        awaitPromise: true,
+        returnByValue: true
+      }, sessionId);
+    } catch (error) {
+      // Evaluated mid-navigation: the old document's context went away under
+      // it. The next probe lands in the new one.
+      lastSeen = error.message;
+      await new Promise(resolve => setTimeout(resolve, 50));
+      continue;
+    }
+    if (probe.exceptionDetails) {
+      // The module itself failed. No amount of waiting fixes that.
+      throw new Error('the shell loaded but ui/app.mjs failed: '
+        + (probe.exceptionDetails.exception?.description ?? probe.exceptionDetails.text));
+    }
+    if (probe.result.value === 'ready') {
+      return;
+    }
+    lastSeen = probe.result.value;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`the shell never became ready to take a file; last seen: ${lastSeen}`);
+}
+
 /** Minimal CDP client: send a command, await the matching id. */
 function connect(endpoint) {
   return new Promise((resolve, reject) => {
@@ -246,7 +297,7 @@ async function withViewer({block = [], startupScript = null, faultableDecoder = 
     }
 
     await client.send('Page.navigate', {url: `http://127.0.0.1:${port}/ui/`}, sessionId);
-    await new Promise(resolve => setTimeout(resolve, 900));
+    await waitForShell(client, sessionId);
 
     const evaluate = async expression => {
       const outcome = await client.send('Runtime.evaluate', {

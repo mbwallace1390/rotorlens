@@ -50,11 +50,13 @@ dependencies {
     // kotlin-stdlib-jdk7/jdk8 1.6.21, while everything else pulls kotlin-stdlib
     // up to 1.8.22. Kotlin 1.8 moved the jdk7/jdk8 classes into stdlib itself, so
     // the old 1.6.21 jars and the new stdlib both define kotlin.io.path.PathsKt
-    // and D8 fails on the duplicates. Pinning the shims to the same version as
-    // stdlib empties them; it does not add anything to the APK.
+    // and D8 fails on the duplicates. Pinning the shims to a 1.8+ version empties
+    // them. Each shim depends on kotlin-stdlib at its own version, so this pin
+    // also sets the shipped stdlib: 1.9.25 here, which is what
+    // shipping-dependencies.json and the notices record.
     constraints {
-        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22")
-        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22")
+        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.25")
+        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.25")
     }
 
     testImplementation("junit:junit:4.13.2")

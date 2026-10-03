@@ -36,11 +36,23 @@ const GROUP_CAPACITY = new Map([
 ]);
 
 /**
+ * The most fields one read of `encoding` can cover: its group capacity, or 1 for
+ * an encoding that is read one field at a time.
+ *
+ * The frame loop stops measuring a run of same-encoding fields here, because
+ * `groupSize` would clamp anything longer to this anyway. Measuring the whole
+ * run instead made each frame quadratic in its field count.
+ */
+export function groupCapacity(encoding) {
+  return GROUP_CAPACITY.get(encoding) ?? 1;
+}
+
+/**
  * How many consecutive fields the next read consumes: group encodings swallow up
  * to their capacity, everything else is one field at a time.
  */
 export function groupSize(encoding, availableFields) {
-  return Math.min(GROUP_CAPACITY.get(encoding) ?? 1, availableFields);
+  return Math.min(groupCapacity(encoding), availableFields);
 }
 
 function decodeTag8_8SVB(reader, count) {

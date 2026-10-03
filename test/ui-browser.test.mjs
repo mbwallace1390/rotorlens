@@ -601,6 +601,37 @@ test('the engine and shell run in a real browser', {
     assert.match(failure.result.value, /contained text, not a file/,
       'the reason code must become words the user can act on');
 
+    // The two ways the Android shell loses its renderer with a log open. They
+    // used to fall through to the copy-failure text, which blamed a permission
+    // and, after a background reclaim, blamed a log that was not the cause.
+    // test/android-shell.test.mjs pins that every code Java sends has words;
+    // this checks the running page actually shows them.
+    const rendererLoss = await client.send('Runtime.evaluate', {
+      expression: `(async () => {
+        const shown = {};
+        for (const reason of ['viewer-restarted', 'viewer-reclaimed']) {
+          window.dispatchEvent(new CustomEvent('rotorlens-import-failed', {detail: {
+            name: 'LOST.BBL', reason
+          }}));
+          await new Promise(resolve => setTimeout(resolve, 200));
+          shown[reason] = document.getElementById('status').textContent;
+        }
+        return JSON.stringify(shown);
+      })()`,
+      awaitPromise: true,
+      returnByValue: true
+    }, sessionId);
+    const lost = JSON.parse(rendererLoss.result.value);
+    for (const text of Object.values(lost)) {
+      assert.match(text, /could not open LOST\.BBL/);
+      assert.doesNotMatch(text, /withdrew permission/,
+        'a lost renderer must not be reported as a copy or permission failure');
+    }
+    assert.match(lost['viewer-restarted'], /out of memory/i);
+    assert.match(lost['viewer-reclaimed'], /in the background/i);
+    assert.doesNotMatch(lost['viewer-reclaimed'], /smaller|too large/i,
+      'after a system reclaim the log was most likely not the cause');
+
     // 8. The axis view, on a phone, with a real log open.
     //
     // This is the half of the product a pilot actually reads, and none of it can
@@ -3661,27 +3692,47 @@ test('the engine and shell run in a real browser', {
 
 const REAL_LOG = process.env.ROTORLENS_REAL_LOG;
 
+/** Where the page fetches the real log from: the UI's own origin. */
+const REAL_LOG_PATH = '/__real-log';
+
+/**
+ * The UI server, answering one extra path with the real log's bytes.
+ *
+ * The real log lives outside the repository and must stay there — it is
+ * somebody's flight, and this repository is public — so it is served from
+ * memory rather than copied into the tree.
+ *
+ * It is served from the SAME origin as the page, because ui/index.html ships a
+ * Content-Security-Policy with `connect-src 'self'`. A second localhost port is
+ * another origin, and the policy refuses the fetch. That is the policy doing its
+ * job, so the test adapts to it rather than the reverse: no Page.setBypassCSP,
+ * which would run history, learning and sharing under a policy the app never
+ * ships with, and no route in tools/serve-ui.mjs, which must never serve a file
+ * from outside the repository. Everything but REAL_LOG_PATH goes to the real
+ * UI handler unchanged.
+ */
+function uiServerWithRealLog(logBytes) {
+  const serveUi = createUiServer().listeners('request')[0];
+  return createServer((request, response) => {
+    if (new URL(request.url, 'http://127.0.0.1').pathname === REAL_LOG_PATH) {
+      response.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Cache-Control': 'no-store'
+      });
+      response.end(logBytes);
+      return;
+    }
+    serveUi(request, response);
+  });
+}
+
 test('a real flight is remembered, compared, and can be deleted', {
   skip: chromePath
     ? (REAL_LOG ? false : 'set ROTORLENS_REAL_LOG to a .bbl path to run this')
     : 'no Chromium found; set ROTORLENS_BROWSER to a path'
 }, async () => {
-  const server = createUiServer();
+  const server = uiServerWithRealLog(await readFile(REAL_LOG));
   const port = await listen(server);
-
-  // The real log lives outside the repository and must stay there — it is
-  // somebody's flight, and this repository is public. So it is served from a
-  // second, throwaway origin rather than copied into the tree.
-  const logBytes = await readFile(REAL_LOG);
-  const logServer = createServer((request, response) => {
-    response.writeHead(200, {
-      'Content-Type': 'application/octet-stream',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'no-store'
-    });
-    response.end(logBytes);
-  });
-  const logPort = await listen(logServer);
 
   const profile = await mkdtemp(path.join(tmpdir(), 'rotorlens-history-'));
   const debugPort = await freePort();
@@ -3738,7 +3789,7 @@ test('a real flight is remembered, compared, and can be deleted', {
     const flown = await client.send('Runtime.evaluate', {
       expression: `(async () => {
         const openLog = async name => {
-          const bytes = await (await fetch('http://127.0.0.1:${logPort}/log')).arrayBuffer();
+          const bytes = await (await fetch('${REAL_LOG_PATH}')).arrayBuffer();
           const transfer = new DataTransfer();
           transfer.items.add(new File([bytes], name));
           const input = document.getElementById('file');
@@ -3896,7 +3947,6 @@ test('a real flight is remembered, compared, and can be deleted', {
     browser.kill('SIGKILL');
     await new Promise(resolve => browser.once('exit', resolve));
     await rm(profile, {recursive: true, force: true, maxRetries: 10, retryDelay: 100});
-    await new Promise(resolve => logServer.close(resolve));
     await new Promise(resolve => server.close(resolve));
   }
 });
@@ -3971,8 +4021,12 @@ function sweepRecord(yawP, errorDps) {
         rollPID: '50,60,30,100,0',
         pitchPID: '52,62,32,100,0',
         yawPID: `${yawP},145,29,3,1`,
+        // All four rate keys, as Rotorflight 4.6 writes them. Without rc_expo
+        // every flight reads RATES_UNREADABLE, nothing can be compared, and the
+        // model's honest answer is no evidence at all.
         rates_type: '4',
         rc_rates: '5,5,12',
+        rc_expo: '0,0,0',
         rates: '10,10,10'
       },
       firmware: {revision: 'Rotorflight 4.6.0'}
@@ -4022,19 +4076,8 @@ test('what RotorLens has learned is on screen, and can be forgotten again', {
     + 'the states this panel most has to keep apart');
   assert.equal(rollP.state, SENSITIVITY_STATE.NO_EVIDENCE);
 
-  const server = createUiServer();
+  const server = uiServerWithRealLog(await readFile(REAL_LOG));
   const port = await listen(server);
-
-  const logBytes = await readFile(REAL_LOG);
-  const logServer = createServer((request, response) => {
-    response.writeHead(200, {
-      'Content-Type': 'application/octet-stream',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'no-store'
-    });
-    response.end(logBytes);
-  });
-  const logPort = await listen(logServer);
 
   const profile = await mkdtemp(path.join(tmpdir(), 'rotorlens-learn-'));
   const debugPort = await freePort();
@@ -4123,7 +4166,7 @@ test('what RotorLens has learned is on screen, and can be forgotten again', {
           - document.documentElement.clientWidth;
 
         // B. A real flight, through the real file input, at phone metrics.
-        const bytes = await (await fetch('http://127.0.0.1:${logPort}/log')).arrayBuffer();
+        const bytes = await (await fetch('${REAL_LOG_PATH}')).arrayBuffer();
         const transfer = new DataTransfer();
         transfer.items.add(new File([bytes], 'LEARNING.BBL'));
         const input = document.getElementById('file');
@@ -4393,7 +4436,6 @@ test('what RotorLens has learned is on screen, and can be forgotten again', {
     browser.kill('SIGKILL');
     await new Promise(resolve => browser.once('exit', resolve));
     await rm(profile, {recursive: true, force: true, maxRetries: 10, retryDelay: 100});
-    await new Promise(resolve => logServer.close(resolve));
     await new Promise(resolve => server.close(resolve));
   }
 });
@@ -4447,19 +4489,8 @@ test('sharing is never asked by itself, shows what would leave, erases — and s
     ? (REAL_LOG ? false : 'set ROTORLENS_REAL_LOG to a .bbl path to run this')
     : 'no Chromium found; set ROTORLENS_BROWSER to a path'
 }, async () => {
-  const server = createUiServer();
+  const server = uiServerWithRealLog(await readFile(REAL_LOG));
   const port = await listen(server);
-
-  const logBytes = await readFile(REAL_LOG);
-  const logServer = createServer((request, response) => {
-    response.writeHead(200, {
-      'Content-Type': 'application/octet-stream',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'no-store'
-    });
-    response.end(logBytes);
-  });
-  const logPort = await listen(logServer);
 
   const profile = await mkdtemp(path.join(tmpdir(), 'rotorlens-sharing-'));
   const debugPort = await freePort();
@@ -4547,7 +4578,7 @@ test('sharing is never asked by itself, shows what would leave, erases — and s
     // ---- open a real flight, through the real file input ------------------
     const opened = await client.send('Runtime.evaluate', {
       expression: `(async () => {
-        const bytes = await (await fetch('http://127.0.0.1:${logPort}/log')).arrayBuffer();
+        const bytes = await (await fetch('${REAL_LOG_PATH}')).arrayBuffer();
         const transfer = new DataTransfer();
         transfer.items.add(new File([bytes], 'BELL-222UT.BBL'));
         const input = document.getElementById('file');
@@ -5015,7 +5046,6 @@ test('sharing is never asked by itself, shows what would leave, erases — and s
     browser.kill('SIGKILL');
     await new Promise(resolve => browser.once('exit', resolve));
     await rm(profile, {recursive: true, force: true, maxRetries: 10, retryDelay: 100});
-    await new Promise(resolve => logServer.close(resolve));
     await new Promise(resolve => server.close(resolve));
   }
 });

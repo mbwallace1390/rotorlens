@@ -2,6 +2,15 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- One policy for all three hosts (serve-ui, Android AssetServer, the iOS
+     scheme handler): a meta element travels inside this file, a header would
+     need three copies. It must stay above the style block, because a meta
+     policy governs only what is parsed after it. connect-src 'self' is the
+     page refusing to talk to any other origin; imported logs are served from
+     the page's own origin on both phones. style-src needs 'unsafe-inline' for
+     the style block and the style attributes app.mjs and legal.mjs write into
+     innerHTML; script stays 'self' only. test/ui-csp.test.mjs pins all of it. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>RotorLens</title>
 <style>

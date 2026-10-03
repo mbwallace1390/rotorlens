@@ -6836,6 +6836,36 @@ onHostFile(source => openFile(source));
 onHostImportStarted(importStarted);
 onHostImportProgress(importAdvanced);
 
+/**
+ * What the page says when a native shell could not hand over a log, keyed by
+ * the shell's stable reason code (the codes are listed on onHostFileFailed in
+ * ui/host.mjs).
+ *
+ * One entry per code, and no code compared anywhere else. A code with no entry
+ * gets the copy-failure text, which blames a permission and the file's size —
+ * true of a failed copy, and wrong about anything else. That is how a renderer
+ * crash, and a renderer the system merely reclaimed, both came to be reported
+ * as a permission problem. test/android-shell.test.mjs reads every code the
+ * Android shell can send and fails if one is missing here.
+ */
+const HOST_FAILURE_WORDS = Object.freeze({
+  'no-file': 'That share contained text, not a file. Share the .bbl itself, or use the ' +
+    'button above to pick it from storage.',
+  'too-large': 'This log is larger than the 128 MiB safe limit. Split or erase the ' +
+    'dataflash in Rotorflight, then open one smaller recording.',
+  'unreadable': 'The file may be too large, or the app that shared it withdrew permission ' +
+    'before the copy finished. Try copying the log to this device first.',
+  // RenderProcessGoneDetail.didCrash() was true: the viewer died with this log
+  // open, and memory is by far the likeliest reason on a large one.
+  'viewer-restarted': 'The viewer ran out of memory on this log and had to restart. ' +
+    'Open a smaller recording, or use a phone with more memory.',
+  // didCrash() was false: Android killed the viewer itself, normally to free
+  // memory for other apps while RotorLens was out of sight. Nothing points at
+  // the log, so nothing here asks the pilot to change it.
+  'viewer-reclaimed': 'Android closed the viewer in the background to free memory. ' +
+    'Open the log again.'
+});
+
 // ...and imports the shell could not complete. Without this the user picks a
 // file, the picker closes, and the screen does not change — which is
 // indistinguishable from the app having frozen.
@@ -6845,14 +6875,11 @@ onHostFileFailed(({name, reason}) => {
   // different file.
   retireCurrentFile(name);
   hideImportProgress();
-  const why = reason === 'no-file'
-    ? 'That share contained text, not a file. Share the .bbl itself, or use the ' +
-      'button above to pick it from storage.'
-    : reason === 'too-large'
-      ? 'This log is larger than the 128 MiB safe limit. Split or erase the ' +
-        'dataflash in Rotorflight, then open one smaller recording.'
-    : 'The file may be too large, or the app that shared it withdrew permission ' +
-      'before the copy finished. Try copying the log to this device first.';
+  // An unknown code — a newer shell than this page — is reported as the copy
+  // failure host.mjs already treats a missing code as.
+  const why = Object.prototype.hasOwnProperty.call(HOST_FAILURE_WORDS, reason)
+    ? HOST_FAILURE_WORDS[reason]
+    : HOST_FAILURE_WORDS.unreadable;
 
   show('status-panel');
   $('status').innerHTML =

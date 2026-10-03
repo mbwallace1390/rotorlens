@@ -1,7 +1,9 @@
 package app.rotorlens;
 
 import android.annotation.SuppressLint;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.net.Uri;
@@ -10,12 +12,17 @@ import android.os.Bundle;
 import android.os.Parcelable;
 import android.os.SystemClock;
 import android.provider.OpenableColumns;
+import android.view.Gravity;
+import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.webkit.JavascriptInterface;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.TextView;
 
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -30,7 +37,8 @@ import androidx.activity.result.contract.ActivityResultContracts;
  * RotorLens is the web viewer in `ui/`, running against the engine in `src/`.
  * This class exists only to do the things a web page cannot: receive a shared or
  * opened `.bbl`, show the system file picker, and serve the viewer over an
- * origin where ES modules work.
+ * origin where ES modules work — plus replace the WebView if its renderer dies,
+ * and hand a tapped About & Legal link to the user's browser.
  *
  * Keeping it this thin is deliberate. Everything implemented here is code the
  * repository's test suite cannot reach, so the rule is that nothing decides
@@ -63,10 +71,25 @@ public final class MainActivity extends ComponentActivity {
      */
     private static final long PROGRESS_INTERVAL_MS = 200;
 
+    /** The current viewer; null only while a dead renderer is being replaced or if it could not be. */
     private WebView webView;
+    private AssetServer server;
     private ImportStore imports;
     private HistoryStore history;
     private ActivityResultLauncher<String[]> picker;
+
+    /** Whether a lost renderer may be replaced without looping. UI thread only. */
+    private final RendererRecovery rendererRecovery = new RendererRecovery();
+
+    /** The system font scale the current WebView's text zoom matches. UI thread only. */
+    private float viewerFontScale;
+
+    /**
+     * The name of the log the page has or is receiving, for telling a replacement
+     * page which log a dead renderer took with it. Null when nothing is open.
+     * UI thread only.
+     */
+    private String openLogName;
 
     /** Monotonic claim on the import slot; only the newest selection may commit. */
     private final AtomicLong importGeneration = new AtomicLong();
@@ -164,7 +187,6 @@ public final class MainActivity extends ComponentActivity {
     }
 
     @Override
-    @SuppressLint("SetJavaScriptEnabled") // The packaged viewer is JavaScript; origin/network are locked below.
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
@@ -181,8 +203,59 @@ public final class MainActivity extends ComponentActivity {
                     }
                 });
 
+        // Debug builds expose the WebView to chrome://inspect, which is by far the
+        // fastest way to diagnose "the page is blank" on a device.
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
+
+        server = new AssetServer(getAssets(), imports);
+        createViewer();
+
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                final WebView viewer = webView;
+                if (viewer == null) {
+                    // The renderer could not be brought back; there is no page to ask.
+                    finish();
+                    return;
+                }
+                // Give the page's real modal first refusal. The callback is
+                // asynchronous, so navigation belongs inside it; finishing here
+                // would close the activity before JavaScript could dismiss the
+                // consent dialog.
+                viewer.evaluateJavascript(
+                        "Boolean(window.RotorLensHandleBack&&window.RotorLensHandleBack())",
+                        handled -> {
+                            if ("true".equals(handled) || viewer != webView) {
+                                // Handled by the page, or this viewer was replaced
+                                // after its renderer died and must not be touched.
+                                return;
+                            }
+                            if (viewer.canGoBack()) {
+                                viewer.goBack();
+                            } else {
+                                finish();
+                            }
+                        });
+            }
+        });
+
+        handleIntent(getIntent());
+    }
+
+    /**
+     * Builds the WebView, points it at the viewer, and makes it the content view.
+     *
+     * Called once from onCreate and again if the renderer process dies; see
+     * {@link #recoverFromRendererLoss}. Every WebView this activity ever shows
+     * is configured here, so a replacement is locked down exactly as the first.
+     */
+    @SuppressLint("SetJavaScriptEnabled") // The packaged viewer is JavaScript; origin/network are locked below.
+    private void createViewer() {
         webView = new WebView(this);
         setContentView(webView);
+        // The fontScale this WebView took its text zoom from. See onConfigurationChanged.
+        viewerFontScale = getResources().getConfiguration().fontScale;
         // targetSdk 36 lays the window out edge to edge on Android 15+ and ignores
         // the theme's statusBarColor/navigationBarColor. The page's own
         // env(safe-area-inset-*) padding covers display cutouts but not the
@@ -202,12 +275,11 @@ public final class MainActivity extends ComponentActivity {
         // Large logs draw a lot of canvas; give the page a real viewport.
         settings.setUseWideViewPort(false);
         settings.setSupportZoom(false);
+        // The default, stated because the link handling below depends on it: with
+        // no second window to open, a target="_blank" link navigates this WebView
+        // and so arrives at shouldOverrideUrlLoading like any other tap.
+        settings.setSupportMultipleWindows(false);
 
-        // Debug builds expose the WebView to chrome://inspect, which is by far the
-        // fastest way to diagnose "the page is blank" on a device.
-        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
-
-        final AssetServer server = new AssetServer(getAssets(), imports);
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view,
@@ -217,10 +289,38 @@ public final class MainActivity extends ComponentActivity {
 
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                // Refuse navigation anywhere but our own origin. There is nothing
-                // else this app should ever load.
                 Uri url = request.getUrl();
-                return url == null || !AssetServer.HOST.equals(url.getHost());
+                if (url != null
+                        && AssetServer.isAppOrigin(url.getScheme(), url.getHost(), url.getPort())) {
+                    return false;
+                }
+                // Nothing else ever loads in the WebView. A tap on one of the
+                // links About & Legal shows goes to the user's own browser, where
+                // following it is their action and not this app's; anything else
+                // is dropped. See ExternalLinks for why the list is exact.
+                if (url != null && ExternalLinks.opensInBrowser(url.toString(), request.hasGesture())) {
+                    openInBrowser(url);
+                }
+                return true;
+            }
+
+            /**
+             * The renderer process died: out of memory on a large log, or reclaimed
+             * by the system while the app was in the background.
+             *
+             * detail.didCrash() is the only thing that tells those apart, and the
+             * page needs it: a crash may have been caused by the open log, a
+             * reclaim most likely was not. It is passed on as a fact, not acted on.
+             *
+             * Returning false here, which is what not overriding it does, makes
+             * Android kill the whole app with the renderer — a hard crash, and
+             * Play counts it. Returning true obliges the shell to stop using this
+             * WebView, which recoverFromRendererLoss does.
+             */
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                recoverFromRendererLoss(view, detail.didCrash());
+                return true;
             }
 
             @Override
@@ -237,6 +337,7 @@ public final class MainActivity extends ComponentActivity {
                 // Module scripts are deferred, so ui/app.mjs has run and called
                 // onHostFile() before the load event that brings us here.
                 pageReady = true;
+                rendererRecovery.pageLoaded();
                 String script = pendingImports.drain(importGeneration.get());
                 if (script != null) {
                     view.evaluateJavascript(script, null);
@@ -246,30 +347,129 @@ public final class MainActivity extends ComponentActivity {
 
         webView.addJavascriptInterface(new NativeBridge(), "RotorLensNative");
         webView.loadUrl(AssetServer.ORIGIN + "/ui/index.html");
+    }
 
-        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
-            @Override
-            public void handleOnBackPressed() {
-                // Give the page's real modal first refusal. The callback is
-                // asynchronous, so navigation belongs inside it; finishing here
-                // would close the activity before JavaScript could dismiss the
-                // consent dialog.
-                webView.evaluateJavascript(
-                        "Boolean(window.RotorLensHandleBack&&window.RotorLensHandleBack())",
-                        handled -> {
-                            if ("true".equals(handled)) {
-                                return;
-                            }
-                            if (webView.canGoBack()) {
-                                webView.goBack();
-                            } else {
-                                finish();
-                            }
-                        });
+    /**
+     * Replaces a WebView whose renderer process is gone.
+     *
+     * The log that was open goes with the renderer and is never offered again,
+     * because it may be exactly what the renderer ran out of memory on: handing
+     * it to the replacement could kill that one too, forever. Instead the new
+     * page is told, through the ordinary failure event, which log was lost and
+     * how the renderer went — "viewer-restarted" if it crashed, which may have
+     * been the log's doing, and "viewer-reclaimed" if the system killed it,
+     * normally to free memory while the app was in the background, when the
+     * log was most likely not the cause. The page decides what to say. Java
+     * decides nothing about the log here — it only knows a name and how the
+     * page died.
+     *
+     * A replacement that dies before its own page finishes loading is not
+     * replaced again (see RendererRecovery); the activity then shows a plain
+     * message instead of looping.
+     *
+     * @param crashed RenderProcessGoneDetail.didCrash(): true for a crash,
+     *     false when the system killed the renderer
+     */
+    private void recoverFromRendererLoss(WebView dead, boolean crashed) {
+        ViewParent parent = dead.getParent();
+        if (parent instanceof ViewGroup) {
+            ((ViewGroup) parent).removeView(dead);
+        }
+        dead.destroy();
+        if (dead != webView) {
+            // An older WebView already replaced; the current one is unaffected.
+            return;
+        }
+        webView = null;
+        pageReady = false;
+
+        // Read before retiring the slot, which forgets it.
+        final String lostLog = openLogName;
+        final long generation = retireImportSlot();
+        // If this activity is ever recreated, it must not re-import whatever
+        // log originally opened it: that may be the one that killed the renderer.
+        setIntent(new Intent(Intent.ACTION_MAIN));
+
+        if (!rendererRecovery.mayRebuildAfterLoss()) {
+            showViewerUnavailable();
+            return;
+        }
+
+        // Rebuild on the next turn of the main loop rather than inside the
+        // WebView's own callback.
+        getWindow().getDecorView().post(() -> {
+            if (isFinishing() || isDestroyed() || webView != null) {
+                return;
+            }
+            createViewer();
+            if (lostLog != null) {
+                // Queued until the new page has registered its listeners, then
+                // delivered by onPageFinished like any cold-start event. Only a
+                // crash is reported as the viewer having died on this log.
+                notifyFailure(lostLog, crashed ? "viewer-restarted" : "viewer-reclaimed", generation);
             }
         });
+    }
 
-        handleIntent(getIntent());
+    /** The last resort when the renderer will not stay up: say so, plainly. */
+    private void showViewerUnavailable() {
+        TextView message = new TextView(this);
+        message.setText(R.string.viewer_unavailable);
+        message.setGravity(Gravity.CENTER);
+        int padding = Math.round(24 * getResources().getDisplayMetrics().density);
+        message.setPadding(padding, padding, padding, padding);
+        message.setFitsSystemWindows(true);
+        setContentView(message);
+    }
+
+    /**
+     * Hands one allow-listed link to whatever the user opens web links with.
+     *
+     * This app still makes no network request: the browser does, because the
+     * user tapped a link to it. No INTERNET permission is involved.
+     */
+    private void openInBrowser(Uri url) {
+        Intent intent = new Intent(Intent.ACTION_VIEW, url);
+        intent.addCategory(Intent.CATEGORY_BROWSABLE);
+        try {
+            startActivity(intent);
+        } catch (ActivityNotFoundException noBrowser) {
+            // Nothing on this device opens web links. The address is printed on
+            // the legal screen beside the link, so it can still be read.
+        }
+    }
+
+    /**
+     * Configuration changes the manifest says this activity handles itself.
+     *
+     * Recreating the activity would destroy the WebView and unlink the open log,
+     * so rotation, window resizing, fold/unfold, display size, font size, locale
+     * and dark mode are declared in android:configChanges and arrive here instead.
+     * The WebView re-lays itself out for size and density changes on its own.
+     *
+     * Font size is the one it does not follow. A WebView takes its text zoom from
+     * the system font scale once, when it is constructed, and never again, so
+     * without this a font-size change would apply only to the next WebView. The
+     * value set is the one a fresh WebView computes: 100 times the font scale,
+     * truncated.
+     *
+     * Measured, not assumed, on an Android 17 emulator with WebView 153: text
+     * measured after a live change to 1.15 and 1.3 was identical to a WebView
+     * cold-started at that scale, and with this line removed it stayed at the old
+     * size. A real handset with an OEM WebView has not been measured.
+     */
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (webView != null && newConfig.fontScale != viewerFontScale) {
+            viewerFontScale = newConfig.fontScale;
+            webView.getSettings().setTextZoom(textZoomFor(viewerFontScale));
+        }
+    }
+
+    /** A fresh WebView's default text zoom for this font scale. */
+    static int textZoomFor(float fontScale) {
+        return (int) (100 * fontScale);
     }
 
     @Override
@@ -281,7 +481,9 @@ public final class MainActivity extends ComponentActivity {
 
     /** Picks up a log the user opened or shared into RotorLens. */
     private void handleIntent(Intent intent) {
-        if (intent == null) {
+        if (intent == null || webView == null) {
+            // No viewer (its renderer could not be brought back) means no page to
+            // hand a log to; copying one into the cache would only strand it there.
             return;
         }
 
@@ -426,6 +628,7 @@ public final class MainActivity extends ComponentActivity {
         // There is one cache slot and one screen. A worker from an older
         // generation cannot commit after this clear.
         imports.clear();
+        openLogName = null;
         return generation;
     }
 
@@ -550,6 +753,9 @@ public final class MainActivity extends ComponentActivity {
                 + "total:" + total + ","
                 + "generation:" + generation
                 + "}}))", generation);
+        if (isCurrentImport(generation)) {
+            openLogName = name;
+        }
     }
 
     /** Reports bytes copied so far. Throttled by PROGRESS_INTERVAL_MS. */
@@ -568,6 +774,9 @@ public final class MainActivity extends ComponentActivity {
                 + "url:" + quote(AssetServer.importPath(id)) + ","
                 + "size:" + byteLength
                 + "}}))", generation);
+        if (isCurrentImport(generation)) {
+            openLogName = name;
+        }
     }
 
     /**
@@ -575,13 +784,24 @@ public final class MainActivity extends ComponentActivity {
      *
      * `reason` is a stable code the page turns into words: "unreadable" for a
      * copy that failed, "no-file" for a share that carried text and no stream,
-     * and "too-large" when the document exceeds the bounded in-memory reader.
+     * "too-large" when the document exceeds the bounded in-memory reader,
+     * "viewer-restarted" when the WebView renderer crashed with this log open
+     * and the shell replaced it, and "viewer-reclaimed" when the system killed
+     * the renderer instead (see recoverFromRendererLoss). ImportStore's
+     * "cancelled" is never sent: a superseded import is not a failure.
+     *
+     * Every code sent here needs words in HOST_FAILURE_WORDS in ui/app.mjs;
+     * test/android-shell.test.mjs reads this file and fails if one has none.
      */
     private void notifyFailure(String name, String reason, long generation) {
         dispatchTerminal("window.dispatchEvent(new CustomEvent('rotorlens-import-failed',{detail:{"
                 + "name:" + quote(name) + ","
                 + "reason:" + quote(reason)
                 + "}}))", generation);
+        if (isCurrentImport(generation)) {
+            // Nothing is open after a failure: the slot was retired first.
+            openLogName = null;
+        }
     }
 
     /** JSON-safe string literal; a filename can contain anything. */

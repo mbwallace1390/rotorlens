@@ -188,6 +188,15 @@ export function parseHeaderBlock(bytes, startOffset) {
     if (offset !== startOffset && startsSessionPreamble(bytes, offset)) {
       break;
     }
+    // Anything not starting `H ` is where the binary frame stream begins, and
+    // frame data is not a line. Measuring it as one first meant a body with no
+    // 0x0A byte in its first 64 KiB — an erased or zero-filled stretch after a
+    // short flight — threw "Header line exceeds" and lost a session whose
+    // header was intact. This is also the byte-level test `headerBlockEnd`
+    // uses, so session discovery and header parsing agree on where data starts.
+    if (bytes[offset] !== 0x48 || bytes[offset + 1] !== 0x20) {
+      break;
+    }
     const lineEnd = boundedLineEnd(bytes, offset);
     if (lineEnd === -1) {
       if (bytes.length - offset > MAX_HEADER_LINE_BYTES) {
@@ -197,10 +206,10 @@ export function parseHeaderBlock(bytes, startOffset) {
           {limit: MAX_HEADER_LINE_BYTES, offset}
         );
       }
-      // A binary frame may legitimately run to EOF without containing a
-      // newline. Only an unterminated header-shaped line is incomplete header
-      // evidence; security-sensitive consumers must fail closed on that case.
-      headerTerminationClean = bytes[offset] !== 0x48 || bytes[offset + 1] !== 0x20;
+      // Only a header-shaped line reaches here (frame data broke out above), so
+      // this is an unterminated `H ` line: incomplete header evidence, which
+      // security-sensitive consumers must fail closed on.
+      headerTerminationClean = false;
       break; // truncated mid-line: keep what we already parsed
     }
 

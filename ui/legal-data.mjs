@@ -101,10 +101,9 @@ export const LEGAL = {
         "copyright": "Copyright 2010-2023 JetBrains s.r.o. and Kotlin Programming Language contributors",
         "note": "androidx is written in Kotlin, so its runtime ships even though RotorLens contains no Kotlin of its own.",
         "artifacts": [
-          "org.jetbrains.kotlin:kotlin-stdlib-common:1.8.22",
-          "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22",
-          "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22",
-          "org.jetbrains.kotlin:kotlin-stdlib:1.8.22"
+          "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.25",
+          "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.25",
+          "org.jetbrains.kotlin:kotlin-stdlib:1.9.25"
         ]
       },
       {

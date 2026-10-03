@@ -415,6 +415,14 @@ extension ViewerViewController: WKNavigationDelegate {
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
+        // Known gap, left deliberately: About & Legal's links (the source
+        // repository and each component's project page) are cancelled here like
+        // every other off-origin navigation, so on iOS a tap on them does nothing.
+        // Android hands an exact allow-list of those URLs to the user's browser on
+        // a tap (android/app/src/main/java/app/rotorlens/ExternalLinks.java). The
+        // iOS equivalent would be UIApplication.shared.open for the same list when
+        // navigationType is .linkActivated; it is not written because this shell
+        // cannot be compiled or run where that change was made.
         guard navigationAction.targetFrame?.isMainFrame == true,
               let url = navigationAction.request.url,
               RotorLensOrigin.contains(url),

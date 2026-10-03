@@ -44,7 +44,7 @@ resolved `releaseRuntimeClasspath` — what the APK actually carries — written
 after any dependency or version change.
 
 **The declared dependency list is not the shipped one.** `androidx.activity` is
-the only line in `android/app/build.gradle.kts`, and it brings twenty-seven other
+the only line in `android/app/build.gradle.kts`, and it brings twenty-six other
 artifacts with it from three further copyright holders. Apache-2.0 §4 attaches
 attribution to what is distributed, not to what was written down, so what follows
 is the resolved set and not the declaration.
@@ -98,19 +98,22 @@ which is why these need their own notice rather than being folded into the block
 above.
 
 ```text
-org.jetbrains.kotlin:kotlin-stdlib:1.8.22
-org.jetbrains.kotlin:kotlin-stdlib-common:1.8.22
-org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22
-org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22
+org.jetbrains.kotlin:kotlin-stdlib:1.9.25
+org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.25
+org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.25
 org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.4
 org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.6.4
 ```
 
-`kotlin-stdlib-jdk7` and `kotlin-stdlib-jdk8` are pinned to 1.8.22 by a
+`kotlin-stdlib-jdk7` and `kotlin-stdlib-jdk8` are pinned to 1.9.25 by a
 constraint in `android/app/build.gradle.kts`. Coroutines 1.6.4 asks for 1.6.21 of
 each, and since Kotlin 1.8 folded those classes into `kotlin-stdlib` itself, the
-old and new jars both defined them and D8 refused to build. At 1.8.22 the two are
-empty shims. The constraint pins a version; it adds nothing.
+old and new jars both defined them and D8 refused to build. At 1.9.25 the two are
+empty shims, and because each depends on `kotlin-stdlib` at its own version, the
+pin also lifts `kotlin-stdlib` from the 1.8.22 the androidx closure asks for to
+1.9.25. From 1.9 the separate `kotlin-stdlib-common` jar no longer ships; its
+metadata is still resolved, but it contributes no file to the APK. The Kotlin
+copyright header at the v1.9.25 tag still reads 2010-2023.
 
 ### JetBrains — annotations
 

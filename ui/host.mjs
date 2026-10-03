@@ -208,9 +208,14 @@ export function onHostFile(handler, scope = globalThis) {
  * Subscribes to imports the host could not complete.
  *
  * `reason` is a stable code, not prose: 'no-file' when a share carried text
- * rather than a file, 'unreadable' when the copy itself failed, and 'too-large'
- * when it exceeds the bounded reader. The wording belongs here, where it can
- * change without touching Java.
+ * rather than a file, 'unreadable' when the copy itself failed, 'too-large'
+ * when it exceeds the bounded reader, 'viewer-restarted' when the Android
+ * WebView renderer crashed with the log open and the shell rebuilt the viewer,
+ * and 'viewer-reclaimed' when the system killed that renderer instead (usually
+ * in the background, to free memory — the log was most likely not the cause).
+ * The wording belongs in the page, where it can change without touching Java:
+ * HOST_FAILURE_WORDS in ui/app.mjs, which test/android-shell.test.mjs checks
+ * against every code the Android shell can send.
  */
 export function onHostFileFailed(handler, scope = globalThis) {
   const listener = event => {
