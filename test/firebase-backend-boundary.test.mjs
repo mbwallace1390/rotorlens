@@ -158,6 +158,37 @@ test('Firebase dependencies, notices and CI stay in their isolated boundaries', 
     ));
   }
 
+  // An `overrides` entry pins a package nothing here depends on directly, so no
+  // other check notices when it stops taking effect: `packages['']` in the lock
+  // does not record overrides, and a lock regenerated without them still
+  // matches the top-level pins above. Each override must be the version the lock
+  // resolves at EVERY location of that package, and must be named in the
+  // notices at that version.
+  for (const [manifest, lock, label] of [
+    [emulatorManifest, emulatorLock, 'emulator'],
+    [functionsManifest, functionsLock, 'Functions']
+  ]) {
+    for (const [name, version] of Object.entries(manifest.overrides ?? {})) {
+      assert.equal(typeof version, 'string',
+        `${label} override ${name} must be an exact version, not a nested override`);
+      const resolved = Object.entries(lock.packages)
+        .filter(([location]) => location === `node_modules/${name}`
+          || location.endsWith(`/node_modules/${name}`))
+        .map(([location, entry]) => `${location}@${entry.version}`);
+      assert.ok(resolved.length > 0,
+        `the ${label} override of ${name} matches nothing in its lockfile`);
+      assert.deepEqual(
+        resolved.filter(entry => !entry.endsWith(`@${version}`)),
+        [],
+        `the ${label} lockfile does not resolve ${name} to its override ${version}; `
+        + 'regenerate that lockfile with npm after changing an override'
+      );
+      assert.match(notices, new RegExp(
+        `${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\n]*${version.replaceAll('.', '\\.')}`
+      ), `THIRD_PARTY_NOTICES.md must name the ${label} override ${name} ${version}`);
+    }
+  }
+
   const workflow = await readFile(
     path.join(projectRoot, '.github', 'workflows', 'ci.yml'),
     'utf8'
