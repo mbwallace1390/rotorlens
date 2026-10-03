@@ -202,9 +202,14 @@ to report `FIELD_MISSING` for them.
 `mechanical-spectrum.mjs` is the one call `ui/` should make. It returns a plain
 JSON-safe object: per-axis peaks with frequency and amplitude in degrees per
 second, whether a rotor harmonic explains each one
-(`explained` / `not-explained` / `not-checked`), and the correlation state with
-its measured reason where it could not be checked. It contains measurements and
-states only; the test suite asserts that no field of it says what to change.
+(`explained` / `near-order` / `not-explained` / `not-checked`), and the
+correlation state with its measured reason where it could not be checked.
+`near-order` is a peak the harmonic match names an order but which sits further
+from it than the logged speed of that rotor allows — the same identity rule the
+airframe gate applies — so the panel never draws it as the rotor's own. Each peak
+also says whether it is a persistent tone or a short burst listed only for having
+reached the attention threshold. It contains measurements and states only; the
+test suite asserts that no field of it says what to change.
 
 The conversion from UMD to ES modules was done mechanically by a script rather
 than retyped, because a transcription slip in analysis code is a measurement bug

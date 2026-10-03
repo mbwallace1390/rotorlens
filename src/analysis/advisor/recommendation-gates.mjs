@@ -248,10 +248,11 @@ export const GAIN_GATE_THRESHOLDS = Object.freeze({
    *
    * Judged since round 3 on a tone's size WHILE PRESENT, which is at least its
    * flight average and equals it for a tone above the level throughout. The 17.3
-   * above was measured as a flight average; the size while present has not been
-   * re-measured on that corpus (the reference log carries no attention-level
-   * rotor tone), so a real flight whose tone comes and goes may now sit nearer
-   * the ceiling than that number says.
+   * above was measured as a flight average. Re-measured 3 October 2026 (Stage
+   * 2d) on the size while present, edge windows left out: the worst of the 53
+   * attention-level main 1/rev and 2/rev tones in those 43 windows is 18.1 deg/s,
+   * and the worst tone above the level for only part of a window is 2.1 times
+   * the level — both still under 24.
    */
   rotorOrderToneCeilingMultiple: 3
 });
@@ -346,6 +347,23 @@ const UNFILTERED_GYRO_SOURCES = Object.freeze(['gyroRAW', 'gyroUnfilt']);
  *     block), instead of being reported like a small tone whose origin "could
  *     not be established".
  *
+ * Stage 2d, review of 3 October 2026:
+ *   - the ceiling also reads a main-rotor 1/rev or 2/rev that was above the level
+ *     for only PART of the range — not attention-eligible, so the result may read
+ *     "clear" — and does so whatever the status. Such a tone measured at four
+ *     times the level while it was there used to support an all-clear.
+ *   - "every attention-level peak is the main rotor's" needs each peak to BE that
+ *     order, not merely to be named it. The analyser names a peak by its nearest
+ *     order within the wider of a bin and a half, 2.5% and the head speed's
+ *     spread — about 2.9 Hz at a 2 Hz resolution — so a tone 5-8% off the
+ *     once-per-rev was taken for the rotor's own. Identity now needs the peak's
+ *     interpolated frequency within the head speed's own spread at that order
+ *     plus half a bin (`rotorOrderMatchEstablished`); see `ROTOR_ORDER_MATCH_NOT_ESTABLISHED`.
+ *   - follow-up, item 3: the ceiling asks the same identity. A tone past it that
+ *     is named the 1/rev or 2/rev but not established as it is not called the
+ *     rotor's large tone; it blocks as vibration not established as the rotor's
+ *     own (see `judgedAsRotorOrderTone`).
+ *
  * Returns `{only, large, tones, refusal, ceilingDps}`. `refusal` names the first
  * condition that did not hold — a measured fact about the result, so a card can
  * say which — and is null only when `only` is true. When `large` is true it is
@@ -358,45 +376,132 @@ export function rotorOrderToneAssessment(mechanical) {
   const refuse = refusal => frozen({
     only: false, large: false, tones: frozen([]), refusal, ceilingDps: null
   });
-  if (!mechanical || typeof mechanical !== 'object' || mechanical.status !== 'attention') {
+  if (!mechanical || typeof mechanical !== 'object') {
     return refuse('NOT_ATTENTION');
   }
   const axes = Array.isArray(mechanical.axes) ? mechanical.axes : [];
   const thresholdDps = mechanical.attentionThreshold?.bandRmsDps;
-  const ceilingDps = Number.isFinite(thresholdDps) && thresholdDps > 0
-    ? GAIN_GATE_THRESHOLDS.rotorOrderToneCeilingMultiple * thresholdDps
-    : null;
+  const ceilingDps = ceilingOf(thresholdDps);
 
-  // The ceiling first. Every attention-level main-rotor 1/rev or 2/rev the
-  // analyser measured on unfiltered gyro and matched, with its size measured —
-  // in whichever stretch it was measured, however the rest of the result reads.
-  const measured = [];
+  // The ceiling first. Every main-rotor 1/rev or 2/rev the analyser measured
+  // above the level on unfiltered gyro and matched, with its size measured — in
+  // whichever stretch, for the whole range or part of it, however the rest of
+  // the result reads.
+  const persistent = [];
+  const aboveLevel = [];
   for (const entry of axes) {
-    if (!UNFILTERED_GYRO_SOURCES.includes(entry?.source ?? entry?.gyroSource)) {
-      continue;
-    }
-    for (const peak of entry.peaks ?? []) {
-      if (peak?.attentionEligible === true && isMainRotorOrder(peak.harmonicMatch)
-          && toneSizeMeasured(peak)) {
-        measured.push(measuredRotorTone(entry, peak));
+    for (const peak of entry?.peaks ?? []) {
+      if (!judgedAsRotorOrderTone(entry, peak)) {
+        continue;
+      }
+      if (peak.attentionEligible === true) {
+        const tone = measuredRotorTone(entry, peak);
+        persistent.push(tone);
+        aboveLevel.push(tone);
+      } else if (reachedLevel(peak, thresholdDps)) {
+        aboveLevel.push(measuredRotorTone(entry, peak));
       }
     }
   }
-  const tones = oneTonePerAxisAndOrder(measured);
-  const refusal = rotorOrderRuleRefusal(mechanical, axes, ceilingDps);
-  if (ceilingDps !== null && tones.some(tone => tone.aboveLevelBandRmsDps > ceilingDps)) {
+  const everyTone = oneTonePerAxisAndOrder(aboveLevel);
+  if (ceilingDps !== null && everyTone.some(tone => tone.aboveLevelBandRmsDps > ceilingDps)) {
+    // Nothing else can stop a result that measured no attention-level peak;
+    // one that measured nothing at all is not measured, and says so.
+    const refusal = mechanical.status === 'attention'
+      ? rotorOrderRuleRefusal(mechanical, axes, ceilingDps)
+      : (mechanical.status === 'clear' ? null : 'NOT_ATTENTION');
     return frozen({
-      only: false, large: true, tones, refusal: refusal ?? 'TONE_ABOVE_SEVERITY_CEILING', ceilingDps
+      only: false, large: true, tones: everyTone,
+      refusal: refusal ?? 'TONE_ABOVE_SEVERITY_CEILING', ceilingDps
     });
   }
+  if (mechanical.status !== 'attention') {
+    return refuse('NOT_ATTENTION');
+  }
+  const refusal = rotorOrderRuleRefusal(mechanical, axes, ceilingDps);
   if (refusal !== null) {
     return refuse(refusal);
   }
-  return frozen({only: true, large: false, tones, refusal: null, ceilingDps});
+  return frozen({
+    only: true, large: false, tones: oneTonePerAxisAndOrder(persistent), refusal: null, ceilingDps
+  });
+}
+
+/** Three times the published attention level, or null when none was published. */
+function ceilingOf(thresholdDps) {
+  return Number.isFinite(thresholdDps) && thresholdDps > 0
+    ? GAIN_GATE_THRESHOLDS.rotorOrderToneCeilingMultiple * thresholdDps
+    : null;
 }
 
 function isMainRotorOrder(match) {
   return Boolean(match) && match.rotor === 'main' && ROTOR_ORDER_TONE_ORDERS.includes(match.order);
+}
+
+/**
+ * Whether a peak is a main-rotor 1/rev or 2/rev the ceiling can judge: matched,
+ * on an unfiltered axis, with both of its sizes measured — and, since the Stage
+ * 2d follow-up (item 3), sitting where the logged head speed puts that order
+ * (`rotorOrderMatchEstablished`). Identity used to be required of the exemption
+ * only, so past the ceiling a tone the analyser merely NAMED the once-per-rev,
+ * 1.5 Hz off it with the head logged steady, was judged the rotor's own large
+ * tone and the pilot sent to track and balance the blades, while the exemption
+ * beside it said it was not established as the rotor's. Such a tone now blocks
+ * as measured vibration not established as the rotor's own.
+ */
+function judgedAsRotorOrderTone(entry, peak) {
+  return UNFILTERED_GYRO_SOURCES.includes(entry?.source ?? entry?.gyroSource)
+    && isMainRotorOrder(peak?.harmonicMatch) && toneSizeMeasured(peak)
+    && rotorOrderMatchEstablished(peak);
+}
+
+/**
+ * Whether a peak was above the attention level in at least one analysis window:
+ * it has a size while present, at or above the published level. Where no level
+ * was published, any size while present counts — the analyser only measures one
+ * over windows that reached its own level.
+ */
+function reachedLevel(peak, thresholdDps) {
+  const size = peak?.attentionWindowBandRmsDps;
+  return Number.isFinite(size) && (!Number.isFinite(thresholdDps) || size >= thresholdDps);
+}
+
+/**
+ * The frequency a peak is judged at — interpolated between the bins where the
+ * analyser published it, the bin's own otherwise — and how far that is from the
+ * order it was matched to, against the tolerance the logged head speed supports:
+ * half its p5-p95 spread at that order, plus half an analysis bin. Null where
+ * any of those was not published. Exported so the finding layer words a tone by
+ * the same measurement the gate judged it on.
+ */
+export function rotorOrderMatchDistance(peak) {
+  const match = peak?.harmonicMatch;
+  const frequencyHz = Number.isFinite(peak?.interpolatedFrequencyHz)
+    ? peak.interpolatedFrequencyHz : peak?.frequencyHz;
+  if (!match || !Number.isFinite(frequencyHz) || !Number.isFinite(match.predictedHz)
+      || !Number.isFinite(match.spreadHz) || !Number.isFinite(match.frequencyResolutionHz)) {
+    return null;
+  }
+  return {
+    offsetHz: Math.abs(frequencyHz - match.predictedHz),
+    toleranceHz: match.spreadHz + match.frequencyResolutionHz / 2
+  };
+}
+
+/**
+ * Stage 2d: whether a peak named a rotor order IS that order, as far as the log
+ * can say. The measured head-speed spread is how far the order itself can sit
+ * from its median over the range; half a bin is how far a frequency read off
+ * the spectrum can sit from the tone. Measured 3 October 2026 over the 53
+ * attention-level main 1/rev and 2/rev peaks of the 43 flight windows in the
+ * private corpus: tolerances of 1.08-3.69 Hz, and the furthest peak 0.17 Hz from
+ * its order, 11% of its own tolerance; the rule passed the same 29 windows
+ * before and after. A peak further out matches no order the logged head speed
+ * explains, and is not established as the rotor's own.
+ */
+export function rotorOrderMatchEstablished(peak) {
+  const distance = rotorOrderMatchDistance(peak);
+  return distance !== null && distance.offsetHz <= distance.toleranceHz;
 }
 
 /** Both sizes the rule reads: the flight average, and the size while present. */
@@ -419,11 +524,21 @@ function measuredRotorTone(entry, peak) {
     // The share of the analysed windows it was above the level in.
     aboveLevelShare: Number.isFinite(peak.attentionPersistenceRatio)
       ? peak.attentionPersistenceRatio : null,
+    // True when no analysis window held the tone whole, so its size while
+    // present is a lower bound on it.
+    sizeIsLowerBound: peak.attentionWindowSizeIsLowerBound === true,
+    // Whether the analyser judged it attention-eligible, or it was above the level
+    // for only part of the range.
+    attentionEligible: peak.attentionEligible === true,
     // The head speed this tone was matched against: the predicted frequency is
     // the logged fundamental times the order, so this is that rotor speed back
     // again, not a second measurement.
     headspeedRpm: Number.isFinite(match.predictedHz)
       ? Math.round((match.predictedHz / match.order) * 60) : null,
+    // How far it sits from that order, and how far the logged head speed lets it
+    // (see `rotorOrderMatchDistance`); null where either was not published.
+    matchOffsetHz: rotorOrderMatchDistance(peak)?.offsetHz ?? null,
+    matchToleranceHz: rotorOrderMatchDistance(peak)?.toleranceHz ?? null,
     chunkRangeUs: Array.isArray(peak.chunkRangeUs) ? [...peak.chunkRangeUs] : null
   };
 }
@@ -512,10 +627,103 @@ function rotorOrderRuleRefusal(mechanical, axes, ceilingDps) {
   if (attentionPeaks === 0) {
     return 'NO_ATTENTION_PEAK';
   }
+  // Every one is NAMED a main-rotor 1/rev or 2/rev. Each must also sit where the
+  // logged head speed puts that order (Stage 2d), or it is not established as
+  // the rotor's own, and keeps blocking like any other tone.
+  if (axes.some(entry => (entry.peaks ?? []).some(peak =>
+    peak?.attentionEligible === true && !rotorOrderMatchEstablished(peak)))) {
+    return 'ROTOR_ORDER_MATCH_NOT_ESTABLISHED';
+  }
   if (ceilingDps === null) {
     return 'ATTENTION_THRESHOLD_UNKNOWN';
   }
   return null;
+}
+
+/**
+ * Every tone that was above the attention level for only PART of the range.
+ *
+ * Stage 2d, review of 3 October 2026 — pre-existing on main. The analyser calls
+ * a tone attention-eligible only when it is above the level in a quarter of the
+ * analysis windows, across half the range, in three of its four quarters, with
+ * no long gap. A tone that reaches the level in fewer, or bunched together, is
+ * not, and if nothing else is the result reads "clear" — so this gate passed it
+ * as a positive measurement of absence, and the airframe card listed it "below
+ * the attention level" under "quiet enough", while its size while present
+ * (`attentionWindowBandRmsDps`) was three to six times the level.
+ *
+ * Such a tone is a measurement, not an absence. Up to the ceiling — three times
+ * the level, the same backstop a persistent main-rotor tone is held to — it is
+ * reported (`blocks: null`) and is not on its own a reason to withhold a gain:
+ * the analyser's own persistence rules are what keep one bump from stopping a
+ * tune, and they are not overruled here. It is never an all-clear. Past the
+ * ceiling it blocks: a main-rotor 1/rev or 2/rev the ceiling can judge as the
+ * rotor's own large tone (`rotorOrderToneAssessment` names it), anything else as
+ * measured vibration nothing explains. Where no level was published nothing can
+ * be judged against one, and every such tone blocks as unexplained.
+ *
+ * Measured 3 October 2026 over the 43 flight windows of the private corpus: 41
+ * such tones on 26 windows, at 1.0-2.1 times the level while present (36 of
+ * them under twice it), above it in 1-32% of the windows (median 6%); none past
+ * the ceiling, so on that corpus it puts the not-ruled-out card on 21 of the 30
+ * windows the airframe rung lets through, and blocks none of them.
+ *
+ * Measurement only: it says what was seen and how large, never what to do.
+ */
+export function tonesAboveLevelInPart(mechanical) {
+  if (!mechanical || typeof mechanical !== 'object') {
+    return frozen({tones: frozen([]), ceilingDps: null});
+  }
+  const thresholdDps = mechanical.attentionThreshold?.bandRmsDps;
+  const ceilingDps = ceilingOf(thresholdDps);
+  const tones = [];
+  for (const entry of Array.isArray(mechanical.axes) ? mechanical.axes : []) {
+    for (const peak of entry?.peaks ?? []) {
+      if (peak?.attentionEligible === true || !reachedLevel(peak, thresholdDps)) {
+        continue;
+      }
+      const match = peak.harmonicMatch ?? null;
+      const size = peak.attentionWindowBandRmsDps;
+      const blocks = toneAboveLevelInPartBlocks(entry, peak, thresholdDps);
+      tones.push(frozen({
+        axis: entry.axis ?? null,
+        frequencyHz: Number.isFinite(peak.frequencyHz) ? peak.frequencyHz : null,
+        rotor: match?.rotor ?? null,
+        order: match?.order ?? null,
+        // Its average over every analysed window of the range, or of its stretch.
+        bandRmsDps: Number.isFinite(peak.bandRmsDps) ? peak.bandRmsDps : null,
+        // Its size while present, and the share of the windows it was above the
+        // level in.
+        aboveLevelBandRmsDps: size,
+        aboveLevelShare: Number.isFinite(peak.attentionPersistenceRatio)
+          ? peak.attentionPersistenceRatio : null,
+        sizeIsLowerBound: peak.attentionWindowSizeIsLowerBound === true,
+        chunkRangeUs: Array.isArray(peak.chunkRangeUs) ? frozen([...peak.chunkRangeUs]) : null,
+        pastCeiling: blocks !== null,
+        blocks
+      }));
+    }
+  }
+  return frozen({tones: frozen(tones), ceilingDps});
+}
+
+/**
+ * What one peak above the level for only part of the range does to the gate:
+ * null up to the ceiling; past it, `MAIN_ROTOR_ORDER_TONE_LARGE` where the
+ * ceiling judges it as the main rotor's own 1/rev or 2/rev, and
+ * `MECHANICAL_EVIDENCE_GATE_BLOCKED` for anything else — or for anything at all
+ * where no level was published to judge it against. Exported so the finding
+ * layer says of each tone exactly what the gate did with it.
+ */
+export function toneAboveLevelInPartBlocks(entry, peak, thresholdDps) {
+  const ceilingDps = ceilingOf(thresholdDps);
+  const size = peak?.attentionWindowBandRmsDps;
+  if (ceilingDps !== null && Number.isFinite(size) && size <= ceilingDps) {
+    return null;
+  }
+  // The rotor's own large tone only where the ceiling judges it as one.
+  return ceilingDps !== null && judgedAsRotorOrderTone(entry, peak)
+    ? 'MAIN_ROTOR_ORDER_TONE_LARGE' : 'MECHANICAL_EVIDENCE_GATE_BLOCKED';
 }
 
 /**
@@ -566,6 +774,11 @@ function rotorOrderRuleRefusal(mechanical, axes, ceilingDps) {
  * them and not others blocks as `ROTOR_CORRELATION_PARTIAL`, not as "never
  * compared": the stretches that were compared were genuinely compared.
  *
+ * A TONE ABOVE THE LEVEL FOR ONLY PART OF THE RANGE (Stage 2d) is read on every
+ * result, "clear" ones included: past the ceiling it blocks, and up to it it is
+ * raised as `TONE_ABOVE_ATTENTION_LEVEL_IN_PART`, an observation that is never an
+ * all-clear. See `tonesAboveLevelInPart`.
+ *
  * @param {object} mechanical a result from `analyzeMechanicalSpectrum`,
  *   `analyzeMechanicalTimeSeries` or `analyzeMechanicalWindow`
  * @param {object} [options] `{eventTimesUs, holdTimesUs}` — the stop and hold
@@ -588,8 +801,13 @@ export function evaluateAirframeGate(mechanical, options = {}) {
   }
 
   const upstream = mechanical.tuningEvidenceGate?.status ?? null;
-  const rotorOrder = upstream === 'permitted' ? null : rotorOrderToneAssessment(mechanical);
-  if (upstream !== 'permitted') {
+  // Asked whatever the upstream gate says (Stage 2d): a once- or twice-per-rev
+  // above the level for part of the range is past the ceiling or not on a result
+  // that reads "clear" as much as on one that reads "attention".
+  const rotorOrder = rotorOrderToneAssessment(mechanical);
+  const asked = upstream !== 'permitted' || rotorOrder.large;
+  const inPart = tonesAboveLevelInPart(mechanical);
+  if (asked) {
     if (rotorOrder.only) {
       // Measured, reported, and not a reason on its own to withhold a gain.
       // The tone-coincidence rule downstream still refuses any gain whose
@@ -610,6 +828,18 @@ export function evaluateAirframeGate(mechanical, options = {}) {
           : 'MECHANICAL_EVIDENCE_NOT_MEASURED');
       }
     }
+  }
+  // A tone above the level for only part of the range (Stage 2d). Past the
+  // ceiling, anything but the main rotor's own 1/rev or 2/rev — which the
+  // rotor-order assessment above names as large — is measured vibration nothing
+  // explains, and blocks as that. Up to it, it is reported: not a blocker on its
+  // own, and never an all-clear.
+  if (inPart.tones.some(tone => tone.blocks === 'MECHANICAL_EVIDENCE_GATE_BLOCKED')
+      && !codes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED')) {
+    codes.push('MECHANICAL_EVIDENCE_GATE_BLOCKED');
+  }
+  if (inPart.tones.some(tone => tone.blocks === null)) {
+    observations.push('TONE_ABOVE_ATTENTION_LEVEL_IN_PART');
   }
 
   const correlation = mechanical.harmonicCorrelation?.state ?? null;
@@ -670,12 +900,19 @@ export function evaluateAirframeGate(mechanical, options = {}) {
       reasonCodes: frozen([...(mechanical.reasonCodes ?? [])]),
       rotorOrderTonesOnly: rotorOrder?.only === true,
       rotorOrderTones: rotorOrder?.only === true ? rotorOrder.tones : frozen([]),
-      // Main-rotor 1/rev and 2/rev only, but past the severity ceiling.
+      // Main-rotor 1/rev and 2/rev past the severity ceiling: above the level for
+      // the whole range or for part of it.
       rotorOrderTonesLarge: rotorOrder?.large === true ? rotorOrder.tones : frozen([]),
       rotorOrderToneCeilingDps: rotorOrder?.ceilingDps ?? null,
       // Why the rotor-order rule did not apply, when it was asked and did not;
       // null when it applied, or when there was nothing to ask it about.
-      rotorOrderRefusal: rotorOrder?.refusal ?? null,
+      rotorOrderRefusal: asked ? rotorOrder.refusal : null,
+      // Every tone above the level for only part of the range, whatever it is,
+      // with its size while present and whether that is past the ceiling — the
+      // measurement the airframe card states instead of an all-clear.
+      tonesAboveLevelInPart: inPart.tones,
+      // The ceiling any tone is judged against: three times the published level.
+      toneCeilingDps: inPart.ceilingDps,
       // How many stretches of a window were compared against the rotor, of how
       // many; null on a window analysed whole.
       rotorComparedStretchCount: Array.isArray(mechanical.chunks)

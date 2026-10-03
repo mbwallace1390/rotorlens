@@ -34,7 +34,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
-import {mkdtemp, rm} from 'node:fs/promises';
+import {mkdtemp, readFile, rm} from 'node:fs/promises';
 import {existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
@@ -2698,6 +2698,146 @@ test('a flight saved twice reads as one flight saved twice, and Forget takes eve
     assert.equal(run.offersSave, true, 'Save did not come back after Forget');
     assert.equal(run.after.beforeId, run.before.beforeId,
       'forgetting the open flight moved its baseline');
+    assert.deepEqual(pageErrors, []);
+  });
+
+  // The before/after panel's Forget on a REOPENED flight that sits in the MIDDLE
+  // of the history. Kept as [F0, Fc, F2], the open flight is Fc and compares
+  // against F0, the flight it followed. Once Fc is forgotten it is a new flight
+  // again, and a new flight follows the newest one kept — F2. A handler that only
+  // cleared the stored id when it matched went on comparing against F0, a flight
+  // the open one no longer follows, which no other case here could tell apart:
+  // in each of them the baseline either vanished or stayed correct.
+  let middle = createHistory();
+  for (const entry of [flights[0], {yawI: 140, seconds: 123}, flights[1]]) {
+    middle = addFlightRecord(middle, flight(entry));
+  }
+  const middleScript = startupScript.replace(JSON.stringify(exportHistory(history)),
+    JSON.stringify(exportHistory(middle)));
+  assert.notEqual(middleScript, startupScript, 'the middle-flight history was not seeded');
+  await withViewer({startupScript: middleScript}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      ${candidateScript}
+      const {selectBaseline} = await import('/src/analysis/flight-history.mjs');
+      const before = look();
+      // The button the panel itself drew, so the delegated handler on #since is
+      // what runs, bound to whatever id the panel bound it to.
+      const forget = document.querySelector('#since [data-forget-flight]');
+      forget?.click();
+      await sleep(150);
+      const after = look();
+      const expected = selectBaseline(state.history, state.candidate);
+      return JSON.stringify({
+        before, after, pressed: forget !== null,
+        expectedBeforeId: expected.baseline?.recordId ?? null,
+        expectedStoredAs: expected.storedAs,
+        offersSave: document.getElementById('since-save') !== null
+      });
+    })()`);
+
+    // Setup guards: the open flight is recognised as the MIDDLE stored flight,
+    // not freshly saved, and compared against the flight before it.
+    assert.deepEqual(run.before.ids, ['test::board#0', 'test::board#1', 'test::board#2'],
+      'the seeded history must hold three flights');
+    assert.equal(run.before.storedAs, 'test::board#1',
+      `the reopened flight was not recognised as the middle one: ${JSON.stringify(run.before)}`);
+    assert.equal(run.before.beforeId, 'test::board#0',
+      'a reopened middle flight must compare against the flight it followed');
+    assert.equal(run.pressed, true, 'the before/after panel offered no Forget for a kept flight');
+
+    assert.deepEqual(run.after.ids, ['test::board#0', 'test::board#2'],
+      'Forget did not remove exactly the open flight');
+    assert.equal(run.after.storedAs, null,
+      'the open flight still reads as stored after it was forgotten');
+    assert.equal(run.offersSave, true, 'Save did not come back after Forget');
+    assert.equal(run.expectedBeforeId, 'test::board#2',
+      'selectBaseline must make the newest flight kept the baseline of a new flight');
+    assert.equal(run.after.beforeId, run.expectedBeforeId,
+      `after Forget the before/after compares against ${run.after.beforeId}, but on the `
+      + `history as it now stands the baseline is ${run.expectedBeforeId}`);
+    assert.equal(run.after.storedAs, run.expectedStoredAs);
+    assert.deepEqual(pageErrors, []);
+  });
+});
+
+test('the plain copy added on 3 October renders as a sentence, never a code', {
+  skip: browserSkip
+}, async () => {
+  // Three branches of the app's plain-English copy, added by the 3 October
+  // review fix, that no other browser test renders: the head speed that moved
+  // only where another axis still measured a hold, the I term not judged because
+  // the holds changed side, and an axis that did not arrest whose commanded rate
+  // was never measured. A branch that is deleted or renamed falls back to the
+  // engine's headline, or to another branch's words, and nothing would notice.
+  //
+  // Each case is the card the engine builds for that branch: the id and the code
+  // that selects the branch are read back out of the engine's source here, so a
+  // rename on either side fails this rather than leaving it rendering a shape
+  // the engine no longer emits.
+  const engine = await readFile(
+    new URL('../src/analysis/recommendations.mjs', import.meta.url), 'utf8');
+  const cases = [
+    {id: 'HEADSPEED_MOVED_WHERE_A_HOLD_WAS_STILL_MEASURED', axes: [null], rung: 'headspeed',
+      kind: 'observation',
+      codes: ['HEADSPEED_MOVED_ONLY_WHERE_A_HOLD_WAS_MEASURED'],
+      words: /each of those stretches still gave a usable hold.*nothing was lost/},
+    {id: 'I_TERM_NOT_JUDGED', axes: ['roll', 'pitch', 'yaw'], rung: 'gain-I',
+      kind: 'next-flight',
+      codes: ['STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS'],
+      words: /on one side in some holds and on the other side in others.*could not be read as that.*not an all-clear/},
+    {id: 'AXIS_DOES_NOT_ARREST', axes: ['roll', 'pitch', 'yaw'], rung: 'gain-P',
+      kind: 'next-flight',
+      codes: ['RESIDUAL_RATE_IN_COMMAND_DIRECTION', 'COMMANDED_RATE_NOT_MEASURED'],
+      words: /rate you asked for could not be measured.*Nothing to change yet/}
+  ];
+  for (const {id, codes} of cases) {
+    assert.ok(engine.includes(`id: '${id}'`), `the engine no longer builds ${id}`);
+    for (const code of codes) {
+      assert.ok(engine.includes(`'${code}'`), `the engine no longer emits ${code}`);
+    }
+  }
+
+  await withViewer({}, async ({evaluate, pageErrors}) => {
+    const rendered = await evaluate(`(async () => {
+      const app = await import('/ui/app.mjs');
+      const box = document.createElement('div');
+      document.body.appendChild(box);
+      const flat = text => text.replace(/\\s+/g, ' ').trim();
+      const out = [];
+      for (const entry of ${JSON.stringify(cases.map(({words, ...rest}) => rest))}) {
+        for (const axis of entry.axes) {
+          box.innerHTML = app.findingHtml({
+            id: entry.id, rung: entry.rung, rungOrder: 1, axis, kind: entry.kind,
+            adjust: null, direction: null, confidence: 'low',
+            headline: 'the engine headline stands here', reasoning: 'because',
+            basis: [], confirm: null, candidates: [], codes: entry.codes,
+            actNow: false, sequence: 0
+          });
+          const plain = box.querySelector('p.plain');
+          out.push({id: entry.id, axis, plain: plain ? flat(plain.textContent) : null});
+        }
+      }
+      box.remove();
+      return JSON.stringify(out);
+    })()`);
+
+    assert.equal(rendered.length, 7, 'every branch must be rendered on every axis it carries');
+    const thing = {roll: 'roll', pitch: 'pitch', yaw: 'tail'};
+    for (const {id, axis, plain} of rendered) {
+      const label = `${id} on ${axis ?? 'no axis'}`;
+      assert.ok(plain, `${label}: no plain sentence was drawn`);
+      assert.notEqual(plain, 'the engine headline stands here',
+        `${label}: fell back to the engine's headline; the plain copy is missing`);
+      assert.match(plain, cases.find(entry => entry.id === id).words,
+        `${label}: rendered another branch's words: ${plain}`);
+      assert.doesNotMatch(plain, /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/,
+        `${label}: an engine code reached the pilot: ${plain}`);
+      assert.doesNotMatch(plain, /\b(?:null|undefined|NaN)\b/, `${label}: ${plain}`);
+      if (axis !== null) {
+        assert.match(plain, new RegExp(`\\b${thing[axis]}\\b`),
+          `${label}: the sentence does not name the ${thing[axis]}: ${plain}`);
+      }
+    }
     assert.deepEqual(pageErrors, []);
   });
 });

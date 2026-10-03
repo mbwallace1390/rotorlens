@@ -547,10 +547,16 @@ function rotorOrderOnlyStub(overrides = {}) {
   // A tone above the level in every window: its size while present IS its
   // flight average. The rule judges the ceiling on the size while present, so a
   // peak without one is the unknown case and is refused.
+  //
+  // Stage 2d: the match carries the head speed's spread at that order and the
+  // analysis resolution, which identity is judged from (a 0.01 relative spread of
+  // a 1800 rpm head is 0.15 Hz either side of the once-per-rev). A match without
+  // them cannot be judged the rotor's own, and is refused.
   const peak = (frequencyHz, order, bandRmsDps) => ({
     frequencyHz, bandRmsDps, attentionWindowBandRmsDps: bandRmsDps, attentionPersistenceRatio: 1,
     bandwidthHz: 2, persistenceRatio: 1, attentionEligible: true,
-    harmonicMatch: {rotor: 'main', order, predictedHz: 30 * order, deltaHz: 0.7, toleranceHz: 2.9}
+    harmonicMatch: {rotor: 'main', order, predictedHz: 30 * order, deltaHz: 0.7, toleranceHz: 2.9,
+      spreadHz: 0.15 * order, frequencyResolutionHz: 1.953}
   });
   return mechanicalStub({
     status: 'attention',
@@ -1030,7 +1036,8 @@ test('the same tone measured in two stretches is one tone, at its worst', () => 
   const peak = (bandRmsDps, chunkRangeUs) => ({
     frequencyHz: 29.3, bandRmsDps, attentionWindowBandRmsDps: bandRmsDps,
     attentionPersistenceRatio: 1, bandwidthHz: 2, persistenceRatio: 1, attentionEligible: true,
-    harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.7, toleranceHz: 2.9},
+    harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.7, toleranceHz: 2.9,
+      spreadHz: 0.15, frequencyResolutionHz: 1.953},
     chunkRangeUs
   });
   const first = [0, 150_000_000];
@@ -1053,6 +1060,323 @@ test('the same tone measured in two stretches is one tone, at its worst', () => 
   assert.deepEqual(tones[0].chunkRangesUs.map(range => [...range]), [first, second],
     'and every stretch it was measured in');
 });
+
+/* ---------------------------------------------------------------------------
+ * Stage 2d, airframe review of 3 October 2026.
+ * ------------------------------------------------------------------------- */
+
+test('a tone\'s worst stretch is the one it was largest in while present, not the one with the '
+  + 'larger average', () => {
+    // Stage 2d, item 6 (case W). The ceiling is judged on the size while present,
+    // and so is which stretch a tone measured twice is worst in. Picked by the
+    // average instead, a once-per-rev steady at 21 deg/s in one stretch and at
+    // 31 deg/s for a third of the next — 17 deg/s averaged over it — read 21,
+    // under the ceiling, and the flight was passed.
+    const first = [0, 150_000_000];
+    const second = [150_000_000, 300_000_000];
+    for (const [steady, loud, average] of [[21.1, 30.7, 16.7], [22.1, 32.6, 19.4], [19.2, 26.8, 17.2]]) {
+      const peak = (bandRmsDps, whilePresent, share, chunkRangeUs) => ({
+        frequencyHz: 29.3, bandRmsDps, attentionWindowBandRmsDps: whilePresent,
+        attentionPersistenceRatio: share, bandwidthHz: 2, persistenceRatio: share,
+        attentionEligible: true, chunkRangeUs,
+        harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.7, toleranceHz: 2.9,
+          spreadHz: 0.15, frequencyResolutionHz: 1.953}
+      });
+      const gate = evaluateAirframeGate(rotorOrderOnlyStub({
+        range: {startTimeUs: 0, endTimeUs: 300_000_000},
+        chunks: [{status: 'attention', startTimeUs: 0, endTimeUs: 150_000_000},
+          {status: 'attention', startTimeUs: 150_000_000, endTimeUs: 300_000_000}],
+        axes: ['roll', 'pitch', 'yaw'].map(axis => ({
+          axis, source: 'gyroRAW', available: true, attentionEligibleUnlistedCount: 0,
+          peaks: axis === 'roll'
+            ? [peak(steady, steady, 1, first), peak(average, loud, 0.35, second)] : []
+        }))
+      }));
+      const label = `steady ${steady} in the first stretch, ${loud} while present (${average} `
+        + `averaged) in the second`;
+      // The fixture is the case: the averages order the stretches one way, the
+      // sizes while present the other.
+      assert.ok(steady > average && loud > steady, label);
+      assert.equal(gate.status, 'blocked', `${label}: ${gate.codes}`);
+      assert.deepEqual([...gate.codes], ['MAIN_ROTOR_ORDER_TONE_LARGE'], label);
+      const [tone] = gate.measured.rotorOrderTonesLarge;
+      assert.equal(tone.aboveLevelBandRmsDps, loud, label);
+      assert.equal(tone.bandRmsDps, average, `${label}: the worst stretch's own average beside it`);
+      assert.deepEqual([...tone.chunkRangeUs], second, label);
+    }
+  });
+
+/**
+ * One tone on roll that was above the attention level in part of the range and
+ * is not attention-eligible, the way the analyser lists one, over a clear result.
+ */
+function aboveLevelInPartStub({whilePresent, share = 0.22, match, frequencyHz = 29.3,
+  status = 'clear', ...overrides}) {
+  return mechanicalStub({
+    status,
+    reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY_BELOW_ATTENTION_THRESHOLD'],
+    axes: ['roll', 'pitch', 'yaw'].map(axis => ({
+      axis, source: 'gyroRAW', available: true, attentionEligibleUnlistedCount: 0,
+      peaks: axis !== 'roll' ? [] : [{
+        frequencyHz, bandRmsDps: whilePresent === null ? 5.1 : whilePresent * Math.sqrt(share),
+        attentionWindowBandRmsDps: whilePresent, attentionPersistenceRatio: whilePresent === null ? 0 : share,
+        attentionWindowSizeIsLowerBound: false, bandwidthHz: 2, persistenceRatio: share + 0.05,
+        attentionEligible: false, harmonicMatch: match
+      }]
+    })),
+    ...overrides
+  });
+}
+
+const MATCHES = Object.freeze({
+  'main 1/rev': {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.7, toleranceHz: 2.9,
+    spreadHz: 0.15, frequencyResolutionHz: 1.953},
+  'main 2/rev': {rotor: 'main', order: 2, predictedHz: 60, deltaHz: 0.55, toleranceHz: 2.9,
+    spreadHz: 0.3, frequencyResolutionHz: 1.953},
+  'no rotor order': null,
+  'the tail rotor': {rotor: 'tail', order: 1, predictedHz: 29, deltaHz: 0.3, toleranceHz: 2.9,
+    spreadHz: 0.1, frequencyResolutionHz: 1.953},
+  'main order 3': {rotor: 'main', order: 3, predictedHz: 90, deltaHz: 0.5, toleranceHz: 2.9,
+    spreadHz: 0.45, frequencyResolutionHz: 1.953}
+});
+
+test('a tone above the attention level for only part of the range is never an all-clear, and '
+  + 'blocks past the ceiling', () => {
+    // Stage 2d, item 1 (pre-existing on main). A tone that reached the level in
+    // some windows but not enough of them, or not spread across enough of the
+    // flight, is not attention-eligible, and the result reads "clear" — so the
+    // gate passed it as a positive measurement of absence, over a tone measured
+    // at three to six times the level while it was there.
+    const events = symmetricEvents();
+    for (const [name, match] of Object.entries(MATCHES)) {
+      for (const whilePresent of [8, 15.5, 24, 24.01, 31, 48]) {
+        // On the frequency its match names, 0.7 Hz off it: within what the head
+        // speed allows, so a main 1/rev or 2/rev here IS the rotor's (item 3).
+        const stub = aboveLevelInPartStub({whilePresent, match,
+          frequencyHz: match ? match.predictedHz - 0.7 : 29.3});
+        const gate = evaluateAirframeGate(stub);
+        const label = `${name} at ${whilePresent} deg/s while present: [${gate.codes}] `
+          + `${JSON.stringify(gate.observations)}`;
+        const [tone, ...more] = gate.measured.tonesAboveLevelInPart;
+        assert.equal(more.length, 0, label);
+        assert.equal(tone.aboveLevelBandRmsDps, whilePresent, label);
+        assert.equal(tone.aboveLevelShare, 0.22, label);
+        assert.equal(tone.axis, 'roll', label);
+        const verdict = evaluateGainRecommendationGates({
+          axis: 'yaw', metric: 'trackingRmsDps', mechanical: stub,
+          capture: captureFor(events), evidence: evidenceFor(events), events, sweep: unanimousSweep()
+        });
+        if (whilePresent <= 24) {
+          // Up to the ceiling: not a blocker, and not an all-clear either — the
+          // observation is what the airframe card is built from.
+          assert.equal(gate.status, 'permitted', label);
+          assert.ok(gate.observations.includes('TONE_ABOVE_ATTENTION_LEVEL_IN_PART'), label);
+          assert.equal(tone.pastCeiling, false, label);
+          assert.equal(verdict.mayRecommend, true, `${label}: ${verdict.blockedBy}`);
+          continue;
+        }
+        assert.equal(gate.status, 'blocked', label);
+        assert.equal(tone.pastCeiling, true, label);
+        assert.equal(verdict.mayRecommend, false, label);
+        assert.ok(!gate.observations.includes('TONE_ABOVE_ATTENTION_LEVEL_IN_PART'), label);
+        if (name === 'main 1/rev' || name === 'main 2/rev') {
+          // The rotor's own tone, past the ceiling: named as large, as a steady one is.
+          assert.deepEqual([...gate.codes], ['MAIN_ROTOR_ORDER_TONE_LARGE'], label);
+          assert.ok(gate.measured.rotorOrderTonesLarge.some(entry =>
+            entry.aboveLevelBandRmsDps === whilePresent && entry.order === match.order), label);
+        } else {
+          // Anything else past it is vibration nothing explains.
+          assert.deepEqual([...gate.codes], ['MECHANICAL_EVIDENCE_GATE_BLOCKED'], label);
+          assert.deepEqual([...gate.measured.rotorOrderTonesLarge], [], label);
+        }
+      }
+    }
+
+    // The control: the same peak, never above the level in any window, is the
+    // all-clear it always was.
+    const quiet = evaluateAirframeGate(aboveLevelInPartStub({whilePresent: null,
+      match: MATCHES['main 1/rev']}));
+    assert.equal(quiet.status, 'permitted');
+    assert.deepEqual([...quiet.observations], []);
+    assert.deepEqual([...quiet.measured.tonesAboveLevelInPart], []);
+
+    // Beside persistent rotor-order tones the rule still applies to those, and the
+    // tone above the level in part is reported beside them, or blocks past the
+    // ceiling, whatever it is.
+    for (const [whilePresent, blocked] of [[18, false], [30, true]]) {
+      const stub = withAxis(rotorOrderOnlyStub(), 'yaw', entry => ({...entry, peaks: [
+        entry.peaks[0], {frequencyHz: 47, bandRmsDps: whilePresent / 2,
+          attentionWindowBandRmsDps: whilePresent, attentionPersistenceRatio: 0.25,
+          bandwidthHz: 2, persistenceRatio: 0.3, attentionEligible: false, harmonicMatch: null}]}));
+      const gate = evaluateAirframeGate(stub);
+      const label = `47 Hz at ${whilePresent} beside rotor-order tones: [${gate.codes}]`;
+      assert.equal(gate.measured.rotorOrderTonesOnly, true, label);
+      assert.equal(gate.status, blocked ? 'blocked' : 'permitted', label);
+      if (blocked) {
+        assert.deepEqual([...gate.codes], ['MECHANICAL_EVIDENCE_GATE_BLOCKED'], label);
+      } else {
+        assert.ok(gate.observations.includes('TONE_ABOVE_ATTENTION_LEVEL_IN_PART')
+          && gate.observations.includes('MAIN_ROTOR_ORDER_TONE_ABOVE_EXPERIMENTAL_THRESHOLD'), label);
+      }
+    }
+
+    // Without a published level nothing can be judged against one: it blocks.
+    const unknown = evaluateAirframeGate(aboveLevelInPartStub({whilePresent: 15.5,
+      match: MATCHES['main 1/rev'], attentionThreshold: undefined}));
+    assert.equal(unknown.status, 'blocked', `${unknown.codes}`);
+  });
+
+test('a tone is the main rotor\'s own only where the logged head speed puts it', async () => {
+  // Stage 2d, item 2. The analyser names a peak a rotor order within the wider
+  // of a bin and a half, 2.5% and the head speed's spread — about 2.9 Hz at a
+  // 2 Hz resolution — and the rotor-order rule took that naming as identity, so a
+  // tone 5-8% off the once-per-rev, with the head speed logged steady, was let
+  // through as the rotor's own. Identity now needs the peak's interpolated
+  // frequency within the head speed's own spread at that order plus half a bin.
+  const withMatch = (offsetHz, order, spreadHz, interpolated = true) => withAxis(
+    rotorOrderOnlyStub(), 'roll', entry => ({...entry, peaks: [{
+      ...entry.peaks[0], frequencyHz: 30 * order + Math.round(offsetHz / 1.953) * 1.953,
+      ...(interpolated ? {interpolatedFrequencyHz: 30 * order + offsetHz} : {}),
+      harmonicMatch: {...entry.peaks[0].harmonicMatch, order, predictedHz: 30 * order,
+        spreadHz, frequencyResolutionHz: 1.953}
+    }, entry.peaks[1]]}));
+  for (const order of [1, 2]) {
+    for (const spreadHz of [0.03, 0.15, 0.6]) {
+      const toleranceHz = spreadHz + 1.953 / 2;
+      for (const share of [0, 0.5, 0.95, 1.05, 1.5, 2.5]) {
+        for (const sign of [1, -1]) {
+          const offsetHz = sign * share * toleranceHz;
+          const gate = evaluateAirframeGate(withMatch(offsetHz, order, spreadHz));
+          const label = `order ${order}, ${offsetHz.toFixed(2)} Hz off with a ${spreadHz} Hz spread: `
+            + `[${gate.codes}] ${gate.measured.rotorOrderRefusal}`;
+          if (share <= 1) {
+            assert.equal(gate.status, 'permitted', label);
+            assert.equal(gate.measured.rotorOrderTonesOnly, true, label);
+          } else {
+            assert.equal(gate.status, 'blocked', label);
+            assert.equal(gate.measured.rotorOrderRefusal, 'ROTOR_ORDER_MATCH_NOT_ESTABLISHED', label);
+          }
+        }
+      }
+    }
+  }
+  // Without the interpolated frequency the bin's own frequency is judged; without
+  // the spread or the resolution the identity cannot be judged at all.
+  assert.equal(evaluateAirframeGate(withMatch(0.5, 1, 0.15, false)).status, 'permitted');
+  for (const missing of ['spreadHz', 'frequencyResolutionHz', 'predictedHz']) {
+    const stub = withAxis(rotorOrderOnlyStub(), 'roll', entry => {
+      const {[missing]: omitted, ...match} = entry.peaks[0].harmonicMatch;
+      return {...entry, peaks: [{...entry.peaks[0], harmonicMatch: match}, entry.peaks[1]]};
+    });
+    const gate = evaluateAirframeGate(stub);
+    assert.equal(gate.measured.rotorOrderRefusal, 'ROTOR_ORDER_MATCH_NOT_ESTABLISHED', missing);
+  }
+
+  // Stage 2d follow-up, item 3: identity is required past the CEILING too. A tone
+  // the analyser named the once- or twice-per-rev but that sits outside what the
+  // head speed allows was judged the rotor's own large tone there — "track and
+  // balance the blades" — while the exemption said it was not established. Past
+  // the ceiling it blocks as vibration not established as the rotor's, steady or
+  // above the level for only part of the range; on the order it is still large.
+  for (const order of [1, 2]) {
+    const toleranceHz = 0.15 * order + 1.953 / 2;
+    for (const [offsetHz, established] of [[1.5 * toleranceHz, false], [0.5 * toleranceHz, true]]) {
+      const predictedHz = 30 * order;
+      const match = {...MATCHES[`main ${order}/rev`], predictedHz, spreadHz: 0.15 * order};
+      const steady = withAxis(rotorOrderOnlyStub(), 'roll', entry => ({...entry, peaks: [{
+        ...entry.peaks[0], frequencyHz: predictedHz + offsetHz, interpolatedFrequencyHz: predictedHz + offsetHz,
+        bandRmsDps: 32, attentionWindowBandRmsDps: 32, harmonicMatch: match}, entry.peaks[1]]}));
+      const inPart = aboveLevelInPartStub({whilePresent: 32, match,
+        frequencyHz: predictedHz + offsetHz});
+      for (const [shape, stub] of [['steady', steady], ['in part', inPart]]) {
+        const gate = evaluateAirframeGate(stub);
+        const label = `order ${order}, ${offsetHz.toFixed(2)} Hz off (tolerance ${toleranceHz.toFixed(2)}), `
+          + `${shape}, at 4x: [${gate.codes}] ${gate.measured.rotorOrderRefusal}`;
+        assert.equal(gate.status, 'blocked', label);
+        if (established) {
+          assert.equal(gate.codes[0], 'MAIN_ROTOR_ORDER_TONE_LARGE', label);
+          assert.ok(gate.measured.rotorOrderTonesLarge.some(tone => tone.aboveLevelBandRmsDps === 32), label);
+          continue;
+        }
+        assert.ok(!gate.codes.includes('MAIN_ROTOR_ORDER_TONE_LARGE'), label);
+        assert.deepEqual([...gate.measured.rotorOrderTonesLarge], [], label);
+        assert.deepEqual([...gate.codes], ['MECHANICAL_EVIDENCE_GATE_BLOCKED'], label);
+        if (shape === 'steady') {
+          assert.equal(gate.measured.rotorOrderRefusal, 'ROTOR_ORDER_MATCH_NOT_ESTABLISHED', label);
+        } else {
+          const [tone] = gate.measured.tonesAboveLevelInPart;
+          assert.equal(tone.blocks, 'MECHANICAL_EVIDENCE_GATE_BLOCKED', label);
+        }
+      }
+    }
+  }
+
+  // Through the real analyser, the reviewer's case: a lone tone 1.5-4 Hz off the
+  // once- or twice-per-rev of a head logged steady at 1800 rpm is never let
+  // through as the rotor's own...
+  let neighbours = 0;
+  for (const [order, rotorHz] of [[1, 30], [2, 60]]) {
+    for (const offsetHz of [1.5, 2, 2.5, 3, 3.5, 4]) {
+      for (const amp of [14, 20, 28]) {
+        const series = toneFlight({tones: [{hz: rotorHz + offsetHz, amp, phase: 1}],
+          seed: 700 + order * 100 + offsetHz * 10 + amp});
+        const mechanical = await spectrum.analyzeMechanicalWindow(series, wholeWindow(series));
+        const gate = evaluateAirframeGate(mechanical);
+        const named = mechanical.axes.flatMap(axis => axis.peaks.filter(peak =>
+          peak.attentionEligible && peak.harmonicMatch?.rotor === 'main'
+          && peak.harmonicMatch.order === order));
+        const label = `${rotorHz + offsetHz} Hz at ${amp}: ${JSON.stringify(named.map(peak =>
+          [peak.frequencyHz, peak.interpolatedFrequencyHz, peak.harmonicMatch]))} [${gate.codes}]`;
+        assert.ok(!gate.measured.rotorOrderTonesOnly, label);
+        if (named.length > 0) {
+          // The analyser still names it the rotor's order; only the rule refuses.
+          neighbours += 1;
+          assert.equal(gate.status, 'blocked', label);
+        }
+      }
+    }
+  }
+  assert.ok(neighbours >= 12, `only ${neighbours} neighbours were named a rotor order at all`);
+
+  // ...while the rotor's own tone, at any head speed and wandering with it as a
+  // governor does, still is.
+  const random = rng(1907);
+  for (let index = 0; index < 16; index += 1) {
+    const rpm = 1500 + random() * 600;
+    const wander = random() * 0.01;
+    const order = index % 2 === 0 ? 1 : 2;
+    const series = rotorToneFlight({rpm: at => rpm * (1 + wander * Math.sin(2 * Math.PI * 0.2 * at)),
+      order, amp: 14 + random() * 14, seed: 800 + index});
+    const mechanical = await spectrum.analyzeMechanicalWindow(series, wholeWindow(series));
+    const gate = evaluateAirframeGate(mechanical);
+    const label = `order ${order} of ${rpm.toFixed(0)} rpm wandering ${(wander * 100).toFixed(2)}%: `
+      + `[${gate.codes}] ${gate.measured.rotorOrderRefusal}`;
+    assert.equal(gate.status, 'permitted', label);
+    assert.equal(gate.measured.rotorOrderTonesOnly, true, label);
+  }
+});
+
+/** A main-rotor tone that follows `rpm(at)`, as a rotor's own tone does, on roll. */
+function rotorToneFlight({rpm, order, amp, seed, rateHz = 1000, seconds = 20}) {
+  const random = rng(seed);
+  const count = Math.round(rateHz * seconds);
+  const timeUs = new Float64Array(count);
+  const quiet = new Float64Array(count);
+  const roll = new Float64Array(count);
+  const head = new Float64Array(count);
+  let phase = 0;
+  for (let index = 0; index < count; index += 1) {
+    const at = index / rateHz;
+    timeUs[index] = Math.round(at * 1e6);
+    head[index] = rpm(at);
+    phase += (2 * Math.PI * order * head[index]) / 60 / rateHz;
+    roll[index] = amp * Math.sin(phase) + (random() - 0.5);
+    quiet[index] = random() - 0.5;
+  }
+  return {timeUs, gyro: {roll, pitch: quiet, yaw: quiet},
+    gyroSources: {roll: 'gyroRAW', pitch: 'gyroRAW', yaw: 'gyroRAW'},
+    headspeedRpm: head, tailspeedRpm: new Float64Array(count).fill(Number.NaN)};
+}
 
 test('the measured-vibration sentence claims no rotor comparison that did not happen', () => {
   // Raised whenever vibration was measured and the rotor-order rule did not

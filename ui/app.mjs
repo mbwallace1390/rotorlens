@@ -75,7 +75,8 @@ import {buildAnalysisRecords, detectStopEvents} from '../src/analysis/records.mj
 import {
   buildDirectionalStopEvidence,
   buildHoldEvidence,
-  EVIDENCE_LIMITS
+  EVIDENCE_LIMITS,
+  HOLDS_FOR_A_FULL_READING
 } from '../src/analysis/pid-evidence.mjs';
 import {
   decimate,
@@ -2271,27 +2272,40 @@ function perTurn(codes) {
 function strongestRotorTone(finding) {
   const basis = finding.basis ?? [];
   // Its size WHILE PRESENT (round 3): the flight average of a tone that comes
-  // and goes is pulled under the very limit the card says it was above.
+  // and goes is pulled under the very limit the card says it was above. The
+  // rotor-order cards list each tone, strongest first; the card for a tone above
+  // the limit for part of the flight names its strongest outright (Stage 2d).
   const size = basis.find(entry => entry.unit === 'deg/s'
-    && /^(?:roll|pitch|yaw): main rotor (?:once|twice)-per-rev, band RMS while above/
-      .test(entry.label));
+    && entry.label === 'strongest tone, band RMS while above the attention level')
+    ?? basis.find(entry => entry.unit === 'deg/s'
+      && /^(?:roll|pitch|yaw): main rotor (?:once|twice)-per-rev, band RMS while above/
+        .test(entry.label));
   const ratio = basis.find(entry => entry.label === 'strongest tone against the experimental level');
   const share = basis.find(entry => entry.unit === '%'
-    && /^strongest tone, share of (?:the range|its stretch) above/.test(entry.label));
+    && /^strongest tone, share of .+ above the attention level$/.test(entry.label));
   const average = basis.find(entry => entry.unit === 'deg/s'
     && /^strongest tone, band RMS averaged over all of/.test(entry.label));
   if (!Number.isFinite(size?.value) || !Number.isFinite(ratio?.value)) {
     return null;
   }
   // How long it was there, and its flight average, beside its size: never the
-  // average in place of the size.
-  const where = /its stretch/.test(share?.label ?? '')
-    ? 'the part of this flight it was measured in' : 'this flight';
+  // average in place of the size. OF WHAT, as the engine says it (Stage 2d, item
+  // 4): a tone measured in two stretches has its share and average of the
+  // stretch it was worst in, not of "the part of this flight it was measured
+  // in", which for such a tone is all of it.
+  const scope = /^strongest tone, share of (.+) above the attention level$/.exec(share?.label ?? '');
+  const where = {
+    'the range': 'this flight',
+    'the stretch it was measured in': 'the part of this flight it was measured in',
+    'the stretch it was worst in': 'the stretch of this flight it was worst in'
+  }[scope?.[1]] ?? 'this flight';
   const presence = Number.isFinite(share?.value) && Number.isFinite(average?.value)
     ? `It was above that limit for ${text(share.value, 0)}% of ${where}, and averaged `
       + `${text(average.value, 1)} degrees a second over all of it. `
     : '';
-  return {size: text(size.value, 1), ratio: text(ratio.value, 1), presence};
+  // No analysis window held the tone whole, so its size is only "at least".
+  const atLeast = /lower bound/.test(size.source ?? '') ? 'at least ' : '';
+  return {size: atLeast + text(size.value, 1), ratio: text(ratio.value, 1), presence};
 }
 
 /** The vibration check's "too little continuous gyro" family of reasons. */
@@ -2311,7 +2325,11 @@ const ROTOR_ORDER_NOT_ESTABLISHED_PLAIN = {
   STRETCH_NOT_MEASURED: 'part of the flight could not be measured',
   ROTOR_NOT_COMPARED: 'your rotor speed could not be compared against it across the whole flight',
   AXIS_NOT_MEASURED_ON_UNFILTERED_GYRO: 'not every axis was logged unfiltered',
-  ATTENTION_PEAK_LIST_INCOMPLETE: 'some of it sat too close together to check piece by piece'
+  ATTENTION_PEAK_LIST_INCOMPLETE: 'some of it sat too close together to check piece by piece',
+  // Stage 2d: near the rotor's own speed, but further from it than the logged
+  // head speed explains.
+  ROTOR_ORDER_MATCH_NOT_ESTABLISHED: 'some of it sits further from your rotor\'s own speed than '
+    + 'your logged head speed explains'
 };
 
 /** The part of a flight the rotor was NOT compared over, and why, in a pilot's words. */
@@ -2378,6 +2396,44 @@ const PLAIN_ENGLISH = {
       + `that limit, and more than this app will read a tune over. ${measured.presence}`
       + 'A tone that size usually means the blades are out of track or out of balance. Sort the '
       + 'tracking and balance before tuning — chasing it with gains changes nothing.';
+  },
+  // Added for Stage 2d (3 October 2026): a tone above the limit for only part of
+  // the flight. This used to read "running smoothly enough", or "quiet enough to
+  // judge the tune over", over a tone three to six times the limit while it was
+  // there. The engine shows this card only when nothing else on the airframe
+  // blocks, so "does not hold back the rest" is true wherever it appears.
+  AIRFRAME_TONE_ABOVE_LEVEL_IN_PART: finding => {
+    const measured = strongestRotorTone(finding);
+    if (!measured) {
+      return finding.headline;
+    }
+    const codes = finding.codes ?? [];
+    // Stage 2d follow-up, item 3: a tone near the rotor's once- or twice-per-turn
+    // but further from it than the logged head speed explains is not the rotor's.
+    // Copy review of 3 October 2026, finding 4: near the TAIL rotor's, it is
+    // judged on the logged tail speed, and said so.
+    let what = 'Something on your helicopter shook it';
+    if (codes.includes('MAIN_ROTOR_ORDER_1') || codes.includes('MAIN_ROTOR_ORDER_2')) {
+      what = `Your main rotor shook the helicopter ${perTurn(codes)} per turn`;
+    } else if (codes.includes('ROTOR_ORDER_MATCH_NOT_ESTABLISHED')) {
+      const tail = codes.includes('NEAR_TAIL_ROTOR_ORDER');
+      what = `Something on your helicopter shook it close to your ${tail ? 'tail rotor\'s' : 'rotor\'s'} `
+        + `own speed, but further from it than your logged ${tail ? 'tail' : 'head'} speed explains,`;
+    }
+    // Finding 6: why it could not be judged, from the criterion the engine says it
+    // failed — too little of the flight, or there often enough but bunched together.
+    let judged = 'That is too little of the flight, or too bunched into one part of it, to judge';
+    if (codes.includes('TONE_ABOVE_LEVEL_IN_TOO_FEW_WINDOWS')) {
+      judged = 'That is too little of the flight to judge';
+    } else if (codes.includes('TONE_ABOVE_LEVEL_TOO_BUNCHED')) {
+      judged = 'It was there often enough, but bunched into one part of this flight, which is too '
+        + 'bunched to judge as a steady shake';
+    }
+    return `${what} above a cautious, still-unproven limit for part of this flight: `
+      + `${measured.size} degrees a second while it was there, ${measured.ratio} times that limit. `
+      + measured.presence
+      + `${judged}, so this flight does not rule your airframe out — fly it again and see whether `
+      + 'it comes back, and when. On its own it does not hold back the rest of this advice.';
   },
   AIRFRAME_BROADBAND_ELEVATED: () =>
     'The gyro is noisy across the whole range, not at one frequency. That is the airframe '
@@ -2609,6 +2665,16 @@ const PLAIN_ENGLISH = {
   I_TERM_NOT_JUDGED: finding => {
     const thing = AXIS_THING[finding.axis] ?? finding.axis;
     const codes = finding.codes ?? [];
+    // 3 October 2026 (re-review of round three): an offset that stood on one side
+    // in every hold, beside a band a quicker shake or the gyro's noise hid. It
+    // used to be "raise I"; it is said as both halves of what was seen.
+    if (codes.includes('STANDING_ERROR_WITH_UNMEASURED_BAND')) {
+      const shake = codes.includes('OSCILLATION_ABOVE_I_TERM_BAND');
+      return `Your ${thing} sat off where you put it on the same side in every hold — which can be `
+        + `too little I — but ${shake ? 'a quicker shake' : 'the gyro\'s own noise'} hid whether it `
+        + 'was also wobbling slowly, which would point somewhere else, so the I term was not '
+        + `judged. ${shake ? 'Sort out the shake first; this' : 'This'} is not an all-clear.`;
+    }
     if (codes.includes('OSCILLATION_ABOVE_I_TERM_BAND')) {
       return `Your ${thing} shook quickly while you held it — faster than the I term works — and `
         + 'that hid anything slower, so the I term was not judged. Sort out the shake first; '
@@ -2619,11 +2685,25 @@ const PLAIN_ENGLISH = {
         + 'noise, so that movement could not be read and the I term was not judged. This is not '
         + 'an all-clear.';
     }
+    // Said with the side it was on since 3 October 2026: "on the side the turn
+    // went" read the same for a tail lagging every turn and one carried past
+    // every turn, and the two point at different things.
     if (codes.includes('STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION')) {
-      return `In every turn your ${thing} sat off where you put it, on the side the turn went. `
-        + 'That can be too little I, or something keeping step with your turns, and these turns '
-        + 'cannot say which. Fly the turns all one way, or still hovers. This is not an '
-        + 'all-clear.';
+      if (codes.includes('RATE_PAST_COMMAND_IN_EVERY_TURN')) {
+        return `In every turn your ${thing} turned faster than you asked, whichever way it went. `
+          + 'That can be feedforward set too high, or something keeping step with your turns, and '
+          + 'these turns cannot say which. Fly still hovers next, where feedforward adds nothing. '
+          + 'This is not an all-clear.';
+      }
+      if (codes.includes('RATE_SHORT_OF_COMMAND_IN_EVERY_TURN')) {
+        return `In every turn your ${thing} turned more slowly than you asked, whichever way it `
+          + 'went. That can be too little I, or something keeping step with your turns, and these '
+          + 'turns cannot say which. Fly the turns all one way, or still hovers. This is not an '
+          + 'all-clear.';
+      }
+      return `In every turn your ${thing} sat off where you put it, changing side with the turn, `
+        + 'and these turns cannot say why. Fly the turns all one way, or still hovers. This is not '
+        + 'an all-clear.';
     }
     // Added 3 October 2026: an error that changed side between holds while its
     // movement inside them was NOT slower than the I term's band comes here, not
@@ -2637,8 +2717,7 @@ const PLAIN_ENGLISH = {
     if (codes.includes('TOO_FEW_HOLDS_FOR_A_STANDING_ERROR')) {
       return `Your ${thing} sat off where you put it on the same side every time — which can be `
         + 'too little I — but that few holds cannot tell it from a slow wander. Fly at least '
-        + `${EVIDENCE_LIMITS.minimumHoldsForStandingError} still holds next time. This is not an `
-        + 'all-clear.';
+        + `${HOLDS_FOR_A_FULL_READING} still holds next time. This is not an all-clear.`;
     }
     if (codes.includes('STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT')
         || codes.includes('STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD')) {
@@ -5724,10 +5803,13 @@ function drawAxisPlot() {
  *
  * ## The distinction this panel exists to keep
  *
- * `peak.rotorHarmonic.state` has three values and only one is a measurement
- * about the rotor:
+ * `peak.rotorHarmonic.state` has four values and only one says the rotor
+ * accounts for the tone:
  *
- *   explained     a trustworthy rotor speed lines up on that order
+ *   explained     a trustworthy rotor speed puts that order where the tone is
+ *   near-order    named that order, but further from it than the logged speed of
+ *                 that rotor allows — not established as the rotor's (copy review
+ *                 of 3 October 2026, finding 3: it was drawn green as "main 1/rev")
  *   not-explained a rotor WAS compared, and does not account for the tone
  *   not-checked   nothing was compared
  *
@@ -5827,6 +5909,22 @@ function peakRotorCell(harmonic) {
         `lands on this frequency${delta}.`
     };
   }
+  // Copy review of 3 October 2026, finding 3: NAMED the order by the analyser's
+  // wide match, but further from it than the logged speed of that rotor allows.
+  // The airframe card calls it not the rotor's own; this drew a green pill and
+  // "lands on this frequency" over it.
+  if (harmonic.state === 'near-order') {
+    const speed = harmonic.rotor === 'tail' ? 'tail speed' : 'head speed';
+    const measured = Number.isFinite(harmonic.offsetFromOrderHz) && Number.isFinite(harmonic.offsetAllowedHz)
+      ? `${text(harmonic.offsetFromOrderHz, 2)} Hz off a predicted ${text(harmonic.predictedHz, 1)} Hz, `
+        + `further than the ${text(harmonic.offsetAllowedHz, 2)} Hz the logged ${speed} allows`
+      : `further from it than the logged ${speed} allows`;
+    return {
+      pill: pill('warn', `near ${harmonic.rotor} ${harmonic.order}/rev — outside the logged ${speed}`),
+      detail: `A rotor speed was read on this window, and this frequency sits near its order ` +
+        `${harmonic.order} — ${measured} — so it is not established as that order.`
+    };
+  }
   if (harmonic.state === 'not-explained') {
     const missing = harmonic.unavailableRotors ?? [];
     return {
@@ -5890,11 +5988,25 @@ function vibrationAxisBlock(axis, view) {
       `Part of this window could not be measured on this axis${why ? ` — ${esc(why)}` : ''}. ` +
       `What the rest of it measured is listed below.</p>`);
   } else {
+    // Copy review of 3 October 2026, finding 8: a short burst is listed for having
+    // reached the threshold in some window, and was counted here as a persistent
+    // tone. The engine says which each peak is; the two are counted apart.
+    const persistent = axis.peaks.filter(peak => peak.persistent !== false).length;
+    const bursts = axis.peaks.length - persistent;
+    let persistentHint = 'listed below';
+    if (persistent === 0) {
+      persistentHint = bursts > 0 ? 'none steady; the bursts are listed below'
+        : 'none stood out of the noise floor';
+    }
     parts.push('<div class="grid" style="margin-top:10px">' + [
       stat('Broadband', `${text(axis.broadbandRmsDps)}&deg;/s`,
         'RMS across the analysed band'),
-      stat('Persistent tones', String(axis.peaks.length),
-        axis.peaks.length === 0 ? 'none stood out of the noise floor' : 'listed below')
+      stat('Persistent tones', String(persistent), persistentHint),
+      ...(bursts > 0
+        ? [stat('Short bursts', String(bursts),
+          'present in too few of the analysis windows to be a steady tone, and above the '
+          + 'attention threshold in some of them; listed below')]
+        : [])
     ].join('') + '</div>');
   }
 
@@ -5905,13 +6017,35 @@ function vibrationAxisBlock(axis, view) {
   parts.push('<ul class="peaks">' + axis.peaks.map(peak => {
     const rotor = peakRotorCell(peak.rotorHarmonic);
     const stretch = stretchWords(peak, view);
+    const scope = stretch ? `the stretch ${esc(stretch)}` : 'the window';
+    // Stage 2d: a peak that was above the threshold at all is shown at its size
+    // while it was there, with how long and its average beside it. The average
+    // alone, next to "above the attention threshold", read under the threshold
+    // for a tone that came and went; and a tone above it for only part of the
+    // window had no pill at all, so it read as a quiet one.
+    const whileAbove = Number.isFinite(peak.amplitudeWhileAboveThresholdDps);
+    const amplitude = whileAbove
+      ? `<span class="amp">${peak.amplitudeWhileAboveThresholdAtLeast ? 'at least ' : ''}`
+        + `${text(peak.amplitudeWhileAboveThresholdDps)}&deg;/s while above it, `
+        + `${Math.round((peak.aboveThresholdShare ?? 0) * 100)}% of ${scope}</span>
+      <span class="amp">${text(peak.amplitudeDps)}&deg;/s averaged</span>`
+      : `<span class="amp">${text(peak.amplitudeDps)}&deg;/s</span>`;
+    let above = '';
+    if (peak.aboveAttentionThreshold) {
+      above = pill('warn', 'above the attention threshold');
+    } else if (whileAbove) {
+      above = pill('warn', 'above the attention threshold for part of it');
+    }
+    // The burst the count above names apart from the persistent tones (finding 8).
+    if (peak.persistent === false) {
+      above += pill('none', 'short burst');
+    }
     return `<li>
       <span class="hz">${text(peak.frequencyHz, 1)} Hz</span>
-      <span class="amp">${text(peak.amplitudeDps)}&deg;/s</span>
-      <span class="amp">present ${Math.round((peak.persistenceRatio ?? 0) * 100)}% of ${stretch
-        ? `the stretch ${esc(stretch)}` : 'the window'}</span>
+      ${amplitude}
+      <span class="amp">present ${Math.round((peak.persistenceRatio ?? 0) * 100)}% of ${scope}</span>
       ${rotor.pill}
-      ${peak.aboveAttentionThreshold ? pill('warn', 'above the attention threshold') : ''}
+      ${above}
       <span class="detail">${esc(rotor.detail)}</span>
     </li>`;
   }).join('') + '</ul>');
@@ -5927,7 +6061,15 @@ function vibrationAxisBlock(axis, view) {
  * produces.
  */
 export function vibrationHtml(view) {
-  const [kind, label] = VIBRATION_STATUS[view.status] ?? ['warn', view.status];
+  let [kind, label] = VIBRATION_STATUS[view.status] ?? ['warn', view.status];
+  // Stage 2d: "clear" means nothing was above the threshold for ENOUGH of the
+  // window. A tone above it for part of the window is not that, and a green
+  // pill over it would read as the all-clear the airframe card no longer gives.
+  const aboveInPart = (view.axes ?? []).some(axis => (axis.peaks ?? []).some(peak =>
+    !peak.aboveAttentionThreshold && Number.isFinite(peak.amplitudeWhileAboveThresholdDps)));
+  if (view.status === 'clear' && aboveInPart) {
+    [kind, label] = ['warn', 'above the attention threshold for part of the window only'];
+  }
   const seconds = (view.range.durationUs ?? 0) / 1e6;
 
   const parts = [

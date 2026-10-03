@@ -692,7 +692,9 @@ async function analyseFixture(file) {
     }
 
     const result = buildRecommendations({axes, records, mechanical, axisSummaries});
-    return {session, mechanical, axes, result};
+    // What was handed to the engine beside the vibration check, so a test can hand
+    // it the same flight over a different vibration measurement.
+    return {session, mechanical, axes, result, inputs: {axes, axisSummaries, records}};
   })();
   analysisCache.set(file, promise);
   return promise;
@@ -784,10 +786,128 @@ test('rf46-gain-fault: three D diagnoses yield one actionable change', async () 
   assertNobodySays(result, 'RINGING_SOURCE_UNKNOWN', 'a two-second hold is measurable');
   assertNobodySays(result, 'OSCILLATION_MATCHES_AIRFRAME_TONE', '25 Hz is off every rotor order');
 
-  // The rungs above it had to clear for any of that to be spoken.
-  assert.ok(idsOf(result).includes('AIRFRAME_CLEAR'));
+  // The rungs above it had to pass for any of that to be spoken.
+  //
+  // UPDATED in Stage 2d: this pinned AIRFRAME_CLEAR, and that pin was the item-1
+  // bug of the 3 October 2026 airframe review. The 25.4 Hz ring this fixture
+  // injects measures 12.8-16.6 deg/s on each axis in the 10-12% of the analysis
+  // windows it is strongest in — above the 8 deg/s level while it is there — so
+  // "a positive measurement of absence" is false of this flight. The airframe
+  // rung still passes on it, and says it is not ruled out instead.
+  assert.equal(result.gates.airframe.status, 'permitted', `${result.gates.airframe.codes}`);
+  assert.ok(!idsOf(result).includes('AIRFRAME_CLEAR'));
+  assert.ok(idsOf(result).includes('AIRFRAME_TONE_ABOVE_LEVEL_IN_PART'), idsOf(result).join(', '));
   assert.ok(idsOf(result).includes('HEADSPEED_STEADY_ENOUGH'));
 });
+
+test('rf46-gain-fault: no airframe card claims a refusal the D change beside it did not get',
+  async () => {
+    // Stage 2d follow-up, item 2. The ring this fixture injects is the tone the
+    // airframe card reports above the level for part of the flight — 25.4 Hz,
+    // matching no rotor order — and that card said an oscillation sitting on it
+    // "is refused on its own card rather than blamed on a gain", while the D card
+    // beside it blamed exactly that oscillation on D. Only a tone matched to a
+    // rotor order is refused (`coincidentTone`); off one, the loop and the airframe
+    // cannot be told apart in one flight, so the gain is named with that warning.
+    const {result} = await analyseFixture('rf46-gain-fault.TXT');
+    const adjustments = result.findings.filter(finding => finding.kind === 'adjustment');
+    assert.equal(adjustments.length, 1);
+    const [change] = adjustments;
+    const oscillationHz = change.basis
+      .find(entry => entry.label === 'oscillation frequency after release').value;
+    const inPart = result.gates.airframe.tonesAboveLevelInPart;
+    const under = inPart.filter(tone => tone.axis === change.axis && tone.rotor === null
+      && Math.abs(tone.frequencyHz - oscillationHz) <= Math.max(tone.bandwidthHz ?? 0, 0.15 * oscillationHz));
+    // The fixture is the case: the change sits on an unmatched tone reported above
+    // the level for part of the flight.
+    assert.ok(under.length > 0, `${oscillationHz} Hz: ${JSON.stringify(inPart)}`);
+    for (const card of result.findings.filter(finding => finding.rung === 'airframe')) {
+      assert.doesNotMatch(`${card.headline} ${card.reasoning}`, /refused on its own card/,
+        `${card.id} claims a refusal the ${change.id} card did not get: ${card.reasoning}`);
+    }
+    const inPartCard = result.findings.find(finding => finding.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
+    assert.match(inPartCard.reasoning, /one flight cannot rule out the airframe/i, inPartCard.reasoning);
+    // ...and the D card names that tone as what it measured: its size while it was
+    // above the level and for how long, never "persistent" at its average.
+    const [tone] = under;
+    assert.match(change.reasoning, /ONE FLIGHT CANNOT RULE OUT THE AIRFRAME/);
+    assert.doesNotMatch(change.reasoning, /persistent tone/, change.reasoning);
+    const said = /a tone at ([\d.]+) Hz, matching no rotor order, at ([\d.]+) deg\/s while it was above the attention level, for (\d+)% of the range \(([\d.]+) deg\/s averaged over all of it\)/
+      .exec(change.reasoning);
+    assert.ok(said, change.reasoning);
+    assert.equal(Number(said[1]), Math.round(tone.frequencyHz * 10) / 10, said[0]);
+    assert.equal(Number(said[2]), Math.round(tone.aboveLevelBandRmsDps * 10) / 10, said[0]);
+    assert.equal(Number(said[3]), Math.round(tone.aboveLevelShare * 100), said[0]);
+    assert.equal(Number(said[4]), Math.round(tone.bandRmsDps * 10) / 10, said[0]);
+  });
+
+/**
+ * A committed fixture through the app's whole-window path, with `burst` added to
+ * the unfiltered gyro the vibration check reads, on all three axes: `dps` RMS at
+ * `hz` (the logged head speed's once-per-rev where null), for `seconds`, from
+ * half-way through the flight.
+ */
+async function analyseFixtureWithBurst(file, {dps, seconds, hz = null}) {
+  const [session] = (await decodeFixture(file)).sessions;
+  const bounds = sessionTimeBounds(session);
+  const series = buildMechanicalSeries(session);
+  const rpm = [...series.headspeedRpm].filter(Number.isFinite).sort((a, b) => a - b);
+  const toneHz = hz ?? rpm[rpm.length >> 1] / 60;
+  const fromS = (bounds.startTimeUs + bounds.durationUs / 2) / 1e6;
+  for (const axis of ['roll', 'pitch', 'yaw']) {
+    const values = series.gyro[axis];
+    for (let index = 0; index < values.length; index += 1) {
+      const at = series.timeUs[index] / 1e6;
+      if (at >= fromS && at < fromS + seconds) {
+        values[index] += dps * Math.SQRT2 * Math.sin(2 * Math.PI * toneHz * at);
+      }
+    }
+  }
+  const mechanical = await analyzeMechanicalWindow(series,
+    {timeRangeUs: {startTimeUs: bounds.startTimeUs, endTimeUs: bounds.endTimeUs}});
+  const {axes, axisSummaries, records} = (await analyseFixture(file)).inputs;
+  return {toneHz, mechanical,
+    result: buildRecommendations({axes, records, mechanical, axisSummaries})};
+}
+
+test('rf46-gain-fault: a short burst of a large tone stops the D change it would sit under',
+  async () => {
+    // Stage 2d follow-up, item 1, end to end. A tone above the level in under a
+    // quarter of the analysis windows was dropped by the analyser before its size
+    // was measured, so a 40 deg/s once-per-rev lasting a second and a half — five
+    // times the level — was never listed, the airframe passed, and "Lower roll D."
+    // went out over it. Past the ceiling it blocks every gain; under it, it is
+    // reported, and the D change stands.
+    for (const [dps, hz, past] of [[40, null, true], [40, 47, true], [20, null, false]]) {
+      const {toneHz, mechanical, result} = await analyseFixtureWithBurst('rf46-gain-fault.TXT',
+        {dps, seconds: 1.5, hz});
+      const listed = mechanical.axes.flatMap(axis => axis.peaks
+        .filter(peak => Math.abs(peak.frequencyHz - toneHz) <= 2 && peak.attentionWindowBandRmsDps >= 8));
+      const airframe = result.findings.filter(finding => finding.rung === 'airframe').map(finding => finding.id);
+      const label = `${dps} deg/s at ${toneHz.toFixed(1)} Hz for 1.5 s: ${mechanical.status} `
+        + `${JSON.stringify(listed.map(peak => [peak.frequencyHz, peak.persistenceRatio,
+          peak.attentionWindowBandRmsDps]))} -> ${result.gates.airframe.status} [${airframe}] `
+        + `${adjustmentsOf(result)}`;
+      // Listed on every axis it was added to, as above the level for part of it.
+      assert.equal(listed.length, 3, label);
+      assert.ok(listed.every(peak => peak.attentionEligible === false), label);
+      assert.ok(!airframe.includes('AIRFRAME_CLEAR'), label);
+      if (past) {
+        assert.equal(result.gates.airframe.status, 'blocked', label);
+        assert.deepEqual(adjustmentsOf(result), [], label);
+        assert.equal(airframe[0], hz === null ? 'AIRFRAME_ROTOR_ORDER_TONE_LARGE' : 'AIRFRAME_VIBRATION_PRESENT',
+          label);
+        assert.equal(result.findings.find(finding => finding.actNow)?.rung, 'airframe', label);
+      } else {
+        assert.equal(result.gates.airframe.status, 'permitted', label);
+        assert.deepEqual(adjustmentsOf(result), ['roll:D_TOO_HIGH:decrease'], label);
+        const card = result.findings.find(finding => finding.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
+        assert.ok(card?.basis.some(entry => entry.label.includes(`${(Math.round(listed[0].frequencyHz * 10)
+          / 10).toFixed(1)} Hz on`) && entry.label.includes('once-per-rev')), `${label}: ${JSON.stringify(
+          card?.basis.map(entry => entry.label))}`);
+      }
+    }
+  });
 
 test('rf46-stop-manoeuvres: the same twelve stops earn NO adjustment', async () => {
   // The specificity control that already existed and was never asserted. Same
@@ -983,10 +1103,22 @@ test('the twin pair: off a rotor order the gain is named, on one it is refused',
   // And the tone itself is present in BOTH — same amplitude, same frequency.
   // Without this the pair could be passing because one file has a tone and the
   // other has none, which is a difference in two terms rather than one.
+  //
+  // UPDATED in Stage 2d: this pinned AIRFRAME_TONE_BELOW_ATTENTION, and that pin
+  // was the item-1 bug: the 25 Hz ring is above the 8 deg/s level in the 10-12%
+  // of the windows it is strongest in, so "below the level worth chasing" is
+  // false of it. It is the tone above the level for part of the flight in both,
+  // at the same size.
+  const sizes = [];
   for (const analysis of [off, on]) {
-    assert.ok(idsOf(analysis.result).includes('AIRFRAME_TONE_BELOW_ATTENTION'));
+    assert.ok(idsOf(analysis.result).includes('AIRFRAME_TONE_ABOVE_LEVEL_IN_PART'),
+      idsOf(analysis.result).join(', '));
+    assert.ok(!idsOf(analysis.result).includes('AIRFRAME_TONE_BELOW_ATTENTION'));
     assert.equal(analysis.mechanical.status, 'clear');
+    sizes.push(analysis.result.findings.find(entry => entry.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART')
+      .basis.find(entry => entry.label === 'strongest tone, band RMS while above the attention level').value);
   }
+  assert.equal(sizes[0], sizes[1], `the same tone in both: ${sizes}`);
 });
 
 /* ---------------------------------------------------------------------------

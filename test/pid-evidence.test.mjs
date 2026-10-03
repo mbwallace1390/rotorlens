@@ -1474,11 +1474,15 @@ test('a standing error is read only where it stands clear of the slow movement a
     assert.ok(!fast.codes.includes('HOLD_EVIDENCE_WITHIN_TOLERANCE'), fast.codes.join(','));
   }
   // The same offset under a SMALL fast oscillation, one the mean clears in every
-  // hold, is still read.
+  // hold, is still read. Small means its slow part moved under the 2 deg/s that
+  // is read as movement, so it carries no code: a measurement that would have
+  // seen a hunt of that size beside it (since the re-review of 3 October 2026,
+  // one that registered is refused — see 'beside a band nothing could see into').
   for (const frequencyHz of [3.6, 4.0, 4.4]) {
     const small = interpretHoldEvidence(buildHoldEvidence(fourHolds(seconds =>
       5 + 3 * Math.sin(2 * Math.PI * frequencyHz * seconds)), {axis: 'yaw', term: 'I'}));
     assert.equal(small.indication, 'increase', `${frequencyHz} Hz: ${small.codes.join(',')}`);
+    assert.ok(!small.codes.includes('OSCILLATION_ABOVE_I_TERM_BAND'), small.codes.join(','));
   }
 });
 
@@ -1652,4 +1656,164 @@ test('an all-clear needs a slow part quiet enough to have seen trouble in', () =
   const quiet = interpretHoldEvidence(buildHoldEvidence(holdsOfLengths([12, 12, 12], {
     error: () => 0.4 + (random() * 2 - 1) * 0.5}), {axis: 'yaw', term: 'I'}));
   assert.ok(quiet.codes.includes('HOLD_EVIDENCE_WITHIN_TOLERANCE'), quiet.codes.join(','));
+});
+
+/* ROUND THREE, RE-REVIEWED 3 October 2026 ---------------------------------- */
+
+test('a standing error is not read as too little I beside a band nothing could see into', () => {
+  // A standing error with an in-band hunt beside it is the conflicting signature,
+  // which is refused — but only where the hunt is SEEN. An oscillation above the
+  // band dominates the crossing count, and a slow ripple no larger than the noise
+  // is not told from it, so under either a hunt is neither read nor ruled out. A
+  // cover SMALLER than the standing error passed every per-hold rule, and the
+  // reading was "increase" by elimination: the review laid a 6-15 Hz torque, or
+  // 50-400 deg/s of gyro noise, over an aircraft with no integrator AND an
+  // in-band wobble, and got "Raise I" in 2 and 10 of 40 flights.
+  //
+  // Swept: either sign, three to six holds of 6-11 s, an in-band wobble beside
+  // the error or none (it was not measured either way, so the reading must not
+  // depend on it), and the two covers in turn. The noise is a tone on a null of
+  // the box average, as in the test above, so all of it is "noise" and the slow
+  // part is exactly the wobble.
+  let state = 6_2026;
+  const random = () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+  const between = (low, high) => low + random() * (high - low);
+  const nullHz = 6 / (EVIDENCE_LIMITS.huntingSmoothingUs / 1_000_000);
+  const misread = [];
+  const reached = {fast: 0, noise: 0};
+  for (let draw = 0; draw < 80; draw += 1) {
+    const noisy = draw % 2 === 1;
+    const standing = (random() < 0.5 ? -1 : 1) * between(6, 18);
+    const lengthsS = Array.from({length: 3 + Math.floor(random() * 4)}, () => between(6, 11));
+    const wobbleHz = between(0.4, 2.4);
+    const wobble = noisy ? between(4, 14) : (random() < 0.5 ? between(1, 3) : 0);
+    const phase = between(0, 2 * Math.PI);
+    // Up to a per-hold ripple near the standing error, as the review's were
+    // (13.3/7.7, 16.5/10.9 deg/s): a cover that reaches past it is refused
+    // hold by hold, and one that stays under it is the hole.
+    const coverHz = between(3.5, 5);
+    const cover = between(8, 34);
+    const noise = between(14, 30);
+    const evidence = buildHoldEvidence(holdsOfLengths(lengthsS, {intervalUs: 1000,
+      error: seconds => standing + wobble * Math.sin(2 * Math.PI * wobbleHz * seconds + phase)
+        + (noisy
+          ? noise * Math.sin(2 * Math.PI * nullHz * seconds)
+          : cover * Math.sin(2 * Math.PI * coverHz * seconds))
+        + (random() * 2 - 1) * 0.3}), {axis: 'yaw', term: 'I'});
+    const verdict = interpretHoldEvidence(evidence);
+    const codes = verdict.codes;
+    const coverCode = noisy ? 'SLOW_RIPPLE_NOT_CLEAR_OF_NOISE' : 'OSCILLATION_ABOVE_I_TERM_BAND';
+    const label = `${noisy ? 'noise' : 'fast'} draw ${draw}: standing ${standing.toFixed(1)}, `
+      + `wobble ${wobble.toFixed(1)} at ${wobbleHz.toFixed(2)} Hz over ${lengthsS.length} holds `
+      + `[${evidence.holds.map(hold => `${hold.steadyStateErrorDps.toFixed(1)}/`
+        + hold.errorRippleRmsDps.toFixed(1)).join(' ')}] -> ${verdict.indication} [${codes.join(',')}]`;
+    // THE HOLE: every hold's mean clear of what moved in it, on one side, in
+    // enough holds — every per-hold rule passed, and only the cover stood
+    // between this and "increase".
+    const holds = evidence.holds;
+    const perHoldClear = holds.length >= EVIDENCE_LIMITS.minimumHoldsForStandingError
+      && holds.every(hold => Math.abs(hold.steadyStateErrorDps) > hold.errorRippleRmsDps)
+      && (holds.every(hold => hold.steadyStateErrorDps > 0)
+        || holds.every(hold => hold.steadyStateErrorDps < 0));
+    if (codes.includes(coverCode) && perHoldClear && codes.includes('STEADY_STATE_ERROR_PRESENT')) {
+      reached[noisy ? 'noise' : 'fast'] += 1;
+      if (verdict.indication !== 'hold' || verdict.confidence !== 'low'
+          || !codes.includes('STANDING_ERROR_WITH_UNMEASURED_BAND')) {
+        misread.push(label);
+      }
+    }
+    if (verdict.indication === 'increase' && codes.includes(coverCode)) {
+      misread.push(`read under the cover: ${label}`);
+    }
+    if (codes.includes('HOLD_EVIDENCE_WITHIN_TOLERANCE')) {
+      misread.push(`cleared: ${label}`);
+    }
+  }
+  assert.deepEqual(misread, [], `${misread.length} standing errors were read beside a band nothing `
+    + `could see into:\n${misread.join('\n')}`);
+  // Not vacuous: the hole was reached, under both covers, many times.
+  assert.ok(reached.fast >= 12 && reached.noise >= 12,
+    `the sweep must reach the hole under both covers: ${JSON.stringify(reached)}`);
+
+  // CONTROL: the same standing error under a fast oscillation too small to
+  // register — its slow part moves under the 2 deg/s that would be read as
+  // movement, so there is no cover code, and it was a measurement that could
+  // have seen a hunt of that size — is still read as too little I.
+  for (let draw = 0; draw < 40; draw += 1) {
+    const standing = (random() < 0.5 ? -1 : 1) * between(6, 15);
+    const lengthsS = Array.from({length: 3 + Math.floor(random() * 4)}, () => between(6, 11));
+    const coverHz = between(3.5, 5);
+    const verdict = interpretHoldEvidence(buildHoldEvidence(holdsOfLengths(lengthsS, {
+      intervalUs: 1000,
+      error: seconds => standing + 2.5 * Math.sin(2 * Math.PI * coverHz * seconds)
+        + (random() * 2 - 1) * 0.3}), {axis: 'yaw', term: 'I'}));
+    assert.equal(verdict.indication, 'increase', `${standing.toFixed(1)} under a small `
+      + `${coverHz.toFixed(2)} Hz oscillation: [${verdict.codes.join(',')}]`);
+    assert.ok(!verdict.codes.includes('OSCILLATION_ABOVE_I_TERM_BAND')
+      && !verdict.codes.includes('STANDING_ERROR_WITH_UNMEASURED_BAND'), verdict.codes.join(','));
+  }
+});
+
+test('an error that follows the stick says which side of the command it was on', () => {
+  // ROUND THREE, RE-REVIEWED 3 October 2026. An error that changes side exactly
+  // with the turn is refused as STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION, and the
+  // card said "a loop that lags behind every turn does that" whichever side it
+  // was — including for an aircraft turning FASTER than commanded both ways,
+  // which is what feedforward set too high does. The side is measured here, in
+  // each turn's own direction (setpoint minus gyro, so positive is short of the
+  // command), and said: RATE_SHORT_OF_COMMAND_IN_EVERY_TURN or
+  // RATE_PAST_COMMAND_IN_EVERY_TURN, never both.
+  let state = 7_2026;
+  const random = () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+  const between = (low, high) => low + random() * (high - low);
+  const misread = [];
+  const seen = {short: 0, past: 0};
+  for (let draw = 0; draw < 40; draw += 1) {
+    const count = 4 + Math.floor(random() * 4);
+    // Both ways, in a random order. Rates clear of the 90 deg/s excursion between
+    // holds, which a turn near it would merge with.
+    const directions = Array.from({length: count}, (_, at) => (at < 2 ? [1, -1][at]
+      : (random() < 0.5 ? -1 : 1)));
+    directions.sort(() => random() - 0.5);
+    const rateDps = between(150, 300);
+    const short = draw % 2 === 0;
+    const size = between(4, 15);
+    const evidence = buildHoldEvidence(holdsOfLengths(
+      Array.from({length: count}, () => between(6, 10)), {
+        setpointsDps: directions.map(direction => direction * rateDps),
+        error: (seconds, at) => directions[at] * (short ? size : -size) + (random() * 2 - 1) * 0.3
+      }), {axis: 'yaw', term: 'I'});
+    const verdict = interpretHoldEvidence(evidence);
+    const codes = verdict.codes;
+    const expected = short ? 'RATE_SHORT_OF_COMMAND_IN_EVERY_TURN' : 'RATE_PAST_COMMAND_IN_EVERY_TURN';
+    const other = short ? 'RATE_PAST_COMMAND_IN_EVERY_TURN' : 'RATE_SHORT_OF_COMMAND_IN_EVERY_TURN';
+    if (verdict.indication !== 'hold' || !codes.includes('STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION')
+        || !codes.includes(expected) || codes.includes(other)) {
+      misread.push(`${short ? 'short' : 'past'} by ${size.toFixed(1)} at ${rateDps.toFixed(0)} deg/s `
+        + `[${directions.join(',')}] -> ${verdict.indication} [${codes.join(',')}]`);
+    } else {
+      seen[short ? 'short' : 'past'] += 1;
+    }
+  }
+  assert.deepEqual(misread, [], `${misread.length} turns were given the wrong side:\n${misread.join('\n')}`);
+  assert.ok(seen.short >= 15 && seen.past >= 15, JSON.stringify(seen));
+
+  // An error that keeps ONE side through turns both ways is a standing error,
+  // not one that follows the stick, and carries neither side code.
+  const directions = [150, -150, -150, 150];
+  const bias = interpretHoldEvidence(buildHoldEvidence(holdsOfLengths([7, 7, 7, 7], {
+    setpointsDps: directions, error: () => -6}), {axis: 'yaw', term: 'I'}));
+  assert.equal(bias.indication, 'increase', bias.codes.join(','));
+  assert.ok(!bias.codes.some(code => /^RATE_(?:SHORT_OF|PAST)_COMMAND/.test(code)), bias.codes.join(','));
+  // Nor does a side change at zero rate, where there is no turn to be short of.
+  const sides = interpretHoldEvidence(buildHoldEvidence(holdsOfLengths([7, 7, 7, 7], {
+    error: (seconds, at) => (at % 2 === 0 ? 6 : -6)}), {axis: 'yaw', term: 'I'}));
+  assert.ok(sides.codes.includes('STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS'), sides.codes.join(','));
+  assert.ok(!sides.codes.some(code => /^RATE_(?:SHORT_OF|PAST)_COMMAND/.test(code)), sides.codes.join(','));
 });

@@ -78,11 +78,16 @@ import {
 import {decodeLog} from '../src/blackbox/decode.mjs';
 import {buildAnalysisRecords, detectStopEvents, STOP_DETECTION_DEFAULTS}
   from '../src/analysis/records.mjs';
-import {resolveAxisSignals, summarizeAxis} from '../src/analysis/axis-report.mjs';
+import {describeHoldCapture, holdManoeuvre, resolveAxisSignals, summarizeAxis}
+  from '../src/analysis/axis-report.mjs';
+// By namespace: a named import of an export a module lacks is a link error that
+// takes every test in this file down with it, not only the one that reads it.
+import * as pidEvidence from '../src/analysis/pid-evidence.mjs';
 import {
   analyzeMechanicalTimeSeries,
   analyzeMechanicalWindow,
   buildMechanicalSeries,
+  MECHANICAL_CONSTANTS,
   sessionTimeBounds
 } from '../src/analysis/advisor/mechanical-spectrum.mjs';
 
@@ -272,7 +277,21 @@ function simulateHoldFlight({
   // length (2 October 2026, round three — see `holdLayout`).
   commands = null,
   noiseDps = 0.8,
-  headspeedRpm = 1800
+  headspeedRpm = 1800,
+  // A static feedforward: this much of the COMMAND added straight to the output
+  // (3 October 2026). Set too high, it carries every turn past the commanded
+  // rate, whichever way the aircraft turns.
+  feedforward = 0,
+  // A constant added to the output by another path — a tail precompensation or
+  // a mixer offset (round seven, 3 October 2026). The I term then carries the
+  // difference as a TRIM, of either sign, rather than sitting near zero.
+  outputBias = 0,
+  // The I term at the first sample: the trim it already carried when the log
+  // began. With `outputBias`, an integrator trimmed for a free linkage.
+  iTermStart = 0,
+  // The firmware's own scaling of the logged P, I and D terms, which RotorLens
+  // does not know. The loop runs on the unscaled terms; only the log is scaled.
+  loggedTermScale = 1
 } = {}) {
   const plant = {
     dt: 0.001, delaySamples: 3, actuatorTau: 0.020, derivativeTau: 0.003,
@@ -285,7 +304,7 @@ function simulateHoldFlight({
   const delayLine = new Array(plant.delaySamples).fill(0);
   let rate = 0;
   let actuator = 0;
-  let integral = 0;
+  let integral = gains.ki ? iTermStart / gains.ki : 0;
   let previousError = 0;
   let derivative = 0;
   let measured = 0;
@@ -337,7 +356,8 @@ function simulateHoldFlight({
     const pTerm = gains.kp * error;
     const iTerm = gains.ki * integral;
     const dTerm = gains.kd * derivative;
-    const output = Math.max(-actuatorLimit, Math.min(actuatorLimit, pTerm + iTerm + dTerm));
+    const output = Math.max(-actuatorLimit, Math.min(actuatorLimit,
+      pTerm + iTerm + dTerm + feedforward * command + outputBias));
 
     delayLine.push(output);
     const delayed = delayLine.shift();
@@ -363,7 +383,7 @@ function simulateHoldFlight({
     records.push({
       timeUs: Math.round(t * 1e6),
       setpoint, gyro, raw,
-      terms: [pTerm, iTerm, dTerm],
+      terms: [pTerm * loggedTermScale, iTerm * loggedTermScale, dTerm * loggedTermScale],
       headspeed: headspeedRpm,
       collective: 0,
       vbat: 24
@@ -1854,9 +1874,19 @@ test('THE STOP FIXTURE: the 2.8x directional asymmetry is recovered, and the air
     // Until 2026-08-13 this asserted AIRFRAME_UNFILTERED_GYRO_MISSING, because
     // the corpus carried only the filtered gyro and the airframe therefore
     // could never be ruled out. The generator now emits gyroRAW, so the gate
-    // clears on its merits.
-    assert.ok(found.AIRFRAME_CLEAR,
-      'the airframe should now clear, got ' + result.findings.map(entry => entry.id).join(', '));
+    // passes on its merits.
+    //
+    // UPDATED in Stage 2d: this pinned AIRFRAME_CLEAR, and that pin was item 1's
+    // bug. The fixture's 25.4 Hz pitch ring after its stops measures 9.9 deg/s
+    // in 2 of its 70 analysis windows — above the attention level while it was
+    // there — so "a positive measurement of absence" is false of it. It is
+    // reported as not ruled out instead, and holds nothing back on its own.
+    assert.equal(result.gates.airframe.status, 'permitted', `${result.gates.airframe.codes}`);
+    assert.ok(!found.AIRFRAME_CLEAR, 'a tone above the level in part is not an all-clear');
+    const inPart = found.AIRFRAME_TONE_ABOVE_LEVEL_IN_PART;
+    assert.ok(inPart, 'expected the tone above the level in part, got '
+      + result.findings.map(entry => entry.id).join(', '));
+    assert.match(inPart.headline, /25\.4 Hz/, inPart.headline);
     assert.equal(result.findings[0].rung, 'airframe',
       'the airframe still reports first, cleared or not');
 
@@ -2068,12 +2098,21 @@ test('a rotor-order tone under the attention threshold is reported, and stops a 
       'the upstream analysis must call this clear, or the test proves nothing');
     const gate = assessAirframe(mechanical);
     assert.equal(gate.status, 'permitted');
-    const matched = gate.subThresholdTones.filter(tone => tone.rotor === 'main');
+    // UPDATED in Stage 2d. This pinned the tone as "sub-threshold", and that pin
+    // was item 1's bug: the ring after each release measures 8.6 deg/s in 8 of the
+    // 72 analysis windows, so it was above the level while it was there, and the
+    // card below listed it "below the attention level" under "quiet enough". It
+    // is a tone above the level for part of the range now — its AVERAGE is still
+    // under the level, which is the case that was lost.
+    const matched = gate.tonesAboveLevelInPart.filter(tone => tone.rotor === 'main');
     assert.ok(matched.length > 0,
-      'a rotor-matched sub-threshold tone must be present: '
-      + JSON.stringify(gate.subThresholdTones));
-    assert.ok(matched.every(tone => tone.bandRmsDps < gate.attentionThresholdDps),
-      'and it must be BELOW the attention level — that is the case that was lost');
+      'a rotor-matched tone above the level for part of the range must be present: '
+      + JSON.stringify(gate.tonesAboveLevelInPart));
+    assert.ok(matched.every(tone => tone.bandRmsDps < gate.attentionThresholdDps
+      && tone.aboveLevelBandRmsDps >= gate.attentionThresholdDps),
+    'and it must average BELOW the attention level while reaching it — that is the case that was lost');
+    assert.ok(!gate.subThresholdTones.some(tone => tone.rotor === 'main'),
+      'a tone that reached the level is never also listed below it');
 
     const result = recommendFor(onOrder, 'yaw', mechanical);
     const ids = result.findings.map(entry => entry.id);
@@ -2081,9 +2120,11 @@ test('a rotor-order tone under the attention threshold is reported, and stops a 
     // 1. The airframe rung must stop claiming absence.
     assert.ok(!ids.includes('AIRFRAME_CLEAR'),
       '"a positive measurement of absence" is false when a tone was measured');
-    const airframe = result.findings.find(entry => entry.id === 'AIRFRAME_TONE_BELOW_ATTENTION');
+    assert.ok(!ids.includes('AIRFRAME_TONE_BELOW_ATTENTION'),
+      `"quiet enough" is false of a tone above the level while it was there: ${ids.join(', ')}`);
+    const airframe = result.findings.find(entry => entry.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
     assert.ok(airframe, `expected the tone observation, got ${ids.join(', ')}`);
-    assert.equal(airframe.kind, 'observation', 'a small tone is not a blocker');
+    assert.equal(airframe.kind, 'next-flight', 'a tone not ruled out is not a blocker, nor clear');
     assert.ok(airframe.basis.some(entry => /once-per-rev/.test(entry.label)),
       'and the rotor order must be named: '
       + airframe.basis.map(entry => entry.label).join(' | '));
@@ -2110,12 +2151,16 @@ test('a rotor-order tone under the attention threshold is reported, and stops a 
     const offRange = {startTimeUs: offOrder[0].timeUs, endTimeUs: offOrder.at(-1).timeUs};
     const offMech = await analyzeMechanicalTimeSeries(seriesOf(offOrder), {timeRangeUs: offRange});
     const offGate = assessAirframe(offMech);
-    assert.ok(offGate.subThresholdTones.length > 0,
-      'the control must ALSO carry a sub-threshold tone — the loop makes one — '
+    // Stage 2d: the loop's ring reaches the level in some windows, so it is a
+    // tone above the level for part of the range rather than a sub-threshold one
+    // (see above); either way it is a tone the control must carry.
+    const offTones = [...offGate.subThresholdTones, ...offGate.tonesAboveLevelInPart];
+    assert.equal(offGate.status, 'permitted', `${offGate.codes}`);
+    assert.ok(offTones.length > 0,
+      'the control must ALSO carry a tone — the loop makes one — '
       + 'or it is not testing the discriminator');
-    assert.ok(offGate.subThresholdTones.every(tone => tone.rotor === null),
-      'and none of it may match a rotor order: '
-      + JSON.stringify(offGate.subThresholdTones));
+    assert.ok(offTones.every(tone => tone.rotor === null),
+      'and none of it may match a rotor order: ' + JSON.stringify(offTones));
     assert.ok(recommendFor(offOrder, 'yaw', offMech).withheld
       .some(entry => entry.findingId === 'D_TOO_HIGH'),
     'the same fault off the rotor order must still be diagnosed, then stability-gated');
@@ -2149,7 +2194,7 @@ const adjustmentIds = result =>
  * and its average over all of it.
  */
 function rotorToneHeadline(headline) {
-  const said = new RegExp('measured ([\\d.]+) deg/s on (?:roll|pitch|yaw)(?: at \\d+ rpm)? while it '
+  const said = new RegExp('measured (?:at least )?([\\d.]+) deg/s on (?:roll|pitch|yaw)(?: at \\d+ rpm)? while it '
     + 'was above (?:an|the) experimental 8 deg/s level[,—\\s]+([\\d.]+) times that level\\b.*?'
     + 'for (\\d+)% of (?:the range|the stretch it was (?:worst|measured) in), and averaged '
     + '([\\d.]+) deg/s')
@@ -2317,6 +2362,13 @@ test('a main-rotor once- or twice-per-rev above the experimental level is report
     assert.ok(tone.basis.some(entry => /threshold/.test(entry.label) && entry.value === 8));
     assert.match(tone.reasoning, /experimental/i);
     assert.match(tone.reasoning, /not (?:yet )?been validated|not yet validated/i);
+    // Stage 2d follow-up, item 5: the tolerance the identity rule applied is the
+    // head speed's own spread PLUS half an analysis bin, as the basis row says —
+    // the reasoning used to name the spread alone.
+    assert.match(tone.reasoning, /within the head speed's own spread at that order plus half an analysis bin/,
+      tone.reasoning);
+    assert.ok(tone.basis.some(entry => /plus half an analysis bin/.test(entry.source ?? '')),
+      JSON.stringify(tone.basis.map(entry => entry.source)));
     assert.match(tone.confirm, /tracking/i);
     assert.match(tone.confirm, /balance/i);
     assert.match(tone.confirm, /drops/i);
@@ -2369,11 +2421,14 @@ test('vibration the main rotor\'s 1/rev and 2/rev do not explain still blocks ev
 
     // Broadband is held separately, and a rotor-order-only spectrum does not
     // excuse a raised floor. (The tone's size while present travels with it: the
-    // rotor-order rule refuses a tone without one.)
+    // rotor-order rule refuses a tone without one. Since Stage 2d so do the head
+    // speed's spread at that order and the resolution, which identity is judged
+    // from.)
     const peaks = [{frequencyHz: 29.3, bandRmsDps: 13.8, attentionWindowBandRmsDps: 13.8,
       attentionPersistenceRatio: 1, bandwidthHz: 2, persistenceRatio: 1,
       attentionEligible: true,
-      harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.7, toleranceHz: 2.9}}];
+      harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.7, toleranceHz: 2.9,
+        spreadHz: 0.45, frequencyResolutionHz: 1.953}}];
     const noisyRotorOnly = assessAirframe(cleanAirframe({
       status: 'attention',
       reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY', 'MAIN_ROTOR_HARMONIC_CORRELATION'],
@@ -2600,7 +2655,8 @@ test('a rotor-order tone beside another airframe blocker never says the rest of 
     const peaks = [{frequencyHz: 29.3, bandRmsDps: 13.8, attentionWindowBandRmsDps: 13.8,
       attentionPersistenceRatio: 1, bandwidthHz: 2, persistenceRatio: 1,
       attentionEligible: true,
-      harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.7, toleranceHz: 2.9}}];
+      harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.7, toleranceHz: 2.9,
+        spreadHz: 0.45, frequencyResolutionHz: 1.953}}];
     const rotorOnly = overrides => cleanAirframe({
       status: 'attention',
       reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY', 'MAIN_ROTOR_HARMONIC_CORRELATION'],
@@ -2658,7 +2714,8 @@ test('an attention-level rotor tone reaches the coincidence rule whatever its pe
     const peak = {frequencyHz: 30, bandRmsDps: 11, attentionWindowBandRmsDps: 13.9,
       attentionPersistenceRatio: 0.3, bandwidthHz: 2, persistenceRatio: 0.3,
       attentionEligible: true,
-      harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0, toleranceHz: 3}};
+      harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0, toleranceHz: 3,
+        spreadHz: 0.45, frequencyResolutionHz: 1.953}};
     const gate = assessAirframe(cleanAirframe({
       status: 'attention',
       reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY', 'MAIN_ROTOR_HARMONIC_CORRELATION'],
@@ -2744,16 +2801,18 @@ function recommendThreeAxes(records, mechanical) {
 
 /**
  * A gyro window with no manoeuvres in it: `tones` on roll (on every axis with
- * `allAxes`), each present throughout or for `onS` of every `periodS`, over a
- * head at `headspeed(at)` rpm. From `thinFromS` on, one sample in six survives,
- * which is a logger falling behind.
+ * `allAxes`, or on a tone's own `axes`), each present throughout, for `onS` of
+ * every `periodS`, or wherever its `on(at)` says, over a head at `headspeed(at)`
+ * rpm. From `thinFromS` on, one sample in six survives, which is a logger falling
+ * behind.
  */
 function gyroWindow({seconds, rateHz = 1000, tones, seed, headspeed = () => 1800,
   thinFromS = Infinity, allAxes = false}) {
   const random = rng(seed);
   const timeUs = [];
   const roll = [];
-  const quiet = [];
+  // Pitch and yaw carry only tones given their own `axes`, over their own noise.
+  const others = {pitch: [], yaw: []};
   const head = [];
   for (let index = 0; index < Math.round(rateHz * seconds); index += 1) {
     const stamp = Math.round((index * 1e6) / rateHz);
@@ -2761,23 +2820,27 @@ function gyroWindow({seconds, rateHz = 1000, tones, seed, headspeed = () => 1800
     if (at >= thinFromS && index % 6 !== 0) {
       continue;
     }
-    let value = 0;
+    const values = {roll: 0, pitch: 0, yaw: 0};
     for (const tone of tones) {
-      if (!tone.periodS || at % tone.periodS < tone.onS) {
-        value += tone.amp * Math.sin(2 * Math.PI * tone.hz * at + (tone.phase ?? 0));
+      if (tone.on ? tone.on(at) : (!tone.periodS || at % tone.periodS < tone.onS)) {
+        const value = tone.amp * Math.sin(2 * Math.PI * tone.hz * at + (tone.phase ?? 0));
+        for (const axis of tone.axes ?? ['roll']) {
+          values[axis] += value;
+        }
       }
     }
     timeUs.push(stamp);
-    roll.push(value + (random() - 0.5));
-    quiet.push(random() - 0.5);
+    roll.push(values.roll + (random() - 0.5));
+    const quiet = random() - 0.5;
+    others.pitch.push(values.pitch + quiet);
+    others.yaw.push(values.yaw + quiet);
     head.push(headspeed(at) + (random() - 0.5) * 4);
   }
   const rollSeries = Float64Array.from(roll);
-  const quietSeries = Float64Array.from(quiet);
+  const other = axis => (allAxes ? rollSeries : Float64Array.from(others[axis]));
   return {
     timeUs: Float64Array.from(timeUs),
-    gyro: {roll: rollSeries, pitch: allAxes ? rollSeries : quietSeries,
-      yaw: allAxes ? rollSeries : quietSeries},
+    gyro: {roll: rollSeries, pitch: other('pitch'), yaw: other('yaw')},
     gyroSources: {roll: 'gyroRAW', pitch: 'gyroRAW', yaw: 'gyroRAW'},
     headspeedRpm: Float64Array.from(head),
     tailspeedRpm: new Float64Array(timeUs.length).fill(Number.NaN)
@@ -2886,6 +2949,7 @@ test('a main-rotor tone is judged on its size while present: an intermittent one
     };
     let hidden = 0;
     let underOneOnAverage = 0;
+    let justPast = 0;
     for (const [order, hz] of [[1, 30], [2, 60]]) {
       // 1. Past three times the level while present: every one blocks, as LARGE.
       for (const strength of [3.5, 4.5, 5.5]) {
@@ -2945,11 +3009,39 @@ test('a main-rotor tone is judged on its size while present: an intermittent one
           assert.ok(ratioRow.value >= 1, JSON.stringify(ratioRow));
         }
       }
+      // 3. Stage 2d, item 3: either side of the ceiling, 3.0-3.4 times the level.
+      // A window that straddled the tone switching on or off held it for part of
+      // its length and was averaged in at that partial power, so a tone just past
+      // the ceiling read 7% under its size and was reported. Its size while
+      // present is now what the same tone measures steady, and the ceiling is
+      // decided on that.
+      for (const strength of [3.0, 3.1, 3.2, 3.3, 3.4]) {
+        const steady = (await run({hz, strength, presence: 1, seed: 700 + order + strength * 10}))
+          .attention[0].attentionWindowBandRmsDps;
+        for (const [presence, periodS] of [[0.3, 10], [0.45, 6], [0.5, 9]]) {
+          const {attention, result} = await run({hz, strength, presence, periodS,
+            seed: 800 + order * 50 + strength * 10 + presence * 10 + periodS});
+          const label = `order ${order} at ${strength}x (steady ${steady}), present `
+            + `${presence * 100}% in ${periodS} s cycles: ${JSON.stringify(attention)}`;
+          assert.ok(attention.length === 1 && isMainOrder(attention[0], [order]), label);
+          const [peak] = attention;
+          assert.equal(peak.attentionWindowSizeIsLowerBound, false, label);
+          assert.ok(Math.abs(peak.attentionWindowBandRmsDps / steady - 1) <= 0.01, label);
+          if (peak.attentionWindowBandRmsDps > 24) {
+            justPast += 1;
+            assert.deepEqual([...result.gates.airframe.codes], ['MAIN_ROTOR_ORDER_TONE_LARGE'], label);
+          } else {
+            assert.equal(result.gates.airframe.status, 'permitted', label);
+            assert.ok(result.findings.some(entry => entry.id === 'AIRFRAME_ROTOR_ORDER_TONE'), label);
+          }
+        }
+      }
     }
     // The sweep reached both holes: tones the flight average hid under the
     // ceiling, and tones above the level that averaged under it.
     assert.ok(hidden >= 12, `only ${hidden} configurations averaged under the ceiling`);
     assert.ok(underOneOnAverage >= 3, `only ${underOneOnAverage} averaged under the level`);
+    assert.ok(justPast >= 9, `only ${justPast} tones at 3.0-3.4 times the level were past the ceiling`);
   });
 
 test('a rotor tone past the ceiling is named as large even where the window was measured only in '
@@ -3116,6 +3208,931 @@ test('a tone measured in two stretches is one row on the vibration cards, at its
     assert.equal(rows[0].value, Math.max(...copies.map(peak => peak.bandRmsDps)), name);
   }
 });
+
+/* --------------------------------------------------------------------------- */
+/* Stage 2d: the airframe review of 3 October 2026.                            */
+/* --------------------------------------------------------------------------- */
+
+/** Every airframe basis row that says its tone was below the attention level. */
+const belowLevelRows = result => result.findings.filter(entry => entry.rung === 'airframe')
+  .flatMap(entry => entry.basis.filter(row => /below the attention level/.test(row.label)));
+
+/** Every airframe basis row that says its tone was above the attention level. */
+const aboveLevelRows = result => result.findings.filter(entry => entry.rung === 'airframe')
+  .flatMap(entry => entry.basis.filter(row =>
+    /above the attention level(?: for part of the range)?:/.test(row.label)));
+
+test('a tone above the attention level for only part of the flight is never an all-clear, and '
+  + 'blocks past the ceiling', async () => {
+    // Stage 2d, item 1 — pre-existing on main. A tone above the level in some
+    // windows but not attention-eligible (too few windows, too short a span, too
+    // few quarters of the flight or too long a gap) left the analyser reading
+    // "clear", and the airframe rung read that as AIRFRAME_CLEAR — "a positive
+    // measurement of absence" — or listed the tone "below the attention level"
+    // under "quiet enough to judge the tune over", while it measured three to six
+    // times the level whenever it was there. Swept over where the tone sits, how
+    // long it lasts and how often it comes back.
+    const shapes = [
+      ['the first quarter', at => at < 15],
+      ['the first 40%', at => at < 24],
+      ['a block in the middle', at => at >= 20 && at < 38],
+      ['the last 30%', at => at >= 42],
+      ['2 s in every 10', at => at % 10 < 2],
+      ['1.5 s in every 6', at => at % 6 < 1.5]
+    ];
+    const kinds = [['the once-per-rev', 30, 1], ['the twice-per-rev', 60, 2], ['a 47 Hz tone', 47, null]];
+    // Stage 2d follow-up: and SHORT BURSTS, 1.5-15 s in ranges of 40 s to five
+    // minutes. A peak present in under a quarter of the analysis windows was
+    // dropped before its size in each was measured, so a burst at three to seven
+    // times the level was never listed, and the rung read AIRFRAME_CLEAR over it.
+    // Every burst here is longer than the gap between analysed windows plus one
+    // window (see the analyser's own sweep), so a window holds each one whole.
+    const ranges = shapes.map(([shape, on]) => [shape, on, 60, [1.6, 2.6, 4.2]]);
+    for (const [seconds, burstS, fromShare] of [[40, 1.5, 0.3], [90, 15, 0.6], [150, 4, 0.2],
+      [300, 3, 0.7]]) {
+      const fromS = seconds * fromShare;
+      ranges.push([`a ${burstS} s burst of ${seconds} s`, at => at >= fromS && at < fromS + burstS,
+        seconds, [2.2, 4.2]]);
+    }
+    const seen = {clear: 0, reported: 0, large: 0, unexplained: 0, eligible: 0, burst: 0};
+    let configuration = 0;
+    for (const [shape, on, seconds, strengths] of ranges) {
+      for (const [kind, hz, order] of kinds) {
+        for (const strength of strengths) {
+          configuration += 1;
+          const series = gyroWindow({seconds, seed: 900 + configuration,
+            tones: [{hz, amp: strength * 8 * Math.SQRT2, on, phase: configuration}]});
+          const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+          const inPart = mechanical.axes.flatMap(axis => axis.peaks
+            .filter(peak => peak.attentionEligible !== true && peak.attentionWindowBandRmsDps >= 8)
+            .map(peak => ({...peak, axis: axis.axis})));
+          const label = `${kind} at ${strength}x over ${shape}: ${mechanical.status}, `
+            + JSON.stringify(inPart.map(peak => [peak.frequencyHz, peak.bandRmsDps,
+              peak.attentionWindowBandRmsDps, peak.attentionPersistenceRatio]));
+          // Every tone here reached the level in a window that held it whole, so
+          // it is on the list — never skipped because the analyser dropped it.
+          const listed = mechanical.axes.find(axis => axis.axis === 'roll').peaks
+            .find(peak => Math.abs(peak.frequencyHz - hz) <= 2 && peak.attentionWindowBandRmsDps >= 8);
+          assert.ok(listed, `${label}: a tone at ${strength} times the level was never listed`);
+          if (listed.attentionEligible) {
+            // Above the level across enough of the flight: the persistent rules,
+            // tested on their own above.
+            seen.eligible += 1;
+            continue;
+          }
+          if (seconds !== 60) {
+            seen.burst += 1;
+          }
+          if (mechanical.status === 'clear') {
+            seen.clear += 1;
+          }
+          const result = buildRecommendations({mechanical});
+          const ids = result.findings.filter(entry => entry.rung === 'airframe').map(entry => entry.id);
+          // The guarded property: no all-clear, and the tone is never listed as
+          // below the level it was above.
+          assert.ok(!ids.includes('AIRFRAME_CLEAR') && !ids.includes('AIRFRAME_TONE_BELOW_ATTENTION'),
+            `${label}: ${ids}`);
+          for (const peak of inPart) {
+            assert.ok(!belowLevelRows(result).some(row =>
+              row.label.includes(`: ${tenths(peak.frequencyHz)} Hz on ${peak.axis}`)),
+            `${label}: listed below the level: ${JSON.stringify(belowLevelRows(result))}`);
+          }
+          assert.ok(aboveLevelRows(result).every(row => row.value >= 8),
+            `${label}: ${JSON.stringify(aboveLevelRows(result))}`);
+          const loudest = inPart.reduce((best, peak) =>
+            (peak.attentionWindowBandRmsDps > best.attentionWindowBandRmsDps ? peak : best));
+          if (loudest.attentionWindowBandRmsDps <= 24) {
+            // Up to the ceiling: not ruled out, said as its size while present, how
+            // long it was there for and its average — and not a reason on its own
+            // to hold the rest back.
+            seen.reported += 1;
+            assert.equal(result.gates.airframe.status, 'permitted', `${label}: ${result.gates.airframe.codes}`);
+            const card = result.findings.find(entry => entry.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
+            assert.ok(card, `${label}: ${ids}`);
+            assert.equal(card.kind, 'next-flight', label);
+            assert.match(card.headline, /not ruled out/, card.headline);
+            const said = rotorToneHeadline(card.headline);
+            assert.ok(said, card.headline);
+            assert.equal(said.size, tenths(loudest.attentionWindowBandRmsDps), card.headline);
+            assert.equal(said.ratio, tenths(loudest.attentionWindowBandRmsDps / 8), card.headline);
+            assert.equal(said.share, Math.round(loudest.attentionPersistenceRatio * 100), card.headline);
+            assert.equal(said.average, tenths(loudest.bandRmsDps), card.headline);
+            assert.ok(card.confirm && /fly/i.test(card.confirm), card.confirm);
+            continue;
+          }
+          // Past it: blocks, as the rotor's own large tone or as vibration nothing
+          // explains.
+          assert.equal(result.gates.airframe.status, 'blocked', label);
+          assert.deepEqual(adjustmentIds(result), [], label);
+          if (order !== null) {
+            seen.large += 1;
+            assert.equal(result.gates.airframe.codes[0], 'MAIN_ROTOR_ORDER_TONE_LARGE', label);
+            assert.equal(ids[0], 'AIRFRAME_ROTOR_ORDER_TONE_LARGE', `${label}: ${ids}`);
+            const said = rotorToneHeadline(result.findings[0].headline);
+            assert.equal(said?.size, tenths(loudest.attentionWindowBandRmsDps), result.findings[0].headline);
+          } else {
+            seen.unexplained += 1;
+            assert.ok(result.gates.airframe.codes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED'), label);
+            const vibration = result.findings.find(entry => entry.id === 'AIRFRAME_VIBRATION_PRESENT');
+            assert.ok(vibration?.codes.includes('NOT_EXPLAINED_BY_MAIN_ROTOR_ORDER'), `${label}: ${ids}`);
+          }
+        }
+      }
+    }
+    // The sweep reached the hole — the analyser reading "clear" over a tone above
+    // the level — and both sides of the ceiling, for the rotor and for not, and
+    // every burst, at every strength.
+    assert.ok(seen.clear >= 20, JSON.stringify(seen));
+    assert.ok(seen.reported >= 12 && seen.large >= 4 && seen.unexplained >= 2, JSON.stringify(seen));
+    assert.equal(seen.burst, 24, JSON.stringify(seen));
+  });
+
+test('a tone above the attention level for part of the flight is never an all-clear in the app\'s '
+  + 'three-axis shape', async () => {
+    // Stage 2d, item 1, end to end: a stop flight whose once-per-rev is there only
+    // over its first stops — 22-30% of the flight — handed over with all three
+    // axes as ui/app.mjs hands it. It used to read "quiet enough to judge the
+    // tune over".
+    for (const [amp, untilShare] of [[20, 0.22], [20, 0.3], [40, 0.22], [60, 0.3]]) {
+      const plain = buildStopFlight({axis: 'yaw', ...STOP_FAULTS.tooMuchD, seed: 4243});
+      const records = withRawTones(plain, [
+        {hz: 30, amp: amp * Math.SQRT2, untilS: (plain.at(-1).timeUs / 1e6) * untilShare}]);
+      const series = seriesOf(records);
+      const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+      const oneRev = mechanical.axes.flatMap(axis => axis.peaks.filter(peak =>
+        isMainOrder(peak, [1]) && peak.attentionWindowBandRmsDps >= 8));
+      const label = `a ${amp} deg/s once-per-rev over the first ${untilShare * 100}%: `
+        + `${mechanical.status} ${JSON.stringify(oneRev.map(peak => [peak.attentionEligible,
+          peak.bandRmsDps, peak.attentionWindowBandRmsDps]))}`;
+      assert.ok(oneRev.length > 0 && oneRev.every(peak => !peak.attentionEligible), label);
+      const result = recommendThreeAxes(records, mechanical);
+      const ids = result.findings.filter(entry => entry.rung === 'airframe').map(entry => entry.id);
+      assert.ok(!ids.includes('AIRFRAME_CLEAR') && !ids.includes('AIRFRAME_TONE_BELOW_ATTENTION'),
+        `${label}: ${ids}`);
+      const largest = Math.max(...oneRev.map(peak => peak.attentionWindowBandRmsDps));
+      if (largest > 24) {
+        assert.equal(result.gates.airframe.status, 'blocked', label);
+        assert.ok(ids.includes('AIRFRAME_ROTOR_ORDER_TONE_LARGE'), `${label}: ${ids}`);
+        assert.deepEqual(adjustmentIds(result), [], label);
+        assert.equal(result.findings.find(entry => entry.actNow)?.id, 'AIRFRAME_ROTOR_ORDER_TONE_LARGE',
+          label);
+      } else if (result.gates.airframe.status === 'permitted') {
+        assert.ok(ids.includes('AIRFRAME_TONE_ABOVE_LEVEL_IN_PART'), `${label}: ${ids}`);
+      } else {
+        // Something else stops the airframe here; the tone is still on screen,
+        // above the level, in the basis of what does.
+        assert.ok(aboveLevelRows(result).some(row => row.value >= 8), `${label}: ${ids}`);
+      }
+    }
+  });
+
+test('a size the analyser could only bound from below is said as "at least"', () => {
+  // Stage 2d, item 3: where no analysis window held the tone whole, its size
+  // while present is published as a lower bound, and no card may state it as
+  // the size.
+  const peak = {frequencyHz: 47, bandRmsDps: 5.2, attentionWindowBandRmsDps: 12.4,
+    attentionWindowSizeIsLowerBound: true, attentionPersistenceRatio: 0.12, bandwidthHz: 2,
+    persistenceRatio: 0.3, attentionEligible: false, harmonicMatch: null};
+  const result = buildRecommendations({mechanical: cleanAirframe({
+    axes: ['roll', 'pitch', 'yaw'].map(axis => ({axis, source: 'gyroRAW', available: true,
+      medianNoisePsdDps2PerHz: 0.0002, broadbandRmsDps: 1.2, peaks: axis === 'roll' ? [peak] : []}))
+  })});
+  const card = result.findings.find(entry => entry.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
+  assert.ok(card, `${result.findings.map(entry => entry.id)}`);
+  assert.match(card.headline, /measured at least 12\.4 deg\/s on roll/, card.headline);
+  const rows = card.basis.filter(row => /above the attention level for part of the range:/.test(row.label));
+  assert.equal(rows.length, 1, JSON.stringify(card.basis.map(row => row.label)));
+  assert.match(rows[0].label, /at least 12\.4 deg\/s while above it/, rows[0].label);
+  assert.match(rows[0].source, /lower bound/, rows[0].source);
+});
+
+test('every "above the attention level" row on the vibration card states the size the tone had '
+  + 'while it was above it', async () => {
+    // Stage 2d, item 5. The row printed the tone's flight average, so a tone above
+    // the level for a third of the flight read "persistent tone above the
+    // attention level ... at 4.4 deg/s" beside an 8 deg/s level.
+    let underOnAverage = 0;
+    for (const strength of [1.25, 1.5, 2]) {
+      for (const [onS, periodS] of [[3, 10], [4, 10], [6, 10]]) {
+        const series = gyroWindow({seconds: 60, seed: 5 + onS + strength * 10,
+          tones: [{hz: 47, amp: strength * 8 * Math.SQRT2, onS, periodS}]});
+        const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+        const peak = mechanical.axes.find(axis => axis.axis === 'roll').peaks
+          .find(entry => Math.abs(entry.frequencyHz - 47) <= 2);
+        const label = `47 Hz at ${strength}x for ${onS} s in ${periodS}: ${JSON.stringify(peak)}`;
+        assert.ok(peak?.attentionEligible, label);
+        if (peak.bandRmsDps < 8) {
+          underOnAverage += 1;
+        }
+        const result = buildRecommendations({mechanical});
+        const vibration = result.findings.find(entry => entry.id === 'AIRFRAME_VIBRATION_PRESENT');
+        assert.ok(vibration, `${label}: ${result.findings.map(entry => entry.id)}`);
+        const rows = vibration.basis.filter(row => /above the attention level:/.test(row.label));
+        assert.equal(rows.length, 1, JSON.stringify(vibration.basis.map(row => row.label)));
+        const [row] = rows;
+        // Its size while present, as the value and in the words; how long it was
+        // there for; and its average beside them, named as the average.
+        assert.equal(row.value, Math.round(peak.attentionWindowBandRmsDps * 1000) / 1000, row.label);
+        assert.ok(row.value >= 8, row.label);
+        const stated = /at ([\d.]+) deg\/s while above it, for (\d+)% of the range \(([\d.]+) deg\/s averaged over all of it\)/
+          .exec(row.label);
+        assert.ok(stated, row.label);
+        assert.equal(Number(stated[1]), tenths(peak.attentionWindowBandRmsDps), row.label);
+        assert.ok(Number(stated[1]) >= 8, row.label);
+        assert.equal(Number(stated[2]), Math.round(peak.attentionPersistenceRatio * 100), row.label);
+        assert.equal(Number(stated[3]), tenths(peak.bandRmsDps), row.label);
+      }
+    }
+    assert.ok(underOnAverage >= 5, `only ${underOnAverage} averaged under the level they were above`);
+
+    // Measured in two stretches, the row speaks for the stretch the tone was
+    // largest in WHILE PRESENT: steady at 14 deg/s in the first, 22 deg/s for
+    // 30% of the second — the larger average is the first stretch's.
+    const series = gyroWindow({seconds: 300, rateHz: 1007, seed: 17, tones: [
+      {hz: 71, amp: 14 * Math.SQRT2, on: at => at < 150},
+      {hz: 71, amp: 22 * Math.SQRT2, on: at => at >= 150 && at % 10 < 3}]});
+    const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+    const copies = mechanical.axes.find(axis => axis.axis === 'roll').peaks
+      .filter(peak => Math.abs(peak.frequencyHz - 71) <= 2 && peak.attentionEligible);
+    const label = JSON.stringify(copies.map(peak => [peak.chunkRangeUs, peak.bandRmsDps,
+      peak.attentionWindowBandRmsDps]));
+    assert.equal(copies.length, 2, label);
+    const louder = copies.reduce((best, peak) =>
+      (peak.attentionWindowBandRmsDps > best.attentionWindowBandRmsDps ? peak : best));
+    const higherAverage = copies.reduce((best, peak) => (peak.bandRmsDps > best.bandRmsDps ? peak : best));
+    assert.notEqual(louder, higherAverage, `the fixture must order the two each way: ${label}`);
+    const vibration = buildRecommendations({mechanical}).findings
+      .find(entry => entry.id === 'AIRFRAME_VIBRATION_PRESENT');
+    const rows = vibration.basis.filter(row => /^persistent tone above the attention level:/.test(row.label));
+    assert.equal(rows.length, 1, JSON.stringify(rows));
+    assert.equal(rows[0].value, louder.attentionWindowBandRmsDps, `${rows[0].label}: ${label}`);
+    assert.match(rows[0].label, /of the stretch it was worst in/, rows[0].label);
+  });
+
+test('the strongest of two rotor tones is the one largest while present, whatever their averages',
+  async () => {
+    // Stage 2d, item 6 (case S). A once-per-rev steady on roll and a twice-per-rev
+    // on pitch three times larger while present but there a third of the time:
+    // sorted by average, the large-tone card named the roll tone at 2.7 times the
+    // level "past the 24 deg/s up to which a main-rotor tone is only reported".
+    for (const [steady, loud, share] of [[23, 32, 0.3], [22, 30, 0.3], [23, 34, 0.25]]) {
+      const series = gyroWindow({seconds: 60, seed: 61 + steady, tones: [
+        {hz: 30, amp: steady * Math.SQRT2, axes: ['roll']},
+        {hz: 60, amp: loud * Math.SQRT2, onS: share * 10, periodS: 10, axes: ['pitch']}]});
+      const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+      const peakOf = (axis, order) => mechanical.axes.find(entry => entry.axis === axis).peaks
+        .find(peak => isMainOrder(peak, [order]));
+      const roll = peakOf('roll', 1);
+      const pitch = peakOf('pitch', 2);
+      const label = `roll 1/rev ${JSON.stringify(roll)}, pitch 2/rev ${JSON.stringify(pitch)}`;
+      // The fixture is the case: the averages order the two one way, the sizes
+      // while present the other, and only the pitch tone is past the ceiling.
+      assert.ok(roll.bandRmsDps > pitch.bandRmsDps, label);
+      assert.ok(pitch.attentionWindowBandRmsDps > 24 && roll.attentionWindowBandRmsDps <= 24, label);
+      const result = buildRecommendations({mechanical});
+      const card = result.findings.find(entry => entry.id === 'AIRFRAME_ROTOR_ORDER_TONE_LARGE');
+      assert.ok(card, `${label}: ${result.findings.map(entry => entry.id)}`);
+      assert.match(card.headline, /twice-per-rev measured [\d.]+ deg\/s on pitch/, card.headline);
+      const said = rotorToneHeadline(card.headline);
+      assert.equal(said.size, tenths(pitch.attentionWindowBandRmsDps), card.headline);
+      assert.ok(said.ratio > 3, card.headline);
+      assert.equal(said.average, tenths(pitch.bandRmsDps), card.headline);
+    }
+  });
+
+test('a once-per-rev measured in two stretches is judged on the stretch it was largest in while '
+  + 'present', async () => {
+    // Stage 2d, item 6 (case W), end to end: steady at 21 deg/s in the first
+    // stretch of a five-minute window, 31 deg/s for a third of the second. Judged
+    // on the larger average it read 21, under the ceiling, and was passed.
+    const series = gyroWindow({seconds: 300, rateHz: 1007, seed: 13, tones: [
+      {hz: 30, amp: 21 * Math.SQRT2, on: at => at < 150},
+      {hz: 30, amp: 31 * Math.SQRT2, on: at => at >= 150 && at % 10 < 3.5}]});
+    const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+    assert.equal(mechanical.chunks.length, 2);
+    const copies = mechanical.axes.find(axis => axis.axis === 'roll').peaks
+      .filter(peak => isMainOrder(peak, [1]) && peak.attentionEligible);
+    const label = JSON.stringify(copies.map(peak => [peak.bandRmsDps, peak.attentionWindowBandRmsDps]));
+    assert.equal(copies.length, 2, label);
+    const [first, second] = [...copies].sort((left, right) => left.chunkRangeUs[0] - right.chunkRangeUs[0]);
+    assert.ok(first.bandRmsDps > second.bandRmsDps, `the averages point the wrong way: ${label}`);
+    assert.ok(second.attentionWindowBandRmsDps > 24 && first.attentionWindowBandRmsDps <= 24, label);
+    const result = buildRecommendations({mechanical});
+    assert.equal(result.gates.airframe.status, 'blocked', label);
+    assert.deepEqual([...result.gates.airframe.codes], ['MAIN_ROTOR_ORDER_TONE_LARGE'], label);
+    const card = result.findings.find(entry => entry.id === 'AIRFRAME_ROTOR_ORDER_TONE_LARGE');
+    const said = rotorToneHeadline(card.headline);
+    assert.equal(said.size, tenths(second.attentionWindowBandRmsDps), card.headline);
+    assert.equal(said.average, tenths(second.bandRmsDps), card.headline);
+    // Item 4: its share and its average are of the stretch it was worst in, and
+    // the card says so, in the basis the plain copy is read from as well.
+    assert.match(card.headline, /of the stretch it was worst in, and averaged/, card.headline);
+    const share = card.basis.find(row => row.unit === '%' && /^strongest tone, share of/.test(row.label));
+    assert.match(share.label, /the stretch it was worst in/, share.label);
+  });
+
+/* --------------------------------------------------------------------------- */
+/* Stage 2d follow-up, airframe review of 3 October 2026.                      */
+/* --------------------------------------------------------------------------- */
+
+/** A peak above the attention level in 11% of the windows, at `whilePresent` deg/s while there. */
+const inPartPeak = (frequencyHz, harmonicMatch, whilePresent = 15.2) => ({
+  frequencyHz, interpolatedFrequencyHz: frequencyHz, bandRmsDps: 4.7,
+  attentionWindowBandRmsDps: whilePresent, attentionWindowSizeIsLowerBound: false,
+  attentionPersistenceRatio: 0.11, bandwidthHz: 2, persistenceRatio: 0.3, attentionEligible: false,
+  harmonicMatch});
+const ONCE_PER_REV = Object.freeze({rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.4,
+  toleranceHz: 2.9, spreadHz: 0.15, frequencyResolutionHz: 1.953});
+/** A clean three-axis result whose roll axis lists `peaks`. */
+const rollPeaks = peaks => cleanAirframe({axes: ['roll', 'pitch', 'yaw'].map(axis => ({
+  axis, source: 'gyroRAW', available: true, attentionEligibleUnlistedCount: 0,
+  medianNoisePsdDps2PerHz: 0.0002, broadbandRmsDps: 1.2, peaks: axis === 'roll' ? peaks : []}))});
+
+test('the card for a tone above the level in part claims a refusal only where the coincidence rule '
+  + 'makes one, and the gain verdict beside it names that tone at its size while present', () => {
+    // Stage 2d follow-up, item 2. The card said an oscillation sitting on the tone
+    // "is refused on its own card rather than blamed on a gain". `coincidentTone`
+    // refuses only on a tone matched to a rotor order, so for one matching none
+    // the sentence was false — on the committed gain-fault fixtures the D card
+    // beside it blamed exactly that oscillation on D. Refusing on an unmatched
+    // tone instead would refuse the loop's own ring, which is what that tone is
+    // there (see `coincidentTone`), so the gain stands with the warning that one
+    // flight cannot rule out the airframe, and the card says that instead.
+    const cases = [
+      ['matching no rotor order', [inPartPeak(25.4, null)], {refused: false, caveat: true}],
+      ['the main rotor\'s once-per-rev', [inPartPeak(29.6, ONCE_PER_REV)], {refused: true, caveat: false}],
+      ['one of each', [inPartPeak(29.6, ONCE_PER_REV, 18), inPartPeak(47, null)],
+        {refused: true, caveat: true}]
+    ];
+    for (const [name, peaks, says] of cases) {
+      const mechanical = rollPeaks(peaks);
+      const result = buildRecommendations({mechanical});
+      const card = result.findings.find(entry => entry.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
+      assert.ok(card, `${name}: ${result.findings.map(entry => entry.id)}`);
+      const label = `${name}: ${card.reasoning}`;
+      // What the card claims is what the rule does, tone by tone.
+      const tones = assessAirframe(mechanical).axes.find(entry => entry.axis === 'roll').tones;
+      assert.deepEqual(peaks.map(peak => coincidentTone(tones, peak.frequencyHz) !== null),
+        peaks.map(peak => peak.harmonicMatch !== null), name);
+      assert.equal(/refused on its own card/.test(card.reasoning), says.refused, label);
+      assert.equal(/one flight cannot rule out the airframe/i.test(card.reasoning), says.caveat, label);
+      if (says.refused && says.caveat) {
+        // Each claim is said of the tones it is true of.
+        assert.match(card.reasoning, /one at or near a rotor order/, label);
+        assert.match(card.reasoning, /one matching no rotor order/, label);
+      }
+    }
+
+    // The caveat on the gain verdict names an unmatched tone above the level for
+    // part of the flight as what it measured — its size while there, for how
+    // long, and its average — never as "persistent" at its average.
+    const inPart = assessAirframe(rollPeaks([inPartPeak(25.4, null)])).axes
+      .find(entry => entry.axis === 'roll').tones;
+    const ambiguity = airframeAmbiguity(inPart, 25.9);
+    assert.equal(ambiguity.code, 'AIRFRAME_MODE_NOT_EXCLUDED_TONE_PRESENT');
+    assert.doesNotMatch(ambiguity.sentence, /persistent/, ambiguity.sentence);
+    assert.match(ambiguity.sentence, new RegExp('a tone at 25\\.4 Hz, matching no rotor order, at 15\\.2 '
+      + 'deg/s while it was above the attention level, for 11% of the range \\(4\\.7 deg/s averaged '
+      + 'over all of it\\)'), ambiguity.sentence);
+    // A steady tone that never reached the level is still the persistent tone it is.
+    const steady = assessAirframe(rollPeaks([{...inPartPeak(25.4, null), attentionWindowBandRmsDps: null,
+      attentionPersistenceRatio: 0, persistenceRatio: 0.8}])).axes.find(entry => entry.axis === 'roll').tones;
+    assert.match(airframeAmbiguity(steady, 25.9).sentence, /a persistent tone at 25\.4 Hz \(4\.7 deg\/s\)/);
+  });
+
+test('a tone near the main rotor\'s order but outside what the logged head speed allows is never '
+  + 'called the rotor\'s own, on any card', async () => {
+    // Stage 2d follow-up, item 3. Identity was required of the rotor-order
+    // EXEMPTION only. Past the ceiling, a tone the analyser merely named the
+    // once-per-rev — 1.5 Hz off it with the head logged steady at 1800 rpm — was
+    // still judged the rotor's own large tone: "This is the main rotor's own tone
+    // ... matched against the logged head speed", "Sort the tracking and balance",
+    // beside a card saying it was not established as the rotor's. It blocks, as
+    // vibration not established as the rotor's, and is said as near the order.
+    const near = /near the main rotor's once-per-rev, outside what the logged head speed allows/;
+    const ownTone = /main rotor's own tone|which is the main rotor's|Sort the tracking/;
+    for (const [shape, on, strength] of [['steady', null, 4], ['over the first 30%', at => at < 18, 4],
+      ['over the first 30%', at => at < 18, 2.5]]) {
+      for (const [offsetHz, established] of [[1.5, false], [0.2, true]]) {
+        const series = gyroWindow({seconds: 60, seed: 3, tones: [{hz: 30 + offsetHz,
+          amp: strength * 8 * Math.SQRT2, phase: 1, ...(on ? {on} : {})}]});
+        const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+        const peak = mechanical.axes.find(axis => axis.axis === 'roll').peaks
+          .find(entry => isMainOrder(entry, [1]));
+        const label = `${30 + offsetHz} Hz at ${strength}x ${shape}: ${JSON.stringify(peak)}`;
+        // The fixture is the case: the analyser names it the once-per-rev, sized past
+        // or under the ceiling as intended.
+        assert.ok(peak && peak.attentionWindowBandRmsDps >= 8, label);
+        assert.equal(peak.attentionEligible, on === null, label);
+        assert.equal(peak.attentionWindowBandRmsDps > 24, strength > 3, label);
+        const result = buildRecommendations({mechanical});
+        const airframe = result.findings.filter(entry => entry.rung === 'airframe');
+        const ids = airframe.map(entry => entry.id);
+        const text = airframe.map(findingText).join(' ');
+        if (established) {
+          // The control: on the order, it is the rotor's own, large or reported.
+          assert.ok(ids.includes(strength > 3 ? 'AIRFRAME_ROTOR_ORDER_TONE_LARGE'
+            : 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART'), `${label}: ${ids}`);
+          assert.doesNotMatch(text, near, label);
+          continue;
+        }
+        assert.ok(!ids.includes('AIRFRAME_ROTOR_ORDER_TONE_LARGE'), `${label}: ${ids}`);
+        assert.deepEqual([...result.gates.airframe.upstream.measured.rotorOrderTonesLarge], [], label);
+        assert.doesNotMatch(text, ownTone, `${label}: ${text}`);
+        assert.match(text, near, `${label}: ${text}`);
+        if (strength > 3) {
+          // Past the ceiling: it blocks every gain, as vibration not established as
+          // the rotor's — and says which condition did not hold.
+          assert.equal(result.gates.airframe.status, 'blocked', label);
+          const vibration = airframe.find(entry => entry.id === 'AIRFRAME_VIBRATION_PRESENT');
+          assert.ok(vibration, `${label}: ${ids}`);
+          assert.ok(vibration.codes.includes('ROTOR_ORDER_NOT_ESTABLISHED')
+            && vibration.codes.includes('ROTOR_ORDER_MATCH_NOT_ESTABLISHED'), `${label}: ${vibration.codes}`);
+          assert.match(vibration.reasoning, /outside what the logged head speed allows/, vibration.reasoning);
+          assert.ok(vibration.basis.some(row => near.test(row.label)
+            && row.value === Math.round(peak.attentionWindowBandRmsDps * 1000) / 1000),
+          JSON.stringify(vibration.basis.map(row => [row.label, row.value])));
+        } else {
+          // Under it: reported as near the order, and the codes the plain copy reads
+          // do not name it the rotor's — "Your main rotor shook" would.
+          const card = airframe.find(entry => entry.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
+          assert.ok(card, `${label}: ${ids}`);
+          assert.match(card.headline, near, card.headline);
+          assert.ok(!card.codes.includes('MAIN_ROTOR_ORDER_1'), `${label}: ${card.codes}`);
+          assert.ok(card.codes.includes('ROTOR_ORDER_MATCH_NOT_ESTABLISHED'), `${label}: ${card.codes}`);
+        }
+      }
+    }
+  });
+
+test('a tone above the level in part is on screen beside a permitted rotor-order card, and in the '
+  + 'basis of another blocker, as itself', async () => {
+    // Stage 2d follow-up, item 4: two mutants survived every test. Dropping the
+    // not-ruled-out card pushed beside a permitted AIRFRAME_ROTOR_ORDER_TONE —
+    // the most common real shape, 20 of the 43 corpus windows — and dropping the
+    // tone's own rows from another airframe blocker's basis.
+    //
+    // A steady once-per-rev under the ceiling, which the rotor-order rule passes,
+    // and a 47 Hz tone matching no rotor order above the level for part of it.
+    for (const strength of [1.6, 2.4]) {
+      for (const [shape, on] of [['the first quarter', at => at < 15], ['2 s in every 10',
+        at => at % 10 < 2], ['the last third', at => at >= 40]]) {
+        const series = gyroWindow({seconds: 60, seed: 90 + strength * 10, tones: [
+          {hz: 30, amp: 12 * Math.SQRT2}, {hz: 47, amp: strength * 8 * Math.SQRT2, phase: 0.7, on}]});
+        const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+        const peak = mechanical.axes.find(axis => axis.axis === 'roll').peaks
+          .find(entry => Math.abs(entry.frequencyHz - 47) <= 2);
+        const label = `47 Hz at ${strength}x over ${shape}: ${JSON.stringify(peak)}`;
+        assert.ok(peak && !peak.attentionEligible && peak.attentionWindowBandRmsDps >= 8, label);
+        const result = buildRecommendations({mechanical});
+        const ids = result.findings.filter(entry => entry.rung === 'airframe').map(entry => entry.id);
+        assert.equal(result.gates.airframe.status, 'permitted', `${label}: ${result.gates.airframe.codes}`);
+        assert.deepEqual([...ids].sort(), ['AIRFRAME_ROTOR_ORDER_TONE', 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART'],
+          label);
+        const rotorCard = result.findings.find(entry => entry.id === 'AIRFRAME_ROTOR_ORDER_TONE');
+        assert.match(rotorCard.reasoning, /on a card of its own/, rotorCard.reasoning);
+        const card = result.findings.find(entry => entry.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
+        assert.match(card.headline, new RegExp(`^A tone at ${tenths(peak.frequencyHz)} Hz, matching no rotor `
+          + `order, measured (?:at least )?${tenths(peak.attentionWindowBandRmsDps)} deg/s on roll`),
+        card.headline);
+      }
+    }
+
+    // The same tone where the head speed moved too much for the rotor to be
+    // compared: the airframe is blocked for that, and the tone is in that card's
+    // basis as its own row, at its size while present.
+    for (const [shape, on] of [['the first quarter', at => at < 15], ['2 s in every 10', at => at % 10 < 2]]) {
+      const series = gyroWindow({seconds: 60, seed: 121, headspeed: at => 1500 + 8 * at,
+        tones: [{hz: 47, amp: 2.2 * 8 * Math.SQRT2, on}]});
+      const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+      const peak = mechanical.axes.find(axis => axis.axis === 'roll').peaks
+        .find(entry => Math.abs(entry.frequencyHz - 47) <= 2);
+      const label = `47 Hz at 2.2x over ${shape}, head speed ramping: ${JSON.stringify(peak)}`;
+      assert.ok(peak && !peak.attentionEligible && peak.attentionWindowBandRmsDps >= 8, label);
+      const result = buildRecommendations({mechanical});
+      const ids = result.findings.filter(entry => entry.rung === 'airframe').map(entry => entry.id);
+      assert.deepEqual(ids, ['AIRFRAME_ROTOR_NOT_COMPARED'], label);
+      const blocker = result.findings.find(entry => entry.id === 'AIRFRAME_ROTOR_NOT_COMPARED');
+      const rows = blocker.basis.filter(row =>
+        row.label.startsWith('tone above the attention level for part of the range: ')
+        && row.label.includes(`${tenths(peak.frequencyHz)} Hz on roll`));
+      assert.equal(rows.length, 1, `${label}: ${JSON.stringify(blocker.basis.map(row => row.label))}`);
+      assert.equal(rows[0].value, Math.round(peak.attentionWindowBandRmsDps * 1000) / 1000, rows[0].label);
+    }
+  });
+
+/* --------------------------------------------------------------------------- */
+/* Stage 2d follow-up, copy review of 3 October 2026, findings 2-8: what each  */
+/* card says about a tone is what was measured, and what the card beside it    */
+/* says about the same tone.                                                   */
+/* --------------------------------------------------------------------------- */
+
+const escapeForRegExp = value => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** "29.3 Hz on yaw" as a card writes it, ready for a RegExp. */
+const toneOn = (frequencyHz, axis) => `${escapeForRegExp(tenths(frequencyHz))} Hz on ${axis}`;
+
+/**
+ * One tone above the attention level for part of the range, as a card states it
+ * in running text: "<f> Hz on <axis>..., at [least ]X deg/s while [it was ]above
+ * [it|the attention level], for S% of SCOPE (A deg/s averaged over all of it)".
+ * Null when the text does not state all of that for that tone.
+ */
+function aboveLevelStated(text, frequencyHz, axis) {
+  const said = new RegExp(`${toneOn(frequencyHz, axis)}(?:(?!Hz on ).)*?, at (least )?([\\d.]+) deg/s `
+    + 'while (?:it was )?above (?:it|the attention level), for (\\d+)% of (the range|the stretch it '
+    + 'was (?:worst|measured) in) \\(([\\d.]+) deg/s averaged over all of it\\)').exec(text);
+  return said
+    ? {atLeast: Boolean(said[1]), size: Number(said[2]), share: Number(said[3]), scope: said[4],
+      average: Number(said[5])}
+    : null;
+}
+
+/**
+ * The words of a card that say why a tone was not judged a steady one, up to and
+ * including "to judge it as a steady tone", or null.
+ */
+function steadyToneSentence(text) {
+  const ending = 'to judge it as a steady tone';
+  const sentence = text.split('. ').find(entry => entry.includes(ending));
+  return sentence ? sentence.slice(0, sentence.indexOf(ending) + ending.length) : null;
+}
+
+test('a ring sitting on a tone above the level for part of the flight names that tone as measured, '
+  + 'and agrees with the airframe card on the same page, in the app\'s three-axis shape', async () => {
+    // Finding 2. `tonesOf` admits a tone above the level for part of the range,
+    // and a short burst, so the coincidence rule can see it — but the card that
+    // refused the gain still said the axis "carries a persistent tone", gave the
+    // tone's flight average as its size, and said "It did not reach the level
+    // worth chasing on its own", beside the airframe card saying the same tone
+    // measured at least 8.6 deg/s while it was there. Swept over the order the
+    // ring sits on, its size and the seed, through the real analyser.
+    let reached = 0;
+    for (const [frequencyHz, headspeedRpm] of [[30, 1800], [25, 1500], [35, 2100]]) {
+      for (const ringAmplitudeDps of [12, 14, 16]) {
+        for (const seed of [4242, 7, 99]) {
+          const records = buildStopFlight({axis: 'yaw', ...STOP_FAULTS.tooMuchD, frequencyHz,
+            headspeedRpm, ringAmplitudeDps, seed});
+          const series = seriesOf(records);
+          const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+          const result = recommendThreeAxes(records, mechanical);
+          const yawTones = assessAirframe(mechanical).axes.find(entry => entry.axis === 'yaw').tones;
+          for (const card of result.findings.filter(entry => entry.id === 'OSCILLATION_MATCHES_AIRFRAME_TONE')) {
+            const ringHz = card.basis.find(row => row.label === 'oscillation frequency after release').value;
+            const tone = coincidentTone(yawTones, ringHz);
+            const label = `${frequencyHz} Hz ring of ${ringAmplitudeDps} deg/s, seed ${seed}: `
+              + `${JSON.stringify(tone)}\n${card.headline}\n${card.reasoning}`;
+            assert.ok(tone, label);
+            if (!tone.aboveLevelInPart) {
+              continue;
+            }
+            reached += 1;
+            assertSaidAsMeasured(card, tone, result, label);
+          }
+        }
+      }
+    }
+    assert.ok(reached >= 12, `only ${reached} rings sat on a tone above the level in part`);
+
+    // The ring sitting on a once-per-rev above the level in enough windows but
+    // bunched into the first part of the flight: the reason the two cards give is
+    // that one, not "too little of the flight". On yaw's unfiltered gyro only,
+    // where the vibration check looks; the stop measurement reads the filtered one.
+    // A ring small enough never to reach the level on its own, so the windows
+    // that do are the block's.
+    let bunched = 0;
+    for (const strength of [2, 2.4]) {
+      for (const untilShare of [0.3, 0.4]) {
+        const plain = buildStopFlight({axis: 'yaw', ...STOP_FAULTS.tooMuchD, frequencyHz: 30,
+          ringAmplitudeDps: 10, seed: 4242});
+        const untilS = (plain.at(-1).timeUs / 1e6) * untilShare;
+        const records = plain.map(record => {
+          const at = record.timeUs / 1e6;
+          const added = at < untilS ? strength * 8 * Math.SQRT2 * Math.sin(2 * Math.PI * 30 * at + 0.6) : 0;
+          return {...record, raw: [record.raw[0], record.raw[1], record.raw[2] + added]};
+        });
+        const series = seriesOf(records);
+        const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+        const result = recommendThreeAxes(records, mechanical);
+        const yawTones = assessAirframe(mechanical).axes.find(entry => entry.axis === 'yaw').tones;
+        const card = result.findings.find(entry => entry.id === 'OSCILLATION_MATCHES_AIRFRAME_TONE');
+        const label = `a once-per-rev at ${strength}x over the first ${untilShare * 100}% under the ring: `
+          + `${result.findings.map(entry => entry.id)}`;
+        assert.ok(card, label);
+        const tone = coincidentTone(yawTones,
+          card.basis.find(row => row.label === 'oscillation frequency after release').value);
+        assert.ok(tone?.aboveLevelInPart && !tone.aboveLevelCriteriaUnmet.includes('window-count'),
+          `${label}: ${JSON.stringify(tone)}`);
+        bunched += 1;
+        assertSaidAsMeasured(card, tone, result, `${label}\n${card.headline}\n${card.reasoning}`);
+        assert.match(card.reasoning, /too bunched together/, card.reasoning);
+      }
+    }
+    assert.equal(bunched, 4);
+
+    // A short BURST of the once-per-rev, under the persistence a steady tone needs,
+    // with the D ring sitting on it on roll — sizes either side of "at least".
+    let bursts = 0;
+    for (const [whilePresent, atLeast] of [[16.4, false], [22, true], [9.1, false]]) {
+      const records = buildStopFlight({axis: 'roll', ...STOP_FAULTS.tooMuchD, frequencyHz: 30, seed: 31});
+      const mechanical = rollPeaks([{frequencyHz: 29.3, interpolatedFrequencyHz: 30.02, bandRmsDps: 2.3,
+        attentionWindowBandRmsDps: whilePresent, attentionWindowSizeIsLowerBound: atLeast,
+        attentionPersistenceRatio: 0.05, attentionSupportingWindowCount: 4, evaluatedWindowCount: 72,
+        supportingWindowCount: 10, persistenceRatio: 0.14, attentionTemporalSpanRatio: 0.06,
+        attentionOccupiedBucketCount: 1, attentionMaximumGapRatio: 0,
+        attentionCriteriaUnmet: ['window-count', 'span', 'quarters'], attentionEligible: false,
+        bandwidthHz: 2, harmonicMatch: ONCE_PER_REV}]);
+      const result = recommendThreeAxes(records, mechanical);
+      const card = result.findings.find(entry => entry.id === 'OSCILLATION_MATCHES_AIRFRAME_TONE'
+        && entry.axis === 'roll');
+      const label = `a burst at ${whilePresent} deg/s while present: ${result.findings.map(entry => entry.id)}`;
+      assert.ok(card, label);
+      const tone = assessAirframe(mechanical).axes.find(entry => entry.axis === 'roll').tones[0];
+      assert.ok(tone.aboveLevelInPart && tone.persistenceRatio < TONE_LIMITS.persistenceRatioFloor, label);
+      bursts += 1;
+      assertSaidAsMeasured(card, tone, result, `${label}\n${card.headline}\n${card.reasoning}`);
+    }
+    assert.equal(bursts, 3);
+  });
+
+/**
+ * The coincidence card about a tone above the level for part of the range says
+ * what was measured — its size while there, for how long, its average — and the
+ * same as the airframe card about that tone: the same numbers, and the same reason
+ * it was not judged a steady tone.
+ */
+function assertSaidAsMeasured(card, tone, result, label) {
+  const axis = card.axis;
+  assert.doesNotMatch(`${card.headline} ${card.reasoning}`, /did not reach the level|persistent tone/i, label);
+  const said = aboveLevelStated(card.headline, tone.frequencyHz, axis);
+  assert.ok(said, `${label}: the headline does not state the tone as measured`);
+  assert.equal(said.size, tenths(tone.aboveLevelBandRmsDps), label);
+  assert.equal(said.atLeast, tone.sizeIsLowerBound, label);
+  assert.equal(said.share, Math.round(tone.aboveLevelShare * 100), label);
+  assert.equal(said.average, tenths(tone.bandRmsDps), label);
+  const whilePresent = card.basis.find(row =>
+    row.label === 'how large that tone was while above the attention level');
+  assert.equal(whilePresent?.value, Math.round(tone.aboveLevelBandRmsDps * 1000) / 1000, label);
+
+  // The airframe rung states the same tone, on its own card or in the basis of
+  // whatever blocks there, and its numbers are the coincidence card's.
+  const airframe = result.findings.filter(entry => entry.rung === 'airframe');
+  const rows = airframe.flatMap(entry => entry.basis.map(row => row.label)).join(' | ');
+  const there = aboveLevelStated(rows, tone.frequencyHz, axis);
+  assert.ok(there, `${label}: the airframe rung does not list it: ${rows}`);
+  assert.deepEqual(said, there, label);
+  const inPart = airframe.find(entry => entry.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
+  if (inPart && new RegExp(`^A tone at ${escapeForRegExp(tenths(tone.frequencyHz))} Hz\\b.*? on ${axis}`
+    + '(?: at \\d+ rpm)? while it was above').test(inPart.headline)) {
+    const headline = rotorToneHeadline(inPart.headline);
+    assert.deepEqual([headline.size, headline.share, headline.average], [said.size, said.share, said.average],
+      `${label}\n${inPart.headline}`);
+    // The same claim about why it is not a steady tone, in the same words.
+    const why = steadyToneSentence(inPart.headline);
+    assert.ok(why, inPart.headline);
+    assert.ok(card.reasoning.includes(why), `${label}\nthe airframe card says: ${why}`);
+  }
+}
+
+test('a tone matched to the tail rotor is judged against the logged tail speed, and said so on '
+  + 'every card', async () => {
+    // Finding 4. "outside what the logged head speed allows" was said of a tone
+    // the analyser matched to the TAIL rotor, whose identity is judged against the
+    // tail speed's own spread — on the coincidence card, on the airframe card's
+    // headline and rows, and in the app's plain line read from its codes. A head
+    // at 1300 rpm puts no main-rotor order near 30 Hz; the tail is swept across
+    // and off its once-per-rev at the D ring's 30 Hz.
+    const seen = {near: 0, established: 0};
+    for (const tailRpm of [1795, 1800, 1805, 1885, 1890, 1895, 1900]) {
+      for (const seed of [4242, 11]) {
+        const records = buildStopFlight({axis: 'yaw', ...STOP_FAULTS.tooMuchD, frequencyHz: 30,
+          ringAmplitudeDps: 14, headspeedRpm: 1300, seed});
+        const series = seriesOf(records);
+        const random = rng(seed + tailRpm);
+        series.tailspeedRpm = Float64Array.from(records.map(() => tailRpm + (random() - 0.5) * 8));
+        const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+        const tones = assessAirframe(mechanical).axes.find(entry => entry.axis === 'yaw').tones;
+        const label = `tail at ${tailRpm} rpm, seed ${seed}: ${JSON.stringify(tones)}`;
+        // The fixture is the case: the ring's tone is matched to the tail rotor,
+        // above the level for part of the range, and to nothing on the main rotor.
+        assert.ok(tones.length > 0 && tones.every(tone => tone.rotor === 'tail' && tone.aboveLevelInPart),
+          label);
+        const result = recommendThreeAxes(records, mechanical);
+        const shape = result.findings.find(entry => entry.id === 'OSCILLATION_MATCHES_AIRFRAME_TONE');
+        const inPart = result.findings.find(entry => entry.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
+        assert.ok(shape && inPart, `${label}: ${result.findings.map(entry => entry.id)}`);
+        const text = [shape, inPart].map(findingText).join(' ');
+        assert.doesNotMatch(text, /logged head speed/, `${label}\n${text}`);
+        if (tones[0].orderEstablished === false) {
+          seen.near += 1;
+          assert.match(inPart.headline,
+            /near the tail rotor's once-per-rev, outside what the logged tail speed allows/, inPart.headline);
+          assert.match(shape.headline,
+            /near the tail rotor's once-per-rev, outside what the logged tail speed allows/, shape.headline);
+          assert.match(shape.reasoning, /outside what the logged tail speed allows/, shape.reasoning);
+          // The cue the plain copy reads to say "tail" rather than "your rotor".
+          assert.ok(inPart.codes.includes('ROTOR_ORDER_MATCH_NOT_ESTABLISHED')
+            && inPart.codes.includes('NEAR_TAIL_ROTOR_ORDER'), `${label}: ${inPart.codes}`);
+        } else {
+          seen.established += 1;
+          assert.doesNotMatch(text, /outside what the logged/, `${label}\n${text}`);
+          assert.ok(!inPart.codes.includes('NEAR_TAIL_ROTOR_ORDER'), `${label}: ${inPart.codes}`);
+        }
+      }
+    }
+    assert.ok(seen.near >= 6 && seen.established >= 4, JSON.stringify(seen));
+  });
+
+test('the vibration card says a tone sits near the rotor\'s order only of the tones that do',
+  async () => {
+    // Finding 5. Where any one tone above the level was near the main rotor's
+    // once- or twice-per-rev but outside what the logged head speed allows, the
+    // card said "What it measured sits near the main rotor's once- or
+    // twice-per-rev" of everything it measured — beside a once-per-rev on another
+    // axis sitting exactly where the head speed puts it.
+    const seen = {mixed: 0, allNear: 0};
+    let configuration = 0;
+    for (const [nearHz, nearAxis] of [[61.8, 'pitch'], [58.3, 'pitch'], [31.6, 'pitch'], [61.8, 'yaw'],
+      [28.4, 'yaw']]) {
+      for (const withOnOrder of [true, false]) {
+        configuration += 1;
+        const tones = [{hz: nearHz, amp: 1.8 * 8 * Math.SQRT2, axes: [nearAxis], phase: 0.5}];
+        if (withOnOrder) {
+          tones.push({hz: 30, amp: 2 * 8 * Math.SQRT2, axes: ['roll']});
+        }
+        const series = gyroWindow({seconds: 60, seed: 12 + configuration, tones});
+        const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+        const attention = assessAirframe(mechanical).axes.flatMap(entry =>
+          entry.tones.filter(tone => tone.attentionEligible));
+        const label = `${nearHz} Hz on ${nearAxis}${withOnOrder ? ' beside a once-per-rev on roll' : ''}: `
+          + JSON.stringify(attention.map(tone => [tone.axis, tone.frequencyHz, tone.order, tone.orderEstablished]));
+        // The fixture is the case: everything above the level is named a main-rotor
+        // 1/rev or 2/rev, the swept tone outside what the head speed allows.
+        assert.ok(attention.every(tone => tone.rotor === 'main' && tone.order <= 2), label);
+        const near = attention.filter(tone => tone.orderEstablished === false);
+        const onOrder = attention.filter(tone => tone.orderEstablished === true);
+        assert.ok(near.length > 0 && onOrder.length > 0 === withOnOrder, label);
+        const card = buildRecommendations({mechanical}).findings
+          .find(entry => entry.id === 'AIRFRAME_VIBRATION_PRESENT');
+        assert.ok(card?.codes.includes('ROTOR_ORDER_NOT_ESTABLISHED'), `${label}: ${card?.codes}`);
+        if (!withOnOrder) {
+          // True of everything it measured, so said of everything.
+          seen.allNear += 1;
+          assert.match(card.reasoning, /^What it measured sits near the main rotor's once- or twice-per-rev, but outside what the logged head speed allows/,
+            card.reasoning);
+          continue;
+        }
+        seen.mixed += 1;
+        assert.doesNotMatch(card.reasoning, /What it measured sits near/, `${label}\n${card.reasoning}`);
+        assert.match(card.reasoning, /lines up with the main rotor's once- or twice-per-rev/, card.reasoning);
+        // Each tone that is only near its order is named as near it; none that
+        // sits on its order is.
+        for (const tone of near) {
+          assert.match(card.reasoning, new RegExp(`${toneOn(tone.frequencyHz, tone.axis)}, near the main rotor's `
+            + '(?:once|twice)-per-rev'), `${label}\n${card.reasoning}`);
+        }
+        for (const tone of onOrder) {
+          assert.doesNotMatch(card.reasoning, new RegExp(`${toneOn(tone.frequencyHz, tone.axis)}, near`),
+            `${label}\n${card.reasoning}`);
+        }
+      }
+    }
+    assert.deepEqual(seen, {mixed: 5, allNear: 5});
+  });
+
+test('a tone above the level for part of the flight is said not to be steady for the reason it '
+  + 'was not', async () => {
+    // Finding 6. Every such tone was said to be "too little of the flight to judge
+    // it as a steady tone" — including tones above the level in a quarter or more
+    // of the analysis windows, which met the count and failed only on being
+    // bunched into one part of the range. The reason is read from the criteria the
+    // analyser published, and checked here against its published counts.
+    const {minimumWelchWindows, minimumPersistenceRatio, minimumAttentionOccupiedBuckets,
+      maximumAttentionUnsupportedGapRatio} = MECHANICAL_CONSTANTS;
+    const shapes = [
+      ['the first quarter', at => at < 15],
+      ['the first 40%', at => at < 24],
+      ['a block in the middle', at => at >= 20 && at < 38],
+      ['the last 30%', at => at >= 42],
+      ['2 s in every 10', at => at % 10 < 2],
+      ['1.5 s in every 6', at => at % 6 < 1.5],
+      ['a 3 s burst', at => at >= 20 && at < 23],
+      ['a 5 s burst', at => at >= 30 && at < 35]
+    ];
+    const seen = {fewWindows: 0, bunched: 0};
+    let configuration = 0;
+    for (const [shape, on] of shapes) {
+      for (const hz of [30, 31.6, 47]) {
+        for (const strength of [1.4, 2.2]) {
+          configuration += 1;
+          const series = gyroWindow({seconds: 60, seed: 600 + configuration,
+            tones: [{hz, amp: strength * 8 * Math.SQRT2, on, phase: configuration}]});
+          const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+          const peak = mechanical.axes.find(axis => axis.axis === 'roll').peaks
+            .find(entry => Math.abs(entry.frequencyHz - hz) <= 2 && entry.attentionWindowBandRmsDps >= 8);
+          const label = `${hz} Hz at ${strength}x over ${shape}: ${JSON.stringify(peak)}`;
+          assert.ok(peak, label);
+          if (peak.attentionEligible) {
+            continue;
+          }
+          const result = buildRecommendations({mechanical});
+          const card = result.findings.find(entry => entry.id === 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART');
+          assert.ok(card, `${label}: ${result.findings.map(entry => entry.id)}`);
+          const row = card.basis.find(entry => entry.label.startsWith('tone above the attention level for '
+            + 'part of the range: ') && entry.label.includes(`${tenths(peak.frequencyHz)} Hz on roll`));
+          assert.ok(row, `${label}: ${card.basis.map(entry => entry.label)}`);
+          const required = Math.max(minimumWelchWindows,
+            Math.ceil(peak.evaluatedWindowCount * minimumPersistenceRatio));
+          const unmet = {
+            span: peak.attentionTemporalSpanRatio < 0.5,
+            quarters: peak.attentionOccupiedBucketCount < minimumAttentionOccupiedBuckets,
+            gap: peak.attentionMaximumGapRatio > maximumAttentionUnsupportedGapRatio
+          };
+          const why = steadyToneSentence(card.headline);
+          if (peak.attentionSupportingWindowCount < required) {
+            // Too few windows: "too little of the flight" is the reason, and it is true.
+            seen.fewWindows += 1;
+            assert.equal(why, 'That is too little of the flight to judge it as a steady tone', label);
+            assert.match(row.source, /too few of them/, row.source);
+            assert.doesNotMatch(row.source, /bunched/, row.source);
+            assert.ok(card.codes.includes('TONE_ABOVE_LEVEL_IN_TOO_FEW_WINDOWS'), `${label}: ${card.codes}`);
+            continue;
+          }
+          // Enough windows, bunched: said as that, naming each way it was bunched.
+          seen.bunched += 1;
+          assert.ok(unmet.span || unmet.quarters || unmet.gap, label);
+          assert.doesNotMatch(card.headline, /too little of the flight/, `${label}\n${card.headline}`);
+          assert.match(why ?? '', /^It was above that level in enough of the analysis windows, but they were too bunched together/,
+            `${label}\n${card.headline}`);
+          assert.equal(/spanning under half of the range/.test(why), unmet.span, `${label}\n${why}`);
+          assert.equal(/fewer than three of its four quarters/.test(why), unmet.quarters, `${label}\n${why}`);
+          assert.equal(/long gap/.test(why), unmet.gap, `${label}\n${why}`);
+          assert.match(row.source, /bunched/, row.source);
+          assert.doesNotMatch(row.source, /too few of them/, row.source);
+          assert.ok(card.codes.includes('TONE_ABOVE_LEVEL_TOO_BUNCHED'), `${label}: ${card.codes}`);
+        }
+      }
+    }
+    assert.ok(seen.fewWindows >= 6 && seen.bunched >= 12, JSON.stringify(seen));
+  });
+
+test('every code the airframe gate blocks on is named on a card, and every tone above the level in '
+  + 'part is on screen, when one stretch\'s copy of a tone is not the rotor\'s own', async () => {
+    // Finding 7, fail-safe. In a window measured in stretches, the copies of one
+    // tone were merged BEFORE the gate's outcome for each was read: a copy named
+    // the once-per-rev but outside what the logged head speed allows — past the
+    // ceiling, so the gate blocked on it as MECHANICAL_EVIDENCE_GATE_BLOCKED —
+    // merged into a louder copy from the other stretch that IS the rotor's own, and
+    // the result still blocked, with no card naming that code or the tone behind
+    // it. Under the ceiling the same merge left the near copy on no card at all.
+    const named = {MECHANICAL_EVIDENCE_NOT_MEASURED: 'BROADBAND_NOT_MEASURED'};
+    const seen = {nearBlocks: 0, nearReported: 0};
+    let configuration = 0;
+    for (const nearHz of [28.4, 31.6]) {
+      for (const [nearX, ownX] of [[2.4, 4.6], [3.6, 4.6], [4, 5.5]]) {
+        for (const nearFirst of [true, false]) {
+          configuration += 1;
+          const first = at => at < 30;
+          const second = at => at >= 150 && at < 180;
+          const series = gyroWindow({seconds: 300, rateHz: 1007, seed: 30 + configuration, tones: [
+            {hz: nearHz, amp: nearX * 8 * Math.SQRT2, on: nearFirst ? first : second, phase: 0.4},
+            {hz: 30, amp: ownX * 8 * Math.SQRT2, on: nearFirst ? second : first, phase: 1.1}]});
+          const mechanical = await analyzeMechanicalWindow(series, wholeRangeOf(series));
+          const airframe = assessAirframe(mechanical);
+          const copies = airframe.tonesAboveLevelInPart.filter(tone => tone.axis === 'roll');
+          const label = `${nearHz} Hz at ${nearX}x, 30 Hz at ${ownX}x, the near one ${nearFirst ? 'first' : 'second'}: `
+            + JSON.stringify(copies.map(tone => [tone.chunkRangeUs?.[0], tone.frequencyHz,
+              tone.aboveLevelBandRmsDps, tone.order, tone.orderEstablished, tone.blocks]));
+          // The fixture is the case: one copy of the once-per-rev per stretch, the
+          // louder one the rotor's own, the other only near it.
+          assert.equal(mechanical.chunks.length, 2, label);
+          const near = copies.find(tone => tone.orderEstablished === false);
+          const own = copies.find(tone => tone.orderEstablished === true);
+          assert.ok(copies.length === 2 && near && own && near.order === 1 && own.order === 1
+            && own.aboveLevelBandRmsDps > near.aboveLevelBandRmsDps, label);
+          if (near.blocks === 'MECHANICAL_EVIDENCE_GATE_BLOCKED') {
+            seen.nearBlocks += 1;
+          } else {
+            seen.nearReported += 1;
+          }
+          const result = buildRecommendations({mechanical});
+          const cards = result.findings.filter(entry => entry.rung === 'airframe');
+          const codes = new Set(cards.flatMap(entry => entry.codes));
+          // The guarded property: every blocking code is named on a card...
+          for (const code of result.gates.airframe.codes) {
+            assert.ok(codes.has(named[code] ?? code), `${label}: the gate blocks on ${code} and no card `
+              + `names it: ${cards.map(entry => `${entry.id} ${entry.codes}`).join(' | ')}`);
+          }
+          // ...and the copy only near the order is on screen as itself, never
+          // spoken for by the rotor's own copy from the other stretch.
+          const text = cards.map(findingText).join(' ');
+          assert.match(text, new RegExp(`${toneOn(near.frequencyHz, 'roll')}, near the main rotor's once-per-rev, `
+            + 'outside what the logged head speed allows'), `${label}\n${text}`);
+        }
+      }
+    }
+    assert.ok(seen.nearBlocks >= 4 && seen.nearReported >= 2, JSON.stringify(seen));
+  });
 
 test('the two limits behind the tone and I-term rules are load-bearing, not decoration',
   () => {
@@ -3672,7 +4689,12 @@ const I_TERM_TROUBLE_CODES = Object.freeze([
   'STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD',
   'STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS',
   'STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION',
-  'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR'
+  'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR',
+  // Re-review of round three, 3 October 2026: a standing error beside a band a
+  // cover hid, and the side a turn-following error was on.
+  'STANDING_ERROR_WITH_UNMEASURED_BAND',
+  'RATE_SHORT_OF_COMMAND_IN_EVERY_TURN',
+  'RATE_PAST_COMMAND_IN_EVERY_TURN'
 ]);
 
 /** The finding the I-term question produced on `axis`, whatever it was. */
@@ -3808,6 +4830,47 @@ test('a slow torque on a healthy integrator is never told to raise I, however th
         layout: holdLayout({holdsS}),
         setups: {roll: slowTorque(), pitch: slowTorque(), yaw: slowTorque()}});
     }
+    // NOR A BIND (round three, re-reviewed 3 October 2026). Under a 0.03-0.035
+    // Hz torque, flown as three ordinary holds of 6.1 s, a healthy integrator
+    // follows the torque — "winding", by the bind discriminator's own numbers —
+    // and the |mean| over the holds read 10-17 deg/s, so the flight was called
+    // SUSPECTED_MECHANICAL_BIND, a blocker on every gain on the axis, although the
+    // per-hold test had already refused that error as a standing one. 10 of the
+    // review's 192 cells; all ten are flown here, with two neighbours.
+    const bindCell = (hz, k) => ({gains: HOLD_NOMINAL, externalTorqueHz: hz,
+      externalTorqueDps2: 6000, externalTorquePhase: (2 * Math.PI * k) / 16, seed: 50 + k,
+      reviewBindCell: true});
+    const threeShortHolds = holdLayout({holdsS: [6.1, 6.1, 6.1]});
+    for (const cells of [[[0.03, 2], [0.03, 3], [0.03, 4]], [[0.03, 10], [0.03, 11], [0.03, 12]],
+      [[0.035, 2], [0.035, 3], [0.035, 10]], [[0.035, 11], [0.03, 5], [0.035, 4]]]) {
+      flights.push({label: `the review's bind cells ${cells.map(cell => cell.join('/')).join(', ')}`,
+        layout: threeShortHolds,
+        setups: Object.fromEntries(AXES_IN_ORDER.map((axis, at) => [axis, bindCell(...cells[at])]))});
+    }
+    // The same with the flight controller's own `iterm_limit` set low, which every
+    // real one has: the integrator follows the torque to its limit and sits there,
+    // so the SECOND bind signature, the pinned one, read the wander as a control
+    // out of travel — found beside the review's cells, 18 of 96 such cells.
+    const pinnedCell = (limit, hz, k) => ({...bindCell(hz, k), integratorLimit: limit,
+      reviewBindCell: false, pinnedCell: true});
+    flights.push({label: 'a low iterm_limit under the same torque', layout: threeShortHolds,
+      setups: {roll: pinnedCell(1, 0.03, 4), pitch: pinnedCell(1, 0.08, 6),
+        yaw: pinnedCell(2, 0.08, 12)}});
+    // A large trim — a standing torque the integrator CAN hold — under a wander
+    // (re-review of 3 October 2026). The I term sits on one side in every hold
+    // with its drift pointing outward, the bind signature fires and the error is
+    // refused hold by hold; what keeps it from reading as an integrator held
+    // against an obstacle is only that it FELL BACK between two holds. Where such
+    // an integrator happens to keep growing across the holds instead, it is read
+    // as a bind — 3 of 200 trim-heavy healthy flights in a sweep — which fails
+    // safe, a linkage checked by hand.
+    const trimCell = setup => ({gains: HOLD_NOMINAL, ...setup, trimCell: true});
+    flights.push({label: 'a large trim under a wander', layout: threeShortHolds, setups: {
+      roll: trimCell({disturbanceDps2: 3835, externalTorqueHz: 0.08, externalTorqueDps2: 2091,
+        externalTorquePhase: 5.64, gustDps2: 41, seed: 92823}),
+      pitch: trimCell({disturbanceDps2: -1757, externalTorqueHz: 0.184, externalTorqueDps2: 7795,
+        externalTorquePhase: 2.82, gustDps2: 131, seed: 757987}),
+      yaw: bindCell(0.03, 2)}});
     // Steady turns on ONE axis — the other two cannot hold while it turns — one
     // way, both ways at random, and both ways IN STEP with a wander whose half
     // period is the hold spacing: there the error's side follows the stick
@@ -3836,6 +4899,10 @@ test('a slow torque on a healthy integrator is never told to raise I, however th
 
     const raised = [];
     const cleared = [];
+    const bound = [];
+    let windingCells = 0;
+    let pinnedCells = 0;
+    let trimCells = 0;
     let slippedThrough = 0;
     let wanderNamed = 0;
     let changedSide = 0;
@@ -3870,6 +4937,48 @@ test('a slow torque on a healthy integrator is never told to raise I, however th
         if (said?.id === 'I_TERM_WITHIN_TOLERANCE'
             && hold.codes.some(code => I_TERM_TROUBLE_CODES.includes(code))) {
           cleared.push(line);
+        }
+        if (hold.bind?.suspected
+            || result.findings.some(entry => entry.id === 'SUSPECTED_MECHANICAL_BIND'
+              && entry.axis === axis)) {
+          bound.push(line);
+        }
+        if (setups[axis].reviewBindCell) {
+          // Not vacuous: by the discriminator's own numbers this integrator WAS
+          // winding against an error over the holds above its threshold, so only
+          // the per-hold refusal stands between it and a bind.
+          const drift = Math.abs(hold.bind?.meanITermDriftPerSecond ?? 0);
+          if (hold.bind?.meanAbsoluteSteadyStateErrorDps > BIND_LIMITS.errorDpsThreshold
+              && drift >= BIND_LIMITS.minimumITermDriftPerSecond
+              && Math.abs(hold.bind?.meanITermRms ?? 0) >= drift * BIND_LIMITS.windUpToDriftRatio) {
+            windingCells += 1;
+          }
+        }
+        if (setups[axis].trimCell) {
+          // Not vacuous: the signature fired, the error was refused, and the I
+          // term sat on one side drifting outward — only its falling back
+          // between holds says it followed the wander.
+          const means = hold.evidence.holds.map(entry => entry.iTermMean);
+          const side = Math.sign(means[0]);
+          const drift = hold.bind?.meanITermDriftPerSecond ?? 0;
+          const signature = hold.bind?.meanAbsoluteSteadyStateErrorDps > BIND_LIMITS.errorDpsThreshold
+            && ((Math.abs(drift) >= BIND_LIMITS.minimumITermDriftPerSecond
+              && Math.abs(hold.bind.meanITermRms) >= Math.abs(drift) * BIND_LIMITS.windUpToDriftRatio)
+              || (hold.bind.meanITermTravelShare <= AUTHORITY_LIMITS.iTermTravelShare
+                && hold.bind.meanITermToPTermRatio >= AUTHORITY_LIMITS.iTermToPTermRatio));
+          assert.ok(signature && hold.bind.standingErrorRefusal && side !== 0
+            && means.every(value => Math.sign(value) === side) && Math.sign(drift) === side
+            && means.some((value, at) => at > 0 && Math.abs(value) < Math.abs(means[at - 1])),
+          `${line}: the trim cell must stand where only the I term falling back keeps it from a `
+            + `bind: ${JSON.stringify(hold.bind)} [${means}]`);
+          trimCells += 1;
+        }
+        if (setups[axis].pinnedCell
+            && hold.bind?.meanAbsoluteSteadyStateErrorDps > BIND_LIMITS.errorDpsThreshold
+            && hold.bind?.meanITermTravelShare <= AUTHORITY_LIMITS.iTermTravelShare
+            && hold.bind?.meanITermToPTermRatio >= AUTHORITY_LIMITS.iTermToPTermRatio) {
+          // Pinned by the discriminator's own numbers, likewise.
+          pinnedCells += 1;
         }
         if (lockStep) {
           // The fixture IS the trap: normalised to its own turn direction, every
@@ -3913,6 +5022,13 @@ test('a slow torque on a healthy integrator is never told to raise I, however th
     assert.deepEqual(cleared, [], `${cleared.length} wanders were given the all-clear`);
     assert.ok(wanderNamed >= trials / 2,
       `the slow wander must be named and a flight given to settle it: ${wanderNamed} of ${trials}`);
+    assert.ok(windingCells >= 10,
+      `the review's bind cells must still wind the I term up, or they test nothing: ${windingCells}`);
+    assert.ok(pinnedCells >= 3,
+      `the iterm_limit cells must still pin the I term, or they test nothing: ${pinnedCells}`);
+    assert.equal(trimCells, 2, 'both trim cells must be flown');
+    assert.deepEqual(bound, [], `${bound.length} of ${trials} healthy integrators under a slow torque `
+      + `were called a bind:\n${bound.join('\n')}`);
 
     // The reviewer's round-one cells at 0.22 and 0.28 Hz, two long holds, still
     // reach SLOW_WANDER_NOT_FROM_THE_I_TERM.
@@ -3923,6 +5039,309 @@ test('a slow torque on a healthy integrator is never told to raise I, however th
       }), 'yaw');
       assert.equal(iTermFinding(result, 'yaw')?.id, 'SLOW_WANDER_NOT_FROM_THE_I_TERM',
         `${hz} Hz at ${torque}: ${result.findings.map(entry => entry.id).join(', ')}`);
+    }
+
+    // CONTROLS: A GENUINE BIND STILL BLOCKS IN MOVING AIR, and outranks a "Raise
+    // I" on another axis (re-review of 3 October 2026). These replace controls
+    // flown in still air only, which passed while the gate above switched a real
+    // bind off whenever anything else moved the aircraft too: a governor
+    // hunting, or wind, under a control that cannot move far enough against a
+    // standing torque larger than it can hold. That error is refused hold by
+    // hold, as an error that moved, and the axis fell to a next-flight card about
+    // a slow wander — so a gain change on another axis became the one
+    // instruction while the linkage bound (12 of 12 such flights in the review).
+    //
+    // Each flight: two axes bound in moving air, the third with no integrator
+    // against a torque, which on its own earns "Raise I". First two flights drawn
+    // from the review's ranges, rotating the axes; then one flight with a bind
+    // only each half of the integrator test keeps (see `integratorHeldAgainst` in
+    // the module): roll's error stays on one side with the I term on it, but
+    // the I term falls back between two holds; yaw's error changes side
+    // between holds while the I term grows outward on one side through every one.
+    const boundInMovingAir = () => {
+      const limit = between(0.15, 0.25);
+      return {gains: HOLD_NOMINAL, actuatorLimit: limit,
+        disturbanceDps2: (random() < 0.5 ? -1 : 1) * limit * 800 * between(1.15, 1.5),
+        gustDps2: between(80, 300), externalTorqueHz: between(0.05, 0.25),
+        externalTorqueDps2: between(40, 200), externalTorquePhase: between(0, 2 * Math.PI),
+        seed: 1 + Math.floor(random() * 1e6)};
+    };
+    const noIntegrator = () => ({gains: {...HOLD_NOMINAL, ki: 0},
+      disturbanceDps2: (random() < 0.5 ? -1 : 1) * between(300, 600),
+      seed: 1 + Math.floor(random() * 1e6)});
+    const movingAirFlights = [0, 1].map(at => {
+      const noI = AXES_IN_ORDER[at];
+      const layout = holdLayout({holdsS: Array.from({length: 3 + at}, () => between(6, 9))});
+      return {label: `moving-air binds, draw ${at}`, layout, noI, setups: Object.fromEntries(
+        AXES_IN_ORDER.map(axis => [axis, axis === noI ? noIntegrator() : boundInMovingAir()]))};
+    });
+    movingAirFlights.push({label: 'a bind each half of the integrator test keeps alone',
+      layout: holdLayout({holdsS: [7, 7.5, 8, 7]}), noI: 'pitch', setups: {
+        roll: {gains: HOLD_NOMINAL, actuatorLimit: 0.19, disturbanceDps2: -181, gustDps2: 354,
+          externalTorqueHz: 0.061, externalTorqueDps2: 107, externalTorquePhase: 4.69, seed: 532121},
+        pitch: {gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: 450, seed: 77},
+        yaw: {gains: HOLD_NOMINAL, actuatorLimit: 0.194, disturbanceDps2: 165, gustDps2: 139,
+          externalTorqueHz: 0.065, externalTorqueDps2: 349, externalTorquePhase: 2.46, seed: 351443}
+      }});
+    let boundOverARefusal = 0;
+    const heldBy = new Set();
+    for (const {label, layout, noI, setups} of movingAirFlights) {
+      const withCommands = {};
+      for (const axis of AXES_IN_ORDER) {
+        withCommands[axis] = {commands: layout.commands, ...setups[axis]};
+      }
+      const result = recommendEachAxis(threeAxisRecords(withCommands, layout.durationS));
+      for (const axis of AXES_IN_ORDER.filter(entry => entry !== noI)) {
+        const hold = result.gates.holds[axis];
+        const signed = hold.evidence.holds.map(entry =>
+          `${entry.steadyStateErrorDps.toFixed(1)}/I ${entry.iTermMean.toFixed(2)}`);
+        const line = `${label}, ${axis}: ${iTermFinding(result, axis)?.id} [${signed.join(' ')}] `
+          + `[${hold.codes.join(',')}] ${JSON.stringify(hold.bind)}`;
+        const said = result.findings.find(entry => entry.id === 'SUSPECTED_MECHANICAL_BIND'
+          && entry.axis === axis);
+        assert.ok(said, `${line}: a genuine bind in moving air must still be named`);
+        assert.equal(said.kind, 'blocker', line);
+        assert.equal(said.rung, 'axis-mechanical', line);
+        assert.ok(!raisedIOn(result, axis), line);
+        if (hold.bind.standingErrorRefusal) {
+          // The case the gate lost: the error moved, and only the integrator,
+          // still held against it, says this is a bind and not a wander.
+          boundOverARefusal += 1;
+          heldBy.add(hold.bind.integratorHeldAgainstTheError);
+          assert.match(said.reasoning, /moved/, `${line}: said as what was measured`);
+        }
+      }
+      // The bind is THE instruction; the axis with no integrator does earn "Raise
+      // I" — the competition is real — but it waits behind the linkage.
+      const actNow = result.findings.filter(entry => entry.actNow);
+      assert.equal(actNow.length, 1, `${label}: ${actNow.map(entry => entry.id)}`);
+      assert.equal(actNow[0].id, 'SUSPECTED_MECHANICAL_BIND',
+        `${label}: the one instruction must be the linkage, not ${actNow[0].id}:${actNow[0].axis}`);
+      assert.ok(raisedIOn(result, noI), `${label}, ${noI}: no integrator must still reach "Raise I", `
+        + `or the bind outranks nothing: ${iTermFinding(result, noI)?.id}`);
+      assert.ok(!result.findings.some(entry => entry.id === 'I_TOO_LOW' && entry.actNow), label);
+    }
+    // Not vacuous: the binds reached the per-hold refusal that switched them off,
+    // and each half of the integrator test carried one on its own.
+    assert.ok(boundOverARefusal >= 4,
+      `only ${boundOverARefusal} moving-air binds were refused hold by hold, so this proves little`);
+    assert.deepEqual([...heldBy].sort(), ['growing-on-one-side', 'on-the-error-side'],
+      'each half of the integrator test must carry a bind');
+  });
+
+/**
+ * A control that cannot move past a stop, against a standing torque just past
+ * what that stop allows, so a bind holds the error at about `errorDps` on
+ * `side` — on an aircraft whose I term carries a trim of `trimLogged`, because
+ * another path adds a constant to the output (round seven, 3 October 2026).
+ * Logged terms are scaled so the I term winds at about `windingLogged` a second.
+ * 800 and 2 are `simulateHoldFlight`'s control authority and damping: the stop
+ * at `side * limit` leaves the rate short by `errorDps`, and with a free linkage
+ * the I term would sit at its trim.
+ */
+function boundAgainstATrim({side, errorDps, windingLogged, trimLogged, limit}) {
+  const loggedTermScale = windingLogged / (HOLD_NOMINAL.ki * errorDps);
+  const iTermStart = trimLogged / loggedTermScale;
+  const needed = side * (limit + (2 * errorDps) / 800);
+  return {gains: HOLD_NOMINAL, actuatorLimit: limit, disturbanceDps2: -side * (800 * limit + 2 * errorDps),
+    outputBias: needed - iTermStart, iTermStart, loggedTermScale};
+}
+
+test('a bind still blocks where the I term carries a trim opposite the error, in moving air, '
+  + 'and a working integrator closing its error is not one', () => {
+  // THE HOLE (code review of round six, 3 October 2026). A per-hold refusal keeps
+  // a bind only where the integrator still looks held against the error: its
+  // mean on the error's side in every hold, or on one side and growing. Both
+  // read WHERE the I term sits, and an I term carrying a trim sits wherever the
+  // trim puts it. Twelve of fifty real axes with holds had it opposite the error.
+  // So a tail linkage binding with the error at +5 deg/s, on an I term trimmed at
+  // -40 and winding up through -30, neither sat on the error's side nor grew —
+  // and in moving air the bind was switched off, the axis read as a slow wander,
+  // and "Raise I" on another axis became the one instruction.
+  //
+  // Each flight here: one axis bound in moving air with its I term trimmed
+  // against the error, blipped away from the trim between holds so the trim
+  // lasts the flight; one with no integrator against a torque, which earns
+  // "Raise I" on its own; the third quiet. Drawn from the opposite-trim family's
+  // ranges (trims up to 60, bind errors 5-9 deg/s, winding 1-1.8 a second,
+  // a wander of 20-60 deg/s² and gusts), axes and sides rotating.
+  const random = rng(117);
+  const between = (low, high) => low + random() * (high - low);
+  const flights = [];
+  for (let at = 0; at < 4; at += 1) {
+    const holdsS = Array.from({length: 3 + (at % 2)}, () => between(6, 7.5));
+    const layout = holdLayout({holdsS});
+    const bound = AXES_IN_ORDER[at % 3];
+    const noI = AXES_IN_ORDER[(at + 1) % 3];
+    const side = at % 2 === 0 ? -1 : 1;
+    const windingLogged = between(1, 1.8);
+    const setups = {};
+    for (const axis of AXES_IN_ORDER) {
+      setups[axis] = {commands: layout.commands, gains: HOLD_NOMINAL, seed: 1 + Math.floor(random() * 1e6)};
+    }
+    setups[noI] = {commands: layout.commands, gains: {...HOLD_NOMINAL, ki: 0},
+      disturbanceDps2: (random() < 0.5 ? -1 : 1) * between(300, 600), seed: 1 + Math.floor(random() * 1e6)};
+    const errorDps = between(5, 9);
+    const span = windingLogged * layout.durationS;
+    const trimLogged = -side * Math.min(60, between(span + 5, span + 20));
+    const limit = between(0.15, 0.25);
+    const externalTorqueDps2 = between(20, 60);
+    const externalTorqueHz = between(0.05, 0.25);
+    const externalTorquePhase = between(0, 2 * Math.PI);
+    const gustDps2 = between(80, 250);
+    const seed = 1 + Math.floor(random() * 1e6);
+    setups[bound] = {...boundAgainstATrim({side, errorDps, windingLogged, trimLogged, limit}),
+      externalTorqueDps2, externalTorqueHz, externalTorquePhase, gustDps2, seed,
+      commands: layout.commands.map(segment => ({...segment, dps: -side * segment.dps}))};
+    flights.push({label: `opposite trim, draw ${at}: ${bound} bound on side ${side}, trim `
+      + `${trimLogged.toFixed(0)}`, layout, bound, noI, side, setups});
+  }
+
+  let oppositeEveryHold = 0;
+  const refusals = new Set();
+  for (const {label, layout, bound, noI, side, setups} of flights) {
+    const result = recommendEachAxis(threeAxisRecords(setups, layout.durationS));
+    const hold = result.gates.holds[bound];
+    const holds = hold.evidence.holds;
+    const line = `${label}: ${iTermFinding(result, bound)?.id} [${holds.map(entry =>
+      `${entry.steadyStateErrorDps.toFixed(1)}/I ${entry.iTermMean.toFixed(1)}/dI `
+      + `${entry.iTermDriftPerSecond.toFixed(2)}`).join(' ')}] [${hold.codes}] ${JSON.stringify(hold.bind)}`;
+
+    // Not vacuous: the error stood on the bind's side in every hold and was
+    // refused hold by hold, and neither reading of where the I term sat keeps it.
+    assert.equal(hold.evidence.status, 'captured', line);
+    assert.ok(holds.every(entry => Math.sign(entry.steadyStateErrorDps) === side), line);
+    assert.ok(hold.bind.standingErrorRefusal, `${line}: the error must be refused hold by hold`);
+    refusals.add(hold.bind.standingErrorRefusal);
+    const onErrorSide = holds.every(entry => Math.sign(entry.iTermMean) === side);
+    const iSide = Math.sign(holds[0].iTermMean);
+    const growing = holds.every(entry => Math.sign(entry.iTermMean) === iSide)
+      && holds.every((entry, at) => at === 0
+        || Math.abs(entry.iTermMean) >= Math.abs(holds[at - 1].iTermMean))
+      && Math.sign(hold.bind.meanITermDriftPerSecond) === iSide;
+    assert.ok(!onErrorSide && !growing, `${line}: where the I term sat must not decide this one`);
+    if (holds.every(entry => Math.sign(entry.iTermMean) === -side)) {
+      oppositeEveryHold += 1;
+    }
+
+    // The bind is named, as a blocker, read through the movement, and said as
+    // what was measured: the I term wound toward the error, and the error stood.
+    const said = result.findings.find(entry => entry.id === 'SUSPECTED_MECHANICAL_BIND'
+      && entry.axis === bound);
+    assert.ok(said, `${line}: a genuine bind against an opposite trim must still be named`);
+    assert.equal(said.kind, 'blocker', line);
+    assert.equal(said.rung, 'axis-mechanical', line);
+    assert.ok(!raisedIOn(result, bound), line);
+    assert.equal(hold.bind.integratorHeldAgainstTheError, 'winding-toward-the-error', line);
+    assert.match(said.reasoning, /moved/, line);
+    assert.match(said.reasoning, /wound toward that error in every hold/, `${line}: ${said.reasoning}`);
+    assert.doesNotMatch(said.reasoning, /wound up large/,
+      `${line}: an I term unwinding toward zero did not wind up large: ${said.reasoning}`);
+
+    // THE instruction is the linkage. The axis with no integrator still earns
+    // "Raise I" — the competition is real — but waits behind it.
+    const actNow = result.findings.filter(entry => entry.actNow);
+    assert.equal(actNow.length, 1, `${label}: ${actNow.map(entry => `${entry.id}:${entry.axis}`)}`);
+    assert.equal(`${actNow[0].id}:${actNow[0].axis}`, `SUSPECTED_MECHANICAL_BIND:${bound}`,
+      `${label}: the one instruction must be the linkage`);
+    assert.ok(raisedIOn(result, noI), `${label}, ${noI}: no integrator must still reach "Raise I": `
+      + `${iTermFinding(result, noI)?.id}`);
+    assert.ok(!result.findings.some(entry => entry.id === 'I_TOO_LOW' && entry.actNow), label);
+  }
+  // Not vacuous: the trim was opposite the error through every hold of most of
+  // them, and both per-hold refusals were met.
+  assert.ok(oppositeEveryHold >= 3, `the trim stayed opposite in only ${oppositeEveryHold}`);
+  assert.deepEqual([...refusals].sort(),
+    ['STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD', 'STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT']);
+
+  // CONTROL: A WORKING INTEGRATOR CLOSING ITS ERROR IS NOT A BIND. A soft one
+  // (ki a quarter of nominal), trimmed opposite the error, catching up with a
+  // torque that stepped in at the start, in moving air: it winds toward the
+  // error in every hold, faster than the winding floor, exactly as the bind
+  // above does — but the error SHRINKS across the holds as it winds, which a
+  // bound control cannot do. Only that keeps it from being called a bind.
+  const layout = holdLayout({holdsS: [7.5, 6.4, 7.4, 7.8]});
+  const setups = {};
+  for (const axis of AXES_IN_ORDER) {
+    setups[axis] = {commands: layout.commands, gains: HOLD_NOMINAL, seed: 5};
+  }
+  const loggedTermScale = 11.7;
+  const iTermStart = 72 / loggedTermScale;
+  setups.pitch = {commands: layout.commands, gains: {...HOLD_NOMINAL, ki: 0.0124},
+    disturbanceDps2: 4047, outputBias: -iTermStart, iTermStart, loggedTermScale,
+    externalTorqueHz: 0.131, externalTorqueDps2: 585, externalTorquePhase: 2.81, gustDps2: 87,
+    seed: 22930};
+  const result = recommendEachAxis(threeAxisRecords(setups, layout.durationS));
+  const hold = result.gates.holds.pitch;
+  const holds = hold.evidence.holds;
+  const side = Math.sign(holds[0].steadyStateErrorDps);
+  const line = `catching up: ${iTermFinding(result, 'pitch')?.id} [${holds.map(entry =>
+    `${entry.steadyStateErrorDps.toFixed(1)}/I ${entry.iTermMean.toFixed(1)}/dI `
+    + `${entry.iTermDriftPerSecond.toFixed(2)}`).join(' ')}] ${JSON.stringify(hold.bind)}`;
+  const drift = Math.abs(hold.bind.meanITermDriftPerSecond);
+  assert.ok(hold.bind.meanAbsoluteSteadyStateErrorDps > BIND_LIMITS.errorDpsThreshold
+    && drift >= BIND_LIMITS.minimumITermDriftPerSecond
+    && Math.abs(hold.bind.meanITermRms) >= drift * BIND_LIMITS.windUpToDriftRatio,
+  `${line}: the winding signature must fire, or this tests nothing`);
+  assert.ok(hold.bind.standingErrorRefusal, line);
+  assert.ok(side !== 0 && holds.every(entry => Math.sign(entry.steadyStateErrorDps) === side
+    && Math.sign(entry.iTermMean) === -side && Math.sign(entry.iTermDriftPerSecond) === side
+    && Math.abs(entry.iTermDriftPerSecond) >= BIND_LIMITS.minimumITermDriftPerSecond),
+  `${line}: it must wind toward the error in every hold, past the floor, from the far side`);
+  const meanOf = list => list.reduce((total, entry) =>
+    total + side * entry.steadyStateErrorDps * entry.measuredDurationUs, 0)
+    / list.reduce((total, entry) => total + entry.measuredDurationUs, 0);
+  assert.ok(meanOf(holds.slice(2)) < 0.5 * meanOf(holds.slice(0, 2)),
+    `${line}: the error must close across the holds, or this tests nothing`);
+  assert.ok(!hold.bind.suspected
+    && !result.findings.some(entry => entry.id === 'SUSPECTED_MECHANICAL_BIND'), line);
+});
+
+test('on a real log the I term winds toward setpoint minus gyro, the side the bind gate reads',
+  {skip: REAL_LOG ? false : 'set ROTORLENS_REAL_LOG'}, () => {
+    // `integratorHeldAgainst` reads an I term on the error's side as one wound
+    // against it. That rests on a sign convention RotorLens does not set: the
+    // error is computed here as setpoint minus gyro, and the I term is whatever
+    // the firmware logged. Any PID has dI/dt = ki * error, so over a short window
+    // the I term must move the way the window's error points. Checked on the app's
+    // own records, axis by axis; were a decoder or a field map ever to flip one,
+    // the gate would read a wound integrator as a following one.
+    const session = sessionOf(REAL_LOG);
+    for (const axis of AXES_IN_ORDER) {
+      const {records, usable} = buildAnalysisRecords(session, {axis});
+      assert.ok(usable, axis);
+      const index = AXES_IN_ORDER.indexOf(axis);
+      let withError = 0;
+      let againstError = 0;
+      let start = 0;
+      while (start < records.length) {
+        let end = start;
+        while (end < records.length && records[end].timeUs - records[start].timeUs < 50_000) {
+          end += 1;
+        }
+        if (end >= records.length) {
+          break;
+        }
+        let sum = 0;
+        for (let at = start; at < end; at += 1) {
+          sum += records[at].setpoint[index] - records[at].gyro[index];
+        }
+        const meanError = sum / (end - start);
+        const change = records[end].terms[1] - records[start].terms[1];
+        // Only where the error was large enough to move an integrator visibly.
+        if (Math.abs(meanError) > 5 && Number.isFinite(change) && change !== 0) {
+          if (Math.sign(change) === Math.sign(meanError)) {
+            withError += 1;
+          } else {
+            againstError += 1;
+          }
+        }
+        start = end;
+      }
+      const windows = withError + againstError;
+      assert.ok(windows >= 50, `${axis}: only ${windows} windows with an error to read`);
+      assert.ok(withError >= 0.9 * windows,
+        `${axis}: the I term moved with setpoint minus gyro in ${withError} of ${windows} windows`);
     }
   });
 
@@ -3955,7 +5374,16 @@ test('too little I still earns "Raise I" from three ordinary holds, and two are 
           + `${iTermFinding(result, axis)?.id} [${result.gates.holds[axis].codes}]`);
       }
       // One change at a time: exactly one of them is the instruction.
-      assert.equal(result.findings.filter(entry => entry.id === 'I_TOO_LOW').length, 1, label);
+      const raise = result.findings.filter(entry => entry.id === 'I_TOO_LOW');
+      assert.equal(raise.length, 1, label);
+      // Said as what was measured (re-review of 3 October 2026). The side rule
+      // does not refuse a slow wander — one slow enough keeps its side through
+      // three holds — and the card credited it with that; what refuses it is the
+      // per-hold clearance, and the card now says both, in the hold count read.
+      const holdCount = result.gates.holds[raise[0].axis].holdCount;
+      assert.match(raise[0].reasoning, new RegExp(`on the same side in every one of the ${holdCount} `
+        + 'holds, and larger than its own movement in each'), raise[0].reasoning);
+      assert.doesNotMatch(raise[0].reasoning, /a slow wander does not do/, raise[0].reasoning);
     }
 
     // Turns both ways under the tail's own torque: the standing error stays on
@@ -4018,6 +5446,43 @@ test('too little I still earns "Raise I" from three ordinary holds, and two are 
     assert.ok(flipSaid.codes.includes('STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION'),
       `${flipSaid.codes}`);
     assert.match(flipSaid.confirm, /one direction|one way/i, flipSaid.confirm);
+    // Said with its side (re-review of 3 October 2026): this loop falls SHORT of
+    // the command in every turn, measured in each turn's own direction.
+    assert.ok(flipSaid.codes.includes('RATE_SHORT_OF_COMMAND_IN_EVERY_TURN'), `${flipSaid.codes}`);
+    assert.match(flipSaid.reasoning, /fell short of the command/, flipSaid.reasoning);
+    assert.match(flipSaid.reasoning, /lags behind every turn/, flipSaid.reasoning);
+    assert.ok(flipSaid.candidates.some(entry => /too little I/i.test(entry)), `${flipSaid.candidates}`);
+
+    // AND THE OTHER SIDE. The card said "a loop that lags behind every turn does
+    // that" whichever side the error was on — including for an aircraft turning
+    // FASTER than commanded both ways, which is what a feedforward set too high
+    // does. Swept over the review's two settings: every turn past the command,
+    // said so, with feedforward named, and still nothing read about the I term.
+    for (const feedforward of [0.01, 0.02]) {
+      const leadSetups = {...flipSetups, yaw: {...flipSetups.yaw, feedforward}};
+      const led = recommendEachAxis(threeAxisRecords(leadSetups, flips.durationS));
+      const hold = led.gates.holds.yaw;
+      const normalised = hold.evidence.holds.map(entry =>
+        Math.sign(entry.setpointMedianDps) * entry.steadyStateErrorDps);
+      const label = `feedforward ${feedforward}: [${normalised.map(value => value.toFixed(1))}] `
+        + `[${hold.codes}]`;
+      // The fixture: past the command in every turn, by more than a standing error.
+      assert.ok(normalised.every(value => value < -pidEvidence.HOLD_READING_THRESHOLDS.errorDps),
+        label);
+      assert.ok(!raisedIOn(led, 'yaw'), label);
+      const said = iTermFinding(led, 'yaw');
+      assert.equal(said?.id, 'I_TERM_NOT_JUDGED', `${label}: ${said?.id}`);
+      assert.ok(said.codes.includes('STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION'), label);
+      assert.ok(said.codes.includes('RATE_PAST_COMMAND_IN_EVERY_TURN'), label);
+      assert.ok(!said.codes.includes('RATE_SHORT_OF_COMMAND_IN_EVERY_TURN'), label);
+      assert.equal(said.direction, null);
+      assert.match(said.reasoning, /ran past the command/, said.reasoning);
+      assert.doesNotMatch(spokenText(said), /lags? behind|fell short/i, spokenText(said));
+      assert.ok(said.candidates.some(entry => /feedforward/i.test(entry)), `${said.candidates}`);
+      // What to fly separates them: a still hover commands nothing for a
+      // feedforward to add to.
+      assert.match(said.confirm, /still hovers?/i, said.confirm);
+    }
   });
 
 test('the I-term all-clear rests on a measurement that could have seen trouble, never elimination',
@@ -4052,15 +5517,51 @@ test('the I-term all-clear rests on a measurement that could have seen trouble, 
       // Both I-term signatures — a standing error and an in-band wobble, which is
       // refused — under a vibration that hides the wobble. The review had "Raise
       // I" here: the standing error was read, and the hunt beside it was not seen.
-      ['both signatures under a fast oscillation', () => ({gains: {...HOLD_NOMINAL, ki: 0},
-        disturbanceDps2: 400, externalTorqueHz: between(0.5, 1.2), externalTorqueDps2: 1500,
-        extraTorques: [{hz: 12, dps2: 20000}]})]
+      //
+      // FIXED in the re-review of 3 October 2026. This family laid a 12 Hz,
+      // 20000 deg/s² torque over a 4.7 deg/s standing error: a per-hold ripple of
+      // about 24 deg/s, which the per-hold rule refuses every time, so it never
+      // met a cover SMALLER than the error — which is where "Raise I" was still
+      // given (2 of 40 flights with a fast torque, 10 of 40 under gyro noise).
+      // Both covers are now drawn from the review's own ranges, and each family
+      // flies the review's two flights that reached "Raise I" first.
+      ['both signatures under a fast oscillation', coverDraw([
+        {standing: -1436, wobbleHz: 1.196, wobble: 1283, fastHz: 9.97, fast: 2158, seed: 749740},
+        {standing: -1169, wobbleHz: 1.142, wobble: 973, fastHz: 14.54, fast: 1677, seed: 161966}
+      ], false)],
+      ['both signatures under gyro noise', coverDraw([
+        {standing: -1275, wobbleHz: 0.84, wobble: 1397, noise: 391.9, seed: 46946},
+        {standing: 909, wobbleHz: 0.781, wobble: 880, noise: 200.2, seed: 474000}
+      ], true)]
     ];
+    /**
+     * No integrator, a standing torque, an in-band wobble beside it, and a cover
+     * over both: the listed flights first, then draws from the review's ranges.
+     */
+    function coverDraw(cells, noisy) {
+      let used = 0;
+      return () => {
+        const cell = cells[used] ?? {
+          standing: (random() < 0.5 ? -1 : 1) * between(600, 1500),
+          wobbleHz: between(0.5, 1.4), wobble: between(800, 3000),
+          fastHz: between(6, 15), fast: between(1000, 8000), noise: between(50, 400)
+        };
+        used += 1;
+        return {gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: cell.standing,
+          externalTorqueHz: cell.wobbleHz, externalTorqueDps2: cell.wobble,
+          ...(noisy ? {noiseDps: cell.noise} : {extraTorques: [{hz: cell.fastHz, dps2: cell.fast}]}),
+          ...(cell.seed ? {seed: cell.seed} : {})};
+      };
+    }
+    const covered = new Set(['both signatures under a fast oscillation',
+      'both signatures under gyro noise']);
     const layout = holdLayout({holdsS: [8, 8, 8]});
     const cleared = [];
     const reached = {masked: 0, noisy: 0};
     let inBandSeen = 0;
     let standingUnderCover = 0;
+    let noiseCheckedFirst = 0;
+    let noiseCheckedFirstUnderABranch = 0;
     for (let flight = 0; flight < families.length; flight += 1) {
       const setups = {};
       const names = {};
@@ -4084,9 +5585,30 @@ test('the I-term all-clear rests on a measurement that could have seen trouble, 
         // Nor is anything under the cover read as a standing error: a hunt the
         // cover hid beside it would make it the conflicting signature.
         assert.ok(!raisedIOn(result, axis), `${line}: "Raise I" under the cover`);
-        if (names[axis] === 'both signatures under a fast oscillation'
-            && hold.codes.includes('STEADY_STATE_ERROR_PRESENT')) {
+        // THE HOLE the re-review found: under a cover, every hold's mean clear of
+        // what moved in it, on one side, in enough holds — so only the cover
+        // stood between the error and "increase". It is refused by name, and
+        // said: a next flight, never a reading of the I term.
+        const holds = hold.evidence.holds ?? [];
+        if (covered.has(names[axis])
+            && (hold.codes.includes('OSCILLATION_ABOVE_I_TERM_BAND')
+              || hold.codes.includes('SLOW_RIPPLE_NOT_CLEAR_OF_NOISE'))
+            && holds.length >= pidEvidence.EVIDENCE_LIMITS.minimumHoldsForStandingError
+            && holds.every(entry => Math.abs(entry.steadyStateErrorDps) > entry.errorRippleRmsDps)
+            && (holds.every(entry => entry.steadyStateErrorDps > 0)
+              || holds.every(entry => entry.steadyStateErrorDps < 0))) {
           standingUnderCover += 1;
+          assert.ok(hold.codes.includes('STANDING_ERROR_WITH_UNMEASURED_BAND'), line);
+          assert.ok(['I_TERM_NOT_JUDGED', 'I_TERM_VERDICT_UNSTABLE'].includes(said?.id), line);
+          assert.equal(said.kind, 'next-flight', line);
+          if (said.id === 'I_TERM_NOT_JUDGED') {
+            assert.match(said.reasoning, /same side in every one of the \d+ holds/, said.reasoning);
+            assert.match(said.reasoning, /could not|hid whether/i, said.reasoning);
+            assert.ok(said.candidates.some(entry => /too little I/i.test(entry)), `${said.candidates}`);
+            if (hold.codes.includes('OSCILLATION_ABOVE_I_TERM_BAND')) {
+              assert.match(said.confirm, /^Settle what is shaking first/, said.confirm);
+            }
+          }
         }
         // An in-band movement is never described as slower than the band
         // (item 3), whichever card it reached.
@@ -4115,6 +5637,19 @@ test('the I-term all-clear rests on a measurement that could have seen trouble, 
           reached.noisy += 1;
           assert.match(said.reasoning, /noise/i, `${line}: ${said.reasoning}`);
           assert.match(said.reasoning, /\d+(?:\.\d+)? deg\/s RMS/, said.reasoning);
+          // WHAT HID THE BAND IS DEALT WITH FIRST, whatever the card goes on to ask
+          // (re-review of 3 October 2026): the noise is checked before any hold is
+          // flown again, including where a branch replaced the confirm with its
+          // own — a standing error beside the band, here. A shake above the band
+          // comes first when there is one.
+          if (!hold.codes.includes('OSCILLATION_ABOVE_I_TERM_BAND')) {
+            assert.match(said.confirm, /^Check the gyro mounting and the vibration findings on this flight first\. Then fly \d+ or more /,
+              `${line}: ${said.confirm}`);
+            noiseCheckedFirst += 1;
+            if (hold.codes.includes('STANDING_ERROR_WITH_UNMEASURED_BAND')) {
+              noiseCheckedFirstUnderABranch += 1;
+            }
+          }
         }
         // An in-band movement the noise hid is said to be inside the band.
         if (inBand && hold.codes.includes('SLOW_RIPPLE_NOT_CLEAR_OF_NOISE')) {
@@ -4128,8 +5663,28 @@ test('the I-term all-clear rests on a measurement that could have seen trouble, 
     assert.ok(reached.masked >= 3, `the fast-oscillation road must be reached: ${reached.masked}`);
     assert.ok(reached.noisy >= 3, `the noisy-ripple road must be reached: ${reached.noisy}`);
     assert.ok(inBandSeen >= 2, `an in-band ripple under the noise must be reached: ${inBandSeen}`);
-    assert.ok(standingUnderCover >= 2,
-      `the standing error under a fast oscillation must be there to misread: ${standingUnderCover}`);
+    assert.ok(noiseCheckedFirst >= 3 && noiseCheckedFirstUnderABranch >= 1,
+      `the noise check must be reached, and beside a standing error: ${noiseCheckedFirst}, `
+      + `${noiseCheckedFirstUnderABranch}`);
+    // And ahead of a branch that writes its own confirm, which is where it was
+    // being lost: a wander in step with three holds, under gyro noise, changes
+    // side between them — the calm-air hold is asked for only after the noise.
+    const inStep = holdLayout({holdsS: [6.1, 6.1, 6.1]});
+    const noisySides = recommendFor(simulateHoldFlight({axis: 'yaw', gains: HOLD_NOMINAL,
+      externalTorqueHz: 1 / 13, externalTorqueDps2: 2000, externalTorquePhase: 2.09, noiseDps: 100,
+      commands: inStep.commands, durationS: inStep.durationS}), 'yaw');
+    const sidesCodes = noisySides.gates.holds.yaw.codes;
+    assert.ok(sidesCodes.includes('SLOW_RIPPLE_NOT_CLEAR_OF_NOISE')
+      && sidesCodes.includes('STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS')
+      && !sidesCodes.includes('OSCILLATION_ABOVE_I_TERM_BAND'), `[${sidesCodes}]`);
+    const sidesSaid = iTermFinding(noisySides, 'yaw');
+    assert.equal(sidesSaid?.id, 'I_TERM_NOT_JUDGED', `[${sidesCodes}]`);
+    assert.match(sidesSaid.confirm, /^Check the gyro mounting and the vibration findings on this flight first\. Then fly \d+ or more still holds .* in calm air, with the other two axes quiet, and watch the head-speed trace/,
+      sidesSaid.confirm);
+    // Not vacuous: the review's four flights stand in the hole on this layout,
+    // and nothing but the cover stood between each and "Raise I".
+    assert.ok(standingUnderCover >= 4,
+      `a standing error clear in every hold under a cover must be there to misread: ${standingUnderCover}`);
 
     // CONTROL: a quiet, healthy loop still earns the all-clear, and the card says
     // what was measured and the size it would have seen.
@@ -4144,6 +5699,36 @@ test('the I-term all-clear rests on a measurement that could have seen trouble, 
       assert.equal(said?.id, 'I_TERM_WITHIN_TOLERANCE', `${axis}: ${quiet.gates.holds[axis].codes}`);
       assert.match(said.reasoning, /neither sat off the commanded rate nor wandered/);
       assert.match(said.reasoning, /under the 2 deg\/s/, said.reasoning);
+    }
+
+    // CONTROL: no integrator against the review's standing torques still earns
+    // "Raise I" — bare, and under a fast oscillation too small to register (its
+    // slow part under the 2 deg/s read as movement, so no code): a measurement
+    // that would have seen a hunt of that size beside it. Too small at every
+    // filter length and threshold the sweep tries, too: one that registers at
+    // some of them (9.97 Hz at 600 deg/s², 1.2 deg/s RMS) now reads "increase"
+    // at some sweep points and is refused at others, which is
+    // I_TERM_VERDICT_UNSTABLE, not "Raise I".
+    const lowSetups = {
+      roll: {commands: layout.commands, gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: -1436,
+        seed: 91},
+      pitch: {commands: layout.commands, gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: 1169,
+        extraTorques: [{hz: 12, dps2: 400}], seed: 92},
+      yaw: {commands: layout.commands, gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: 909,
+        extraTorques: [{hz: 9.97, dps2: 300}], seed: 93}
+    };
+    const low = recommendEachAxis(threeAxisRecords(lowSetups, layout.durationS));
+    for (const axis of AXES_IN_ORDER) {
+      const codes = low.gates.holds[axis].codes;
+      assert.ok(raisedIOn(low, axis), `${axis}: ${iTermFinding(low, axis)?.id} [${codes}]`);
+      assert.ok(!codes.includes('OSCILLATION_ABOVE_I_TERM_BAND')
+        && !codes.includes('STANDING_ERROR_WITH_UNMEASURED_BAND'), `${axis}: [${codes}]`);
+    }
+    for (const axis of ['pitch', 'yaw']) {
+      const ripple = low.gates.holds[axis].evidence.summary.meanErrorRippleRmsDps;
+      assert.ok(ripple > 0.2 && ripple < pidEvidence.HOLD_READING_THRESHOLDS.huntingRippleDps,
+        `${axis}: the small fast oscillation must be there and under the threshold, or the `
+        + `control tests nothing: ${ripple}`);
     }
   });
 
@@ -4482,7 +6067,14 @@ test('a head speed that moved where it was measured is never called steady', () 
   assert.match(said.headline, /\b1 of the 1\b/, said.headline);
   assert.match(`${said.headline} ${said.reasoning}`, /too few/i);
   assert.doesNotMatch(`${said.headline} ${said.reasoning}`, /held (?:well|steady)/i);
-  assert.match(said.confirm, /\b2\b|two/i, said.confirm);
+  // UPDATED 3 October 2026 (re-review of round three): this pinned the confirm
+  // to 2 hovers, the governor rung's own minimum. Those hovers are holds, and 2
+  // is a count a standing error cannot be read from; every hold count the copy
+  // asks for is now the one a full reading needs, which also covers the governor.
+  assert.match(said.confirm, new RegExp(`\\bFly ${pidEvidence.HOLDS_FOR_A_FULL_READING} or more `
+    + 'still hovers'), said.confirm);
+  assert.match(said.reasoning, new RegExp(`judged over ${pidEvidence.EVIDENCE_LIMITS.minimumHolds} `
+    + 'or more steady segments'), said.reasoning);
   assert.match(said.confirm, /5 s/, said.confirm);
 
   // Four hovers, the head speed moving through only the second: enough
@@ -4894,5 +6486,172 @@ test('a stop direction whose commanded rate was not measured is not a small shor
           `${where}, ${entry.id}: ${spokenText(entry)}`);
       }
     }
+  }
+});
+
+/* =========================================================================== */
+/* 11. HOLDS, ROUND THREE RE-REVIEWED (3 OCTOBER 2026)                          */
+/* =========================================================================== */
+
+/** Number words a sentence might spell a count of holds in. */
+const COUNT_WORDS = Object.freeze({one: 1, two: 2, three: 3, four: 4, five: 5, six: 6,
+  seven: 7, eight: 8, nine: 9, ten: 10});
+const COUNT = '(\\d+|one|two|three|four|five|six|seven|eight|nine|ten)';
+
+/**
+ * Every count of holds a sentence ASKS a pilot to fly: "fly 3 or more still
+ * holds", "fly two long still holds", "until you have 2 such holds", "2 are
+ * needed", "takes 3 holds". A count of holds that WERE measured ("1 usable steady
+ * hold", "in every one of the 3 holds") is not a request and is not read, and
+ * neither is a count of stops ("fly two or three more stops each way").
+ */
+const HOLD_NOUN = '(?=[^.;:]{0,40}?\\b(?:holds?|hovers?|segments?|turns?)\\b)';
+const HOLD_REQUESTS = Object.freeze([
+  new RegExp(`\\bfly\\s+(?:the same\\s+|another\\s+|at least\\s+)?${COUNT}\\b${HOLD_NOUN}`, 'gi'),
+  new RegExp(`\\buntil you have\\s+${COUNT}\\s+such\\s+holds\\b`, 'gi'),
+  new RegExp(`\\b${COUNT}\\s+(?:are|is)\\s+needed\\b`, 'gi'),
+  new RegExp(`\\btakes\\s+${COUNT}\\s+holds?\\b`, 'gi')
+]);
+
+function requestedHoldCounts(text) {
+  const counts = [];
+  for (const pattern of HOLD_REQUESTS) {
+    for (const match of String(text ?? '').matchAll(pattern)) {
+      const word = match[1].toLowerCase();
+      counts.push(COUNT_WORDS[word] ?? Number(word));
+    }
+  }
+  return counts;
+}
+
+test('every count of holds the copy asks a pilot to fly is the count a full reading needs', () => {
+  // Round three made three holds the fewest a standing error is read from, and
+  // the copy went on asking for two: the manoeuvre brief ("Repeat until you have
+  // 2 such holds"), the not-enough-yet card ("2 are needed before the I term can
+  // be called"), and the confirms of I_TOO_LOW, I_TOO_HIGH,
+  // I_TERM_SIGNATURES_CONFLICT and I_TERM_NOT_LOGGED ("fly two long still
+  // holds"). A pilot with too little I who flew what he was told came back to "2
+  // holds are too few to call that a standing error"; and after "Raise I", a
+  // two-hold re-fly could not confirm the error had closed.
+  //
+  // Every count is now HOLDS_FOR_A_FULL_READING, derived from both minimums, so
+  // the two cannot drift apart again. The flights below reach every card that
+  // asks for holds, through the real engine, and every count they ask for is
+  // read back out of what they say.
+  const needed = pidEvidence.HOLDS_FOR_A_FULL_READING;
+  const limits = pidEvidence.EVIDENCE_LIMITS;
+  assert.equal(needed, Math.max(limits.minimumHolds, limits.minimumHoldsForStandingError));
+
+  // The reader catches every sentence that drifted, or it proves nothing.
+  for (const sentence of ['and fly two long still holds again.',
+    'Repeat until you have 2 such holds.',
+    '1 usable steady hold on yaw, and 2 are needed before the I term can be called.',
+    'Turn the PID term fields on, and fly the same two long, still holds again.',
+    'Fly two or three more long, still holds on this axis.',
+    'Fly 2 or more still hovers, each held for 5 s or more.',
+    'Fly 2 or more steady yaw segments of ONE kind.']) {
+    assert.deepEqual(requestedHoldCounts(sentence), [2], sentence);
+  }
+  assert.deepEqual(requestedHoldCounts('on the same side in every one of the 3 holds, and 1 usable '
+    + 'steady hold on yaw; fly the same hold again with the other two axes quiet. Fly two or three '
+    + 'more stops each way. Repeat until you have 2 nose left and 2 nose right.'), []);
+
+  const one = holdLayout({holdsS: [9]});
+  const two = holdLayout({holdsS: [10, 12]});
+  const noI = {...HOLD_NOMINAL, ki: 0};
+  const flights = [
+    ['one hold', 'HOLD_EVIDENCE_PROVISIONAL',
+      simulateHoldFlight({gains: noI, disturbanceDps2: 500, ...one})],
+    ['too little I', 'I_TOO_LOW', simulateHoldFlight({gains: noI, disturbanceDps2: 400, ...THREE_HOLDS})],
+    ['too much I', 'I_TOO_HIGH', simulateHoldFlight({gains: HOLD_SOFT, gustDps2: 2200})],
+    ['both signatures', 'I_TERM_SIGNATURES_CONFLICT', simulateHoldFlight({gains: noI,
+      disturbanceDps2: 400, externalTorqueDps2: 1000, externalTorqueHz: 1.0, durationS: 30})],
+    ['no PID terms', 'I_TERM_NOT_LOGGED', simulateHoldFlight({gains: noI, disturbanceDps2: 400,
+      ...THREE_HOLDS}).map(record => ({...record, terms: [0, 0, 0]}))],
+    ['two holds', 'I_TERM_NOT_JUDGED', simulateHoldFlight({gains: noI, disturbanceDps2: 500, ...two})],
+    ['hovers and turns', 'I_TERM_HOLDS_MIXED', simulateHoldFlight({gains: noI, disturbanceDps2: 300,
+      durationS: 60, stops: [{atS: 1, amplitudeDps: 120, holdS: 0.3},
+        {atS: 13, amplitudeDps: 60, holdS: 11}, {atS: 37, amplitudeDps: -60, holdS: 11}]})],
+    ['a reading that flips', 'I_TERM_VERDICT_UNSTABLE',
+      simulateHoldFlight({gains: HOLD_SOFT, gustDps2: 600})],
+    // One hover, its head speed wandering: the hold is lost, and the governor
+    // cannot be judged from one segment.
+    ['one hover, the head speed moving', 'HEADSPEED_TOO_FEW_SEGMENTS_TO_JUDGE',
+      simulateHoldFlight({gains: HOLD_NOMINAL, ...one}).map(record => ({...record,
+        headspeed: 1800 * (1 + 0.08 * Math.sin(2 * Math.PI * 0.2 * record.timeUs / 1e6))}))]
+  ];
+  const mustAsk = new Set(['HOLD_EVIDENCE_PROVISIONAL', 'I_TOO_LOW', 'I_TOO_HIGH',
+    'I_TERM_SIGNATURES_CONFLICT', 'I_TERM_NOT_LOGGED', 'I_TERM_NOT_JUDGED', 'I_TERM_HOLDS_MIXED',
+    'I_TERM_VERDICT_UNSTABLE', 'NO_HOLD_EVIDENCE', 'HEADSPEED_TOO_FEW_SEGMENTS_TO_JUDGE']);
+  const disagree = [];
+  const asked = new Set();
+  for (const [label, id, records] of flights) {
+    const result = recommendFor(records, 'yaw');
+    const ids = result.findings.map(entry => entry.id);
+    assert.ok(ids.includes(id), `${label}: the flight must reach ${id}: ${ids.join(', ')}`);
+    for (const finding of result.findings) {
+      const counts = requestedHoldCounts(spokenText(finding));
+      if (counts.length > 0) {
+        asked.add(finding.id);
+      }
+      if (counts.some(count => count !== needed)) {
+        disagree.push(`${label}, ${finding.id}: asks for [${counts}]: ${spokenText(finding)}`);
+      }
+    }
+  }
+  // The measurement panel's own brief and headline, which the cards above quote.
+  for (const axis of AXES_IN_ORDER) {
+    const brief = [...holdManoeuvre(axis).steps, holdManoeuvre(axis).note].join(' ');
+    const partial = describeHoldCapture({status: 'inconclusive', holds: [{}], rejectedHoldCounts: {}},
+      {axis});
+    for (const [where, text] of [['holdManoeuvre', brief], ['describeHoldCapture', partial.headline]]) {
+      const counts = requestedHoldCounts(text);
+      assert.ok(counts.length > 0, `${where}(${axis}) must ask for a count: ${text}`);
+      if (counts.some(count => count !== needed)) {
+        disagree.push(`${where}(${axis}): asks for [${counts}]: ${text}`);
+      }
+    }
+    assert.equal(partial.needed, needed);
+  }
+  assert.deepEqual(disagree, [], `${disagree.length} sentences ask for a count of holds other than `
+    + `the ${needed} a full reading needs:\n${disagree.join('\n')}`);
+  // Not vacuous: every card that sends a pilot to fly holds was reached and asked.
+  assert.deepEqual([...mustAsk].filter(id => !asked.has(id)), [],
+    `cards that never asked for a count: ${[...asked].join(', ')}`);
+});
+
+test('a fast shake over holds whose error changed side says to settle the shake first', () => {
+  // Re-review of 3 October 2026. A healthy integrator under a slow wander, with a
+  // 5-11 Hz torque over it, flown as five ordinary holds: the error changes side
+  // from hold to hold, and the movement inside each is faster than the band. The
+  // 3 October routing already sends that to I_TERM_NOT_JUDGED, which names the
+  // shake — but the changed-side branch then replaced its confirm with a calm-air
+  // hold, and "settle what is shaking first" was lost. The review's own flights,
+  // all three on one layout, in the app's three-axis shape.
+  const layout = holdLayout({holdsS: [6.582, 5.995, 6.327, 6.244, 6.389]});
+  const cell = ({slowHz, slow, phase, fastHz, fast, seed}) => ({commands: layout.commands,
+    gains: HOLD_NOMINAL, seed, externalTorqueHz: slowHz, externalTorqueDps2: slow,
+    externalTorquePhase: phase, extraTorques: [{hz: fastHz, dps2: fast}]});
+  const result = recommendEachAxis(threeAxisRecords({
+    roll: cell({slowHz: 0.0694, slow: 5233, phase: 2.136, fastHz: 8.349, fast: 6608, seed: 521211}),
+    pitch: cell({slowHz: 0.0767, slow: 3523, phase: 4.966, fastHz: 4.847, fast: 3737, seed: 273269}),
+    yaw: cell({slowHz: 0.0775, slow: 5599, phase: 4.006, fastHz: 11.113, fast: 7051, seed: 29559})
+  }, layout.durationS));
+  for (const axis of AXES_IN_ORDER) {
+    const hold = result.gates.holds[axis];
+    const said = iTermFinding(result, axis);
+    const line = `${axis}: ${said?.id} [${hold.codes}]`;
+    // The fixture: both codes, or this tests nothing.
+    assert.ok(hold.codes.includes('OSCILLATION_ABOVE_I_TERM_BAND')
+      && hold.codes.includes('STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS'), line);
+    assert.equal(said?.id, 'I_TERM_NOT_JUDGED', line);
+    assert.equal(said.direction, null);
+    assert.ok(!raisedIOn(result, axis), line);
+    // The shake first, and then what the changed side asks for.
+    assert.match(said.confirm, /^Settle what is shaking first/, `${line}: ${said.confirm}`);
+    assert.match(said.confirm, /calm air/, `${line}: ${said.confirm}`);
+    assert.match(said.reasoning, /faster than the [\d.]+-[\d.]+ Hz band/, said.reasoning);
+    assert.match(said.reasoning, /one side in \d+ and on the other in \d+/, said.reasoning);
+    assert.doesNotMatch(spokenText(said), /wandered slowly|slower than/i, spokenText(said));
   }
 });
