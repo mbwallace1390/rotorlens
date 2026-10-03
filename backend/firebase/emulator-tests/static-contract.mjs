@@ -86,8 +86,8 @@ test('Firebase dependencies stay outside the app and root package', async () => 
   }
   const functionsManifest = JSON.parse(await read('functions/package.json'));
   assert.deepEqual(functionsManifest.dependencies, {
-    'firebase-admin': '14.2.0',
-    'firebase-functions': '7.3.2'
+    'firebase-admin': '14.5.0',
+    'firebase-functions': '7.4.0'
   });
   const androidManifest = await readFile(
     path.join(projectRoot, 'android', 'app', 'src', 'main', 'AndroidManifest.xml'),
