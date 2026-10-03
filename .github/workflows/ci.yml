@@ -1,6 +1,7 @@
 # RotorLens CI
 #
-# Six jobs, run on every push, every pull request and on manual dispatch.
+# Six jobs, run on every push, every pull request, on manual dispatch, and once
+# a week on the default branch.
 #
 # The compliance job is the one that earns its keep. `provenance`,
 # `privacy-claims`, `legal-disclaimer` and `check-donation` encode promises made
@@ -21,6 +22,13 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  # The Firebase audits read committed lockfiles against an advisory database
+  # that moves without any commit here. With no scheduled run, a newly published
+  # advisory first turned up as a red check on whichever unrelated pull request
+  # opened next. A weekly run on the default branch shows that rot on main,
+  # where it belongs. Permissions stay read-only (below) for this event too.
+  schedule:
+    - cron: '17 6 * * 1'
 
 # Every job only needs to read the checkout. Keep the implicit GITHUB_TOKEN from
 # acquiring repository write permissions through a changed organization default.
@@ -138,7 +146,10 @@ jobs:
 
       # High/critical advisories fail the build. Current upstream Firebase
       # graphs also carry documented moderate transitive advisories; do not use
-      # `--force` to downgrade the pinned top-level SDKs around them.
+      # `--force` to downgrade the pinned top-level SDKs around them. Three
+      # transitive versions in the emulator graph are forced by `overrides` in
+      # backend/firebase/package.json, and only the proof step below shows they
+      # still work; backend/firebase/README.md says why each one is there.
       - name: Audit emulator dependencies
         run: npm audit --audit-level=high --prefix backend/firebase
 

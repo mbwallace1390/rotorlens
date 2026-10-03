@@ -250,8 +250,20 @@ transitive build/test graphs.
   <https://github.com/firebase/firebase-functions/releases/tag/v7.4.0> — MIT —
   Copyright (c) 2017 Firebase.
 
+`backend/firebase/package.json` also forces three versions inside the emulator
+graph with npm `overrides`, for the advisories recorded in
+`backend/firebase/README.md`. They are transitive dependencies of the tools
+above, listed here because this repository chose their versions rather than the
+packages that depend on them:
+
+- `@grpc/grpc-js` 1.14.5 — <https://github.com/grpc/grpc-node> — Apache-2.0.
+- `basic-ftp` 6.2.1 — <https://github.com/patrickjuchli/basic-ftp> — MIT —
+  Copyright (c) 2019 Patrick Juchli.
+- `chokidar` 4.0.3 — <https://github.com/paulmillr/chokidar> — MIT —
+  Copyright (c) 2012 Paul Miller (https://paulmillr.com), Elan Shanker.
+
 The complete Apache-2.0 text is committed at
-`config/licenses/apache-2.0.txt`. The two MIT packages carry the standard MIT
+`config/licenses/apache-2.0.txt`. The MIT packages carry the standard MIT
 permission, notice-retention, no-warranty, and liability-disclaimer terms with
 the copyright lines above. These tools are fetched only to run a local demo
 project and CI; there is no Firebase project selection, login, deployment, or
