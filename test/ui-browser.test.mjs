@@ -202,6 +202,60 @@ async function waitForDevTools(port, attempts = 60) {
   throw new Error('Chromium DevTools endpoint never became ready');
 }
 
+/**
+ * Returns once the shell has loaded AND `ui/app.mjs` has finished running.
+ *
+ * Not a fixed sleep after `Page.navigate`. Until app.mjs has evaluated there is
+ * no listener on the file input, so a log handed to the page is dropped without
+ * a sound and the test then waits out its whole budget for an open that never
+ * started; on a loaded CI runner 900 ms was not always enough. Importing the
+ * page's own module URL resolves only once that module has run (the page and
+ * this import share one module instance) and rejects with its error if it
+ * threw, so the wait ends the moment the shell can take a file.
+ *
+ * The deadline only turns a page that never loads into a named failure instead
+ * of a hung job; a page that loads ends the wait as soon as it is ready.
+ */
+async function waitForShell(client, sessionId, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastSeen = 'nothing evaluated yet';
+  while (Date.now() < deadline) {
+    let probe;
+    try {
+      probe = await client.send('Runtime.evaluate', {
+        expression: `(async () => {
+          if (location.pathname !== '/ui/' || document.readyState !== 'complete') {
+            return location.href + ' (' + document.readyState + ')';
+          }
+          const app = await import('/ui/app.mjs');
+          return typeof app.openFile === 'function' && document.getElementById('file')
+            ? 'ready'
+            : 'loaded without a wired file input';
+        })()`,
+        awaitPromise: true,
+        returnByValue: true
+      }, sessionId);
+    } catch (error) {
+      // Evaluated mid-navigation: the old document's context went away under
+      // it. The next probe lands in the new one.
+      lastSeen = error.message;
+      await new Promise(resolve => setTimeout(resolve, 50));
+      continue;
+    }
+    if (probe.exceptionDetails) {
+      // The module itself failed. No amount of waiting fixes that.
+      throw new Error('the shell loaded but ui/app.mjs failed: '
+        + (probe.exceptionDetails.exception?.description ?? probe.exceptionDetails.text));
+    }
+    if (probe.result.value === 'ready') {
+      return;
+    }
+    lastSeen = probe.result.value;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`the shell never became ready to take a file; last seen: ${lastSeen}`);
+}
+
 /** Minimal CDP client: send a command, await the matching id. */
 function connect(endpoint) {
   return new Promise((resolve, reject) => {
@@ -246,7 +300,8 @@ test('the engine and shell run in a real browser', {
   const server = createUiServer();
   const port = await listen(server);
   const profile = await mkdtemp(path.join(tmpdir(), 'rotorlens-ui-'));
-  const debugPort = port + 1;
+  // Not `port + 1`; see `freePort` for why that fails as "DevTools never ready".
+  const debugPort = await freePort();
 
   const browser = spawn(chromePath, [
     '--headless=new',
@@ -283,7 +338,7 @@ test('the engine and shell run in a real browser', {
     await client.send('Page.enable', {}, sessionId);
 
     await client.send('Page.navigate', {url: `http://127.0.0.1:${port}/`}, sessionId);
-    await new Promise(resolve => setTimeout(resolve, 900));
+    await waitForShell(client, sessionId);
 
     // 1. The engine decodes a generated fixture with no Node globals present.
     const decode = await client.send('Runtime.evaluate', {
@@ -3135,7 +3190,7 @@ test('the engine and shell run in a real browser', {
     }, sessionId);
 
     await client.send('Page.navigate', {url: `http://127.0.0.1:${port}/`}, sessionId);
-    await new Promise(resolve => setTimeout(resolve, 900));
+    await waitForShell(client, sessionId);
     await client.send('Emulation.setDeviceMetricsOverride', {
       width: 384, height: 800, deviceScaleFactor: 2, mobile: true
     }, sessionId);
@@ -3471,7 +3526,7 @@ test('a real flight is remembered, compared, and can be deleted', {
     }, sessionId);
 
     await client.send('Page.navigate', {url: `http://127.0.0.1:${port}/`}, sessionId);
-    await new Promise(resolve => setTimeout(resolve, 900));
+    await waitForShell(client, sessionId);
     await client.send('Emulation.setDeviceMetricsOverride', {
       width: 384, height: 800, deviceScaleFactor: 2, mobile: true
     }, sessionId);
@@ -3822,7 +3877,7 @@ test('what RotorLens has learned is on screen, and can be forgotten again', {
     }, sessionId);
 
     await client.send('Page.navigate', {url: `http://127.0.0.1:${port}/`}, sessionId);
-    await new Promise(resolve => setTimeout(resolve, 900));
+    await waitForShell(client, sessionId);
     await client.send('Emulation.setDeviceMetricsOverride', {
       width: 384, height: 800, deviceScaleFactor: 2, mobile: true
     }, sessionId);
@@ -4269,7 +4324,7 @@ test('sharing is never asked by itself, shows what would leave, erases — and s
     }, sessionId);
 
     await client.send('Page.navigate', {url: `http://127.0.0.1:${port}/`}, sessionId);
-    await new Promise(resolve => setTimeout(resolve, 900));
+    await waitForShell(client, sessionId);
     await client.send('Emulation.setDeviceMetricsOverride', {
       width: 384, height: 800, deviceScaleFactor: 2, mobile: true
     }, sessionId);
@@ -4842,7 +4897,7 @@ test('a dump of many flights opens the one you picked, and says so', {
     await client.send('Runtime.enable', {}, sessionId);
     await client.send('Page.enable', {}, sessionId);
     await client.send('Page.navigate', {url: `http://127.0.0.1:${port}/`}, sessionId);
-    await new Promise(resolve => setTimeout(resolve, 900));
+    await waitForShell(client, sessionId);
 
     // The screen the app ships to, before a single measurement is taken.
     await client.send('Emulation.setDeviceMetricsOverride', {
@@ -4890,7 +4945,15 @@ test('a dump of many flights opens the one you picked, and says so', {
           const input = $('file');
           input.files = transfer.files;
           input.dispatchEvent(new Event('change'));
-          for (let attempt = 0; attempt < 800; attempt += 1) {
+          // Until the open finishes or says it failed, not for a count of
+          // polls. A count was ~16 s of wall clock, and a 320-flight dump on a
+          // starved runner can take longer than that and still be correct. The
+          // shell is known to be listening (see waitForShell), and every way an
+          // open can fail ends in an error line in #status, so a failure ends
+          // the wait at once; the deadline only turns a hang into a named
+          // failure rather than a job timeout.
+          const deadline = performance.now() + 120000;
+          while (performance.now() < deadline) {
             // Sampled from the poll loop as well as from frame callbacks. A
             // 14 KiB log settles inside a handful of frames, and a guard reading
             // "too few frames to judge" would then be the only thing the
@@ -4900,6 +4963,9 @@ test('a dump of many flights opens the one you picked, and says so', {
             if ($('session-stats').children.length > 0
                 && $('status').textContent.includes(name + ' \\u2014')) {
               return true;
+            }
+            if ($('status').querySelector('.error')) {
+              return false;
             }
             await sleep(20);
           }
@@ -4912,6 +4978,17 @@ test('a dump of many flights opens the one you picked, and says so', {
         sampling = false;
 
         const {state} = await import('/ui/app.mjs');
+        // Settled first, and only then the log it settled on. A dump that never
+        // opened leaves state.result null, and reading it anyway reported this
+        // as "Cannot read properties of null (reading 'sessions')", which names
+        // nothing about why.
+        if (!settled) {
+          return JSON.stringify({opened: {
+            settled,
+            status: $('status').textContent,
+            hasResult: state.result !== null
+          }});
+        }
         const sessions = state.result.sessions;
 
         const opened = {
@@ -5088,7 +5165,8 @@ test('a dump of many flights opens the one you picked, and says so', {
     // 1. every flight listed, ONE flight read
     // =====================================================================
     assert.equal(opened.settled, true,
-      'the dump never finished opening, so nothing below this means anything');
+      'the dump never finished opening, so nothing below this means anything. '
+      + `Status: ${JSON.stringify(opened.status)}; page errors: ${JSON.stringify(pageErrors)}`);
     assert.equal(opened.listed, 320,
       `160 copies of a two-session fixture is 320 flights; the picker offered ${opened.listed}`);
 
@@ -5318,7 +5396,7 @@ test('a flight already read is kept, but only while it fits', {
     await client.send('Runtime.enable', {}, sessionId);
     await client.send('Page.enable', {}, sessionId);
     await client.send('Page.navigate', {url: `http://127.0.0.1:${port}/`}, sessionId);
-    await new Promise(resolve => setTimeout(resolve, 900));
+    await waitForShell(client, sessionId);
     await client.send('Emulation.setDeviceMetricsOverride', {
       width: 384, height: 800, deviceScaleFactor: 2, mobile: true
     }, sessionId);
