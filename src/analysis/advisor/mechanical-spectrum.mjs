@@ -258,7 +258,8 @@ var ATTENTION_BAND_RMS_THRESHOLD_DPS = 8;
 var ATTENTION_THRESHOLD_BASIS = "experimental-synthetic-calibration";
 // Caps the peaks BELOW the attention level only, at five of their own however
 // many attention-eligible peaks are listed beside them. Every attention-eligible
-// peak is listed however many there are; see `detectPeaks`.
+// peak is listed however many there are, and so is every peak that reached the
+// level in some window without being attention-eligible; see `detectPeaks`.
 var MAX_PEAKS_PER_AXIS = 5;
 var TARGET_FREQUENCY_RESOLUTION_HZ = 2;
 
@@ -891,6 +892,112 @@ function peakBandwidth(psd, peakBin, frequencyResolutionHz) {
     };
 }
 
+/**
+ * A tone's size WHILE PRESENT, from its band power in each analysis window.
+ *
+ * Stage 2d, review of 3 October 2026. The RMS over every window that reached
+ * the level read low: a window straddling the tone switching on or off holds it
+ * for part of its length, passes the level all the same, and was averaged in at
+ * that partial power — 0.87-0.94 of the tone's size at on-times of one to three
+ * seconds, so a once-per-rev just past three times the level was reported under
+ * the ceiling. So the EDGE windows — the first and last of each run of
+ * consecutive windows above the level, the ones next to a window below it or to
+ * the end of the range — are left out, and the size is the RMS over the rest.
+ * Where that leaves none, the tone never stayed on past one window's edges, and
+ * the RMS over every window above the level is published as a LOWER BOUND
+ * (`lowerBound`), never as a size.
+ *
+ * Measured on synthetic tones switching on for 0.6-8 s and off for 0.6-5 s, at
+ * 500-2000 Hz over 20-120 s ranges, at 3-10 times the level: with the edges out
+ * the size is the tone's steady size to within 0.5% wherever the tone is on and
+ * off for more than about two windows — the Hann window weights the part of a
+ * window nearest a switch least, so the window next to an edge window is all
+ * but whole. A stricter rule, keeping only windows with a whole window above the
+ * level on either side, moved no size by more than that 0.5% and was dropped.
+ * Edge windows can only pull the size down, so the result is never less than the
+ * RMS over every window above the level: never under the level, nor under the
+ * flight average.
+ */
+function sizeWhileAboveLevel(bandPowers, aboveLevel) {
+    var innerSum = 0;
+    var innerCount = 0;
+    var everySum = 0;
+    var everyCount = 0;
+    for (var index = 0; index < bandPowers.length; index++) {
+        if (!aboveLevel[index]) {
+            continue;
+        }
+        everySum += bandPowers[index];
+        everyCount++;
+        // An edge window: the first or last of its run.
+        if (index > 0 && aboveLevel[index - 1]
+                && index + 1 < bandPowers.length && aboveLevel[index + 1]) {
+            innerSum += bandPowers[index];
+            innerCount++;
+        }
+    }
+    if (everyCount === 0) {
+        return { rmsDps: null, lowerBound: false };
+    }
+    var everyWindow = Math.sqrt(Math.max(0, everySum / everyCount));
+    if (innerCount === 0) {
+        return { rmsDps: everyWindow, lowerBound: true };
+    }
+    return {
+        rmsDps: Math.max(everyWindow, Math.sqrt(Math.max(0, innerSum / innerCount))),
+        lowerBound: false
+    };
+}
+
+/**
+ * A peak's frequency between the bins: the vertex of the parabola through the
+ * log power of the peak bin and its two neighbours.
+ *
+ * Stage 2d. The bin a tone lands in can be half a bin — about 1 Hz at the 2 Hz
+ * target resolution — from the tone, which is all a rotor-order match could ever
+ * be judged to. Measured on synthetic tones swept across a bin at 500, 1000 and
+ * 2000 Hz: within 0.031 Hz of the tone, where the bin alone is up to 0.96 Hz
+ * off. Falls back to the bin's own frequency wherever the three powers do not
+ * describe a peak.
+ */
+function interpolatedPeakHz(psd, bin, resolutionHz) {
+    var left = psd[bin - 1];
+    var centre = psd[bin];
+    var right = psd[bin + 1];
+    if (!(left > 0 && centre > 0 && right > 0)) {
+        return bin * resolutionHz;
+    }
+    var a = Math.log(left);
+    var b = Math.log(centre);
+    var c = Math.log(right);
+    var curvature = a - 2 * b + c;
+    if (!(curvature < 0)) {
+        return bin * resolutionHz;
+    }
+    var offset = Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / curvature));
+    return (bin + offset) * resolutionHz;
+}
+
+/**
+ * Whether a listed peak was present in enough analysis windows to be a
+ * persistent tone: `MIN_PERSISTENCE_RATIO` of them, and never fewer than
+ * `MIN_WELCH_WINDOWS`. Judged from the two counts every peak publishes, so it
+ * reads the same on a peak inside `detectPeaks` and on one in a result.
+ *
+ * Since the Stage 2d follow-up a peak short of it is listed when it reached the
+ * attention level in some window — a burst — and such a peak is not persistent:
+ * it raises no "persistent" reason code or finding of its own.
+ */
+function meetsPresenceRequirement(peak) {
+    var evaluated = peak && Number.isFinite(peak.evaluatedWindowCount)
+        ? peak.evaluatedWindowCount : 0;
+    return Boolean(peak) && Number.isFinite(peak.supportingWindowCount)
+        && peak.supportingWindowCount >= Math.max(
+            MIN_WELCH_WINDOWS,
+            Math.ceil(evaluated * MIN_PERSISTENCE_RATIO)
+        );
+}
+
 function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, windowSize) {
     var frequencyResolutionHz = sampleRateHz / windowSize;
     var minimumBin = Math.max(1, Math.ceil(MIN_FREQUENCY_HZ / frequencyResolutionHz));
@@ -934,9 +1041,14 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
             MIN_WELCH_WINDOWS,
             Math.ceil(windowPsd.length * MIN_PERSISTENCE_RATIO)
         );
-        if (supportingWindowCount < requiredWindows) {
-            continue;
-        }
+        // Whether the peak was present in enough windows to be a persistent tone.
+        // Stage 2d follow-up, item 1 (pre-existing on main): a peak short of this
+        // used to be dropped HERE, before its size in each window was measured, so
+        // a burst of a few seconds at three to seven times the attention level was
+        // never listed and the airframe rung read "clear" over it. It is now
+        // measured window by window first, and dropped only if it never reached
+        // the level in any window; see the presence check after that loop.
+        var presenceRequirementMet = supportingWindowCount >= requiredWindows;
         var bandwidth = peakBandwidth(psd, bin, frequencyResolutionHz);
         var bandPower = 0;
         for (var powerBin = bandwidth.leftBin;
@@ -947,9 +1059,10 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
         // Require the absolute 8 deg/s band-RMS gate to pass in the same
         // minimum number of individual windows before it can block tuning.
         var attentionSupportingWindowCount = 0;
-        // Band power summed over the windows that reached the level, for the
-        // tone's size WHILE PRESENT (see `attentionWindowBandRmsDps` below).
-        var attentionWindowBandPowerSum = 0;
+        // Each window's band power, and whether it reached the level, for the
+        // tone's size WHILE PRESENT (see `sizeWhileAboveLevel`).
+        var windowBandPowers = [];
+        var windowAboveLevel = [];
         var firstAttentionWindow = null;
         var lastAttentionWindow = null;
         var attentionWindowStarts = [];
@@ -962,10 +1075,12 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
                 attentionBandPower += attentionRow[attentionBin]
                     * frequencyResolutionHz;
             }
-            if (Math.sqrt(Math.max(0, attentionBandPower))
-                    >= ATTENTION_BAND_RMS_THRESHOLD_DPS) {
+            var reachedLevel = Math.sqrt(Math.max(0, attentionBandPower))
+                >= ATTENTION_BAND_RMS_THRESHOLD_DPS;
+            windowBandPowers.push(attentionBandPower);
+            windowAboveLevel.push(reachedLevel);
+            if (reachedLevel) {
                 attentionSupportingWindowCount++;
-                attentionWindowBandPowerSum += attentionBandPower;
                 if (firstAttentionWindow === null) {
                     firstAttentionWindow = attentionWindowIndex;
                 }
@@ -973,6 +1088,14 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
                 attentionWindowStarts.push(windowStarts[attentionWindowIndex]);
             }
         }
+        // Too few windows to be a persistent tone, and never above the level in
+        // any of them: a passing bump, dropped as it always was. One that reached
+        // the level is kept, never attention-eligible (below), and listed with the
+        // other tones above the level for part of the range.
+        if (!presenceRequirementMet && attentionSupportingWindowCount === 0) {
+            continue;
+        }
+        var sizeWhilePresent = sizeWhileAboveLevel(windowBandPowers, windowAboveLevel);
         var attentionPersistenceRatio = windowPsd.length > 0
             ? attentionSupportingWindowCount / windowPsd.length : 0;
         var attentionTemporalSpanRatio = firstAttentionWindow === null
@@ -1012,9 +1135,30 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
             maximumUnsupportedGapSamples / maximumWindowStart,
             3
         );
+        // The four attention criteria, each judged once, and the ones this peak
+        // did not meet published by name (copy review of 3 October 2026, finding
+        // 6): "too few windows" and "enough windows, bunched into one part of the
+        // range" are different facts about a tone, and only this function knows
+        // which applied. `attentionEligible` below is exactly "none unmet".
+        var attentionCriteriaUnmet = [];
+        if (!(attentionSupportingWindowCount >= requiredWindows)) {
+            attentionCriteriaUnmet.push("window-count");
+        }
+        if (!(attentionTemporalSpanRatio >= 0.5)) {
+            attentionCriteriaUnmet.push("span");
+        }
+        if (!(attentionOccupiedBucketCount >= MIN_ATTENTION_OCCUPIED_BUCKETS)) {
+            attentionCriteriaUnmet.push("quarters");
+        }
+        if (!(attentionMaximumGapRatio <= MAX_ATTENTION_UNSUPPORTED_GAP_RATIO)) {
+            attentionCriteriaUnmet.push("gap");
+        }
         candidates.push({
             bin: bin,
             frequencyHz: bin * frequencyResolutionHz,
+            // Between the bins; see `interpolatedPeakHz`. `frequencyHz` stays the
+            // bin's, which is what every tolerance written before this was built on.
+            interpolatedFrequencyHz: interpolatedPeakHz(psd, bin, frequencyResolutionHz),
             psdDps2PerHz: psd[bin],
             localNoisePsdDps2PerHz: noiseFloor,
             relativePowerDb: relativePowerDb,
@@ -1031,13 +1175,19 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
             // averaged under three times it. Judged window by window, the same way
             // attention eligibility is. It is at least the level (every window in
             // it is) and at least `bandRmsDps` (those windows are the loudest), and
-            // equals `bandRmsDps` for a tone above the level throughout. Its
-            // resolution is one analysis window: a tone switching on and off
-            // faster than that is never seen whole, and reads smaller.
-            attentionWindowBandRmsDps: attentionSupportingWindowCount > 0
-                ? Math.sqrt(Math.max(0,
-                    attentionWindowBandPowerSum / attentionSupportingWindowCount))
-                : null,
+            // equals `bandRmsDps` for a tone above the level throughout.
+            //
+            // Since Stage 2d it leaves out the windows that straddle the tone
+            // switching on or off — see `sizeWhileAboveLevel` — which held it for
+            // part of their length and pulled the size 7-13% under the truth at
+            // on-times of a second or three. Where nothing is left once they are
+            // out, the tone never stayed on for a whole window, and
+            // `attentionWindowSizeIsLowerBound` says the size is a lower bound.
+            // Its resolution is still one analysis window: a tone that goes quiet
+            // for less than about two windows is seen as one long stretch, and its
+            // size there is the windowed average.
+            attentionWindowBandRmsDps: sizeWhilePresent.rmsDps,
+            attentionWindowSizeIsLowerBound: sizeWhilePresent.lowerBound,
             supportingWindowCount: supportingWindowCount,
             evaluatedWindowCount: windowPsd.length,
             persistenceRatio: persistenceRatio,
@@ -1046,10 +1196,17 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
             attentionTemporalSpanRatio: attentionTemporalSpanRatio,
             attentionOccupiedBucketCount: attentionOccupiedBucketCount,
             attentionMaximumGapRatio: attentionMaximumGapRatio,
-            attentionEligible: attentionSupportingWindowCount >= requiredWindows
-                && attentionTemporalSpanRatio >= 0.5
-                && attentionOccupiedBucketCount >= MIN_ATTENTION_OCCUPIED_BUCKETS
-                && attentionMaximumGapRatio <= MAX_ATTENTION_UNSUPPORTED_GAP_RATIO,
+            // Judged on the attention criteria alone, as it always was for a listed
+            // peak. A peak short of the presence above but above the level in a
+            // quarter of the windows, across half the range, in three of its four
+            // quarters, with no long gap, is not "one bump", and fails safe as
+            // attention rather than as a tone above the level "in part". No input
+            // tried reaches that corner — a short burst cannot meet the span rule
+            // and a wandering tone stays present — so it is a backstop, not a path.
+            attentionEligible: attentionCriteriaUnmet.length === 0,
+            // "window-count", "span", "quarters", "gap": the criteria above it did
+            // not meet, empty exactly when it is attention-eligible.
+            attentionCriteriaUnmet: attentionCriteriaUnmet,
             harmonicMatch: null
         });
     }
@@ -1108,11 +1265,29 @@ function detectPeaks(psd, windowPsd, windowStarts, sampleCount, sampleRateHz, wi
             selected.push(candidate);
         }
     });
+    // A PEAK ABOVE THE LEVEL FOR PART OF THE RANGE IS NEVER CAPPED, AND NEVER
+    // MERGED. Stage 2d, review of 3 October 2026: a tone that reached the level
+    // in some windows but is not attention-eligible — too few of them, too short
+    // a span, too few quarters, too long a gap — was ranked among the small
+    // peaks on persistence it does not have, so five small steady harmonics
+    // pushed it off the list, and the airframe rung read "clear" over a tone
+    // measured at three to six times the level while it was there. Each one is a
+    // measurement the airframe rung must see, so each is listed as itself, even
+    // beside a listed neighbour closer than the analysis resolves. Since the
+    // Stage 2d follow-up that includes a burst present in too few windows to be a
+    // persistent tone at all (see the presence check in the loop above).
+    candidates.forEach(function(candidate) {
+        if (candidate.attentionEligible !== true
+                && candidate.attentionWindowBandRmsDps !== null) {
+            selected.push(candidate);
+        }
+    });
     // Counted on its own: never `selected.length`, which includes the
     // attention-level peaks above.
     var subThresholdListed = 0;
     candidates.forEach(function(candidate) {
         if (candidate.attentionEligible !== true
+                && candidate.attentionWindowBandRmsDps === null
                 && subThresholdListed < MAX_PEAKS_PER_AXIS
                 && !tooCloseToSelected(selected, candidate)) {
             selected.push(candidate);
@@ -1471,18 +1646,29 @@ function bestHarmonicMatch(peak, rpmSources, frequencyResolutionHz) {
     // Build a fresh object rather than `delete`-ing the ranking key off one that
     // is also returned; a hot path should not hand back a mutated sort record.
     var best = matches[0];
+    var bestEvidence = rpmSources[best.rotor === "main" ? "headspeed" : "tailspeed"];
     return {
         rotor: best.rotor,
         order: best.order,
         predictedHz: best.predictedHz,
         deltaHz: best.deltaHz,
-        toleranceHz: best.toleranceHz
+        toleranceHz: best.toleranceHz,
+        // What a narrower tolerance is built from, published as measured rather
+        // than folded into the one above (Stage 2d): half the rotor speed's
+        // p5-p95 spread, at this order, and the analysis resolution. The match
+        // itself is the wide one, max(1.5 bins, 2.5%, spread) — about 2.9 Hz at a
+        // 2 Hz resolution — which NAMES a peak by its nearest order; whether the
+        // peak IS that order is a question for whoever reads the match.
+        spreadHz: bestEvidence.relativeSpread * best.predictedHz / 2,
+        frequencyResolutionHz: frequencyResolutionHz
     };
 }
 
 function compactPeak(peak) {
     return {
         frequencyHz: round(peak.frequencyHz, 2),
+        // Between the bins; see `interpolatedPeakHz`.
+        interpolatedFrequencyHz: round(peak.interpolatedFrequencyHz, 3),
         psdDps2PerHz: round(peak.psdDps2PerHz, 6),
         localNoisePsdDps2PerHz: round(peak.localNoisePsdDps2PerHz, 6),
         relativePowerDb: round(peak.relativePowerDb, 2),
@@ -1493,6 +1679,9 @@ function compactPeak(peak) {
         // Its size while present; see `detectPeaks`. Null when it never reached
         // the attention level in any window.
         attentionWindowBandRmsDps: round(peak.attentionWindowBandRmsDps, 3),
+        // True when no window held the tone for the whole of its length, so the
+        // size above is a lower bound on it; see `sizeWhileAboveLevel`.
+        attentionWindowSizeIsLowerBound: peak.attentionWindowSizeIsLowerBound === true,
         supportingWindowCount: peak.supportingWindowCount,
         evaluatedWindowCount: peak.evaluatedWindowCount,
         persistenceRatio: round(peak.persistenceRatio, 3),
@@ -1502,12 +1691,17 @@ function compactPeak(peak) {
         attentionOccupiedBucketCount: peak.attentionOccupiedBucketCount,
         attentionMaximumGapRatio: round(peak.attentionMaximumGapRatio, 3),
         attentionEligible: peak.attentionEligible === true,
+        // Which attention criteria it did not meet; see `detectPeaks`.
+        attentionCriteriaUnmet: Array.isArray(peak.attentionCriteriaUnmet)
+            ? peak.attentionCriteriaUnmet.slice() : [],
         harmonicMatch: peak.harmonicMatch ? {
             rotor: peak.harmonicMatch.rotor,
             order: peak.harmonicMatch.order,
             predictedHz: round(peak.harmonicMatch.predictedHz, 2),
             deltaHz: round(peak.harmonicMatch.deltaHz, 2),
-            toleranceHz: round(peak.harmonicMatch.toleranceHz, 2)
+            toleranceHz: round(peak.harmonicMatch.toleranceHz, 2),
+            spreadHz: round(peak.harmonicMatch.spreadHz, 3),
+            frequencyResolutionHz: round(peak.harmonicMatch.frequencyResolutionHz, 4)
         } : null
     };
 }
@@ -1557,10 +1751,14 @@ function buildFindings(result) {
         });
         return;
     }
+    // Persistent peaks only: a burst listed for having reached the attention
+    // level is not one. An attention-eligible peak is always reported.
     var prominent = [];
     result.axes.forEach(function(axis) {
         axis.peaks.forEach(function(peak) {
-            prominent.push({ axis: axis, peak: peak });
+            if (peak.attentionEligible === true || meetsPresenceRequirement(peak)) {
+                prominent.push({ axis: axis, peak: peak });
+            }
         });
     });
     prominent.sort(function(left, right) {
@@ -1992,8 +2190,10 @@ async function analyzeCollected(collected, range, options) {
             peak.harmonicMatch = bestHarmonicMatch(peak, rpmSources, resolutionHz);
         });
     });
+    // A burst listed for having reached the attention level is not a persistent
+    // peak (Stage 2d follow-up); see `meetsPresenceRequirement`.
     var hasPersistentPeak = availableAxes.some(function(axis) {
-        return axis.peaks.length > 0;
+        return axis.peaks.some(meetsPresenceRequirement);
     });
     var hasAttentionPeak = availableAxes.some(function(axis) {
         return axis.peaks.some(function(peak) {
@@ -2868,21 +3068,39 @@ var VIBRATION_SUMMARY_SCHEMA_VERSION = 1;
  * only one of them is a yes. Returning null for the other two is what put a
  * FIELD_MISSING on a column the log has, one layer down, so the two nos are
  * separate values here and the reason travels with the one that has one.
+ *
+ * A FOURTH, "near-order" (copy review of 3 October 2026, finding 3): the
+ * harmonic match NAMES a peak by its nearest order within the wider of a bin and
+ * a half, 2.5% and the speed's spread, and leaves whether the peak IS that order
+ * to whoever reads it (see `bestHarmonicMatch`). This is that reader for a
+ * screen, and it asks what the airframe gate asks (`rotorOrderMatchEstablished`
+ * in recommendation-gates.mjs): is the peak's interpolated frequency within half
+ * the logged speed's own p5-p95 spread at that order, plus half an analysis bin?
+ * "explained" only where it is; "near-order" where it is named the order and
+ * sits further out, which the panel drew as a green "main 1/rev" over a tone the
+ * airframe card called not the rotor's own. Both numbers travel with it.
  */
 function peakRotorAttribution(peak, correlation) {
+    var noOffset = {offsetFromOrderHz: null, offsetAllowedHz: null};
     if (peak.harmonicMatch) {
+        var identity = rotorOrderIdentity(peak);
         return {
-            state: "explained",
+            state: identity !== null && identity.offsetHz <= identity.allowedHz
+                ? "explained" : "near-order",
             rotor: peak.harmonicMatch.rotor,
             order: peak.harmonicMatch.order,
             predictedHz: peak.harmonicMatch.predictedHz,
             deltaHz: peak.harmonicMatch.deltaHz,
             toleranceHz: peak.harmonicMatch.toleranceHz,
+            // How far the peak sits from the order it is named, and how far the
+            // logged speed of that rotor lets it; null where not published.
+            offsetFromOrderHz: identity !== null ? round(identity.offsetHz, 3) : null,
+            offsetAllowedHz: identity !== null ? round(identity.allowedHz, 3) : null,
             unavailableRotors: []
         };
     }
     if (correlation && correlation.evaluated === true) {
-        return {
+        return Object.assign({
             // Measured: a trustworthy rotor speed was compared against this
             // frequency at every order up to 8 and none of them lines up.
             state: "not-explained",
@@ -2895,9 +3113,9 @@ function peakRotorAttribution(peak, correlation) {
             // "not explained by the main rotor" is never read as
             // "not explained by any rotor" on a log with no tail speed.
             unavailableRotors: correlation.unavailableRotors.slice()
-        };
+        }, noOffset);
     }
-    return {
+    return Object.assign({
         // Not a measurement about the aircraft. Nothing was compared.
         state: "not-checked",
         rotor: null,
@@ -2906,6 +3124,30 @@ function peakRotorAttribution(peak, correlation) {
         deltaHz: null,
         toleranceHz: null,
         unavailableRotors: correlation ? correlation.unavailableRotors.slice() : []
+    }, noOffset);
+}
+
+/**
+ * How far a matched peak sits from the order it is named, read at its
+ * interpolated frequency (the bin's own where none was published), and how far
+ * the logged speed allows: half its p5-p95 spread at that order plus half an
+ * analysis bin. Null where the match does not carry what that needs. The same
+ * measurement as `rotorOrderMatchDistance` in recommendation-gates.mjs, which a
+ * test holds this to peak by peak; restated here rather than imported so the
+ * viewer's start-up graph does not take in the advice gates for one comparison.
+ */
+function rotorOrderIdentity(peak) {
+    var match = peak.harmonicMatch;
+    var frequencyHz = Number.isFinite(peak.interpolatedFrequencyHz)
+        ? peak.interpolatedFrequencyHz : peak.frequencyHz;
+    if (!match || !Number.isFinite(frequencyHz) || !Number.isFinite(match.predictedHz)
+            || !Number.isFinite(match.spreadHz)
+            || !Number.isFinite(match.frequencyResolutionHz)) {
+        return null;
+    }
+    return {
+        offsetHz: Math.abs(frequencyHz - match.predictedHz),
+        allowedHz: match.spreadHz + match.frequencyResolutionHz / 2
     };
 }
 
@@ -3043,6 +3285,27 @@ function summarizeMechanicalResult(result) {
                         // Above the experimental threshold published above, not
                         // above any limit Rotorflight or anyone else has set.
                         aboveAttentionThreshold: peak.attentionEligible === true,
+                        // Stage 2d. Its size while it was above that threshold,
+                        // the share of the analysed windows it was above it in,
+                        // and whether that size is only "at least" (no window held
+                        // the tone whole). `amplitudeDps` is its average over every
+                        // window, which for a tone that comes and goes reads under
+                        // the very threshold it was above. Null and 0 for a peak
+                        // that never reached the threshold in any window.
+                        amplitudeWhileAboveThresholdDps: Number.isFinite(
+                            peak.attentionWindowBandRmsDps
+                        ) ? peak.attentionWindowBandRmsDps : null,
+                        amplitudeWhileAboveThresholdAtLeast:
+                            peak.attentionWindowSizeIsLowerBound === true,
+                        aboveThresholdShare: Number.isFinite(peak.attentionPersistenceRatio)
+                            ? peak.attentionPersistenceRatio : 0,
+                        // Copy review of 3 October 2026, finding 8: whether it
+                        // is a persistent tone, by the same presence rule the
+                        // findings above apply, or a burst listed only for
+                        // having reached the threshold in some window — which a
+                        // count of "persistent tones" must not include.
+                        persistent: peak.attentionEligible === true
+                            || meetsPresenceRequirement(peak),
                         // Judged against the rotor comparison of the stretch the
                         // peak was measured in, when it came from one.
                         rotorHarmonic: peakRotorAttribution(

@@ -2358,19 +2358,32 @@ test('the engine and shell run in a real browser', {
               continue;
             }
             timeUs.push(stamp);
+            const at = stamp / 1e6;
             // A tone that comes and goes: present for onS of every periodS.
-            const present = !options.periodS || (stamp / 1e6) % options.periodS < options.onS;
+            const present = !options.periodS || at % options.periodS < options.onS;
+            // Several tones, each between fromS and untilS, and for onS of every
+            // periodS (Stage 2d).
+            const toned = options.tones
+              ? options.tones.reduce((sum, tone) => sum
+                + (at >= (tone.fromS || 0) && at < (tone.untilS || Infinity)
+                  && (!tone.periodS || at % tone.periodS < tone.onS)
+                  ? tone.dps * Math.sin(2 * Math.PI * tone.hz * at) : 0), 0)
+              : (present ? (options.toneDps || 0) : 0)
+                * Math.sin(2 * Math.PI * (options.toneHz || 30) * at);
             // Gyro dropouts: the first share of the window carries no gyro at all.
             gyro.push(options.dropoutShare && i < count * options.dropoutShare ? NaN
-              : (present ? (options.toneDps || 0) : 0)
-                * Math.sin(2 * Math.PI * (options.toneHz || 30) * stamp / 1e6) + noise());
+              : toned + noise());
             head.push(1800 + noise() * 4);
           }
           const values = Float64Array.from(gyro);
+          // A tail rotor turning at options.tailRpm, where one is asked for.
+          const tail = options.tailRpm
+            ? Float64Array.from(timeUs, () => options.tailRpm + noise() * 4)
+            : new Float64Array(timeUs.length).fill(NaN);
           return {timeUs: Float64Array.from(timeUs), gyro: {roll: values, pitch: values, yaw: values},
             gyroSources: {roll: 'gyroRAW', pitch: 'gyroRAW', yaw: 'gyroRAW'},
             headspeedRpm: Float64Array.from(head),
-            tailspeedRpm: new Float64Array(timeUs.length).fill(NaN)};
+            tailspeedRpm: tail};
         }
         async function render(options) {
           const s = series(options);
@@ -2391,6 +2404,7 @@ test('the engine and shell run in a real browser', {
           return {status: mechanical.status, reasons: mechanical.reasonCodes,
             ids: result.findings.map(finding => finding.id), text, plain};
         }
+        const panelHtml = {};
         return JSON.stringify({
           // 40 samples a second: nothing can be measured.
           lowRate: await render({rateHz: 40}),
@@ -2412,7 +2426,50 @@ test('the engine and shell run in a real browser', {
           // The long flight measured in part, carrying a once-per-rev far past the
           // ceiling in the stretch that was measured.
           partlyLarge: await render({rateHz: 1007, seconds: 300, toneHz: 30, toneDps: 60,
-            thinFromS: 250})
+            thinFromS: 250}),
+          // Stage 2d, item 4: five minutes, so two stretches, with the once-per-rev
+          // steady through the first and far larger, for 40% of the time, in the
+          // second. Its share and average are of the stretch it was worst in.
+          twoStretch: await render({rateHz: 1007, seconds: 300, tones: [
+            {hz: 30, dps: 20, untilS: 150}, {hz: 30, dps: 50, fromS: 150, onS: 4, periodS: 10}]}),
+          // Stage 2d, item 1: the once-per-rev above the limit over the first 30%
+          // of a minute only, and nothing else.
+          inPart: await render({seconds: 60, tones: [{hz: 30, dps: 32, untilS: 18}]}),
+          // Stage 2d follow-up, item 3: the same, 1.6 Hz off the once-per-rev of a
+          // head logged steady — named that order by the analyser, but further from
+          // it than the head speed explains, so not the rotor's own.
+          inPartNear: await render({seconds: 60, tones: [{hz: 31.6, dps: 28, untilS: 18}]}),
+          // Copy review of 3 October 2026, finding 4: the same, near the TAIL
+          // rotor's once-per-rev — 6500 rpm is 108.3 Hz — judged on the tail speed.
+          inPartTailNear: await render({seconds: 60, tailRpm: 6500,
+            tones: [{hz: 109.9, dps: 28, untilS: 18}]}),
+          // Finding 6: a three-second burst of the once-per-rev — too few windows,
+          // where the 30% block above is enough of them, bunched.
+          burst: await render({seconds: 60, tones: [{hz: 30, dps: 28, fromS: 20, untilS: 23}]}),
+          // ...and the vibration panel for it, and for the tone that comes and goes:
+          // each peak above the threshold at its size while it was there.
+          panels: await (async () => {
+            const out = {};
+            for (const [name, options] of [
+              ['inPart', {seconds: 60, tones: [{hz: 30, dps: 32, untilS: 18}]}],
+              ['intermittent', {seconds: 60, toneHz: 30, toneDps: 14, onS: 3, periodS: 10}],
+              // Findings 3 and 8: named the once-per-rev but outside what the head
+              // speed explains; and a burst beside a small steady tone.
+              ['inPartNear', {seconds: 60, tones: [{hz: 31.6, dps: 28, untilS: 18}]}],
+              ['burst', {seconds: 60, tones: [{hz: 47, dps: 6},
+                {hz: 30, dps: 40, fromS: 20, untilS: 23}]}]]) {
+              const s = series(options);
+              const view = await mech.summarizeMechanicalVibration(s, {timeRangeUs: {
+                startTimeUs: s.timeUs[0], endTimeUs: s.timeUs[s.timeUs.length - 1]}});
+              box.innerHTML = app.vibrationHtml(view);
+              out[name] = flat(box.textContent);
+              panelHtml[name] = box.innerHTML;
+              box.innerHTML = '';
+            }
+            return out;
+          })(),
+          // The same panels as markup, for which pill each peak carries.
+          panelHtml
         });
       })()`,
       awaitPromise: true,
@@ -2473,6 +2530,103 @@ test('the engine and shell run in a real browser', {
     const partlyLargePlain = partlyLarge.plain.AIRFRAME_ROTOR_ORDER_TONE_LARGE;
     assert.match(partlyLargePlain, /the part of this flight it was measured in/, partlyLargePlain);
     assert.match(partlyLargePlain, /tracking and balance/i, partlyLargePlain);
+
+    // Stage 2d, item 4: a tone measured in both stretches has its share and
+    // average of the stretch it was worst in, and the plain line says so — not
+    // "the part of this flight it was measured in", which for it is all of it.
+    const twoStretch = copied.twoStretch;
+    assert.ok(twoStretch.ids.includes('AIRFRAME_ROTOR_ORDER_TONE_LARGE'), `${twoStretch.ids}`);
+    const twoStretchPlain = twoStretch.plain.AIRFRAME_ROTOR_ORDER_TONE_LARGE;
+    assert.match(twoStretchPlain, /for \d+% of the stretch of this flight it was worst in, and averaged/,
+      twoStretchPlain);
+    assert.doesNotMatch(twoStretchPlain, /the part of this flight it was measured in/, twoStretchPlain);
+
+    // Stage 2d, item 1: a tone above the limit for part of the flight is never
+    // "running smoothly", and is said at its size while it was there.
+    const inPart = copied.inPart;
+    assert.ok(inPart.ids.includes('AIRFRAME_TONE_ABOVE_LEVEL_IN_PART'), `${inPart.ids}`);
+    assert.ok(!inPart.ids.includes('AIRFRAME_CLEAR') && !inPart.ids.includes('AIRFRAME_TONE_BELOW_ATTENTION'),
+      `${inPart.ids}`);
+    assert.doesNotMatch(inPart.text, /running smoothly|quiet enough/i, inPart.text);
+    const inPartPlain = inPart.plain.AIRFRAME_TONE_ABOVE_LEVEL_IN_PART;
+    const inPartTold = new RegExp('per turn above a cautious, still-unproven limit for part of this '
+      + 'flight: ([\\d.]+) degrees a second while it was there, ([\\d.]+) times that limit\\. It was '
+      + 'above that limit for (\\d+)% of this flight, and averaged ([\\d.]+) degrees a second')
+      .exec(inPartPlain);
+    assert.ok(inPartTold, inPartPlain);
+    assert.ok(Number(inPartTold[1]) >= 8 && Number(inPartTold[2]) >= 1, inPartPlain);
+    assert.ok(Number(inPartTold[3]) < 50, inPartPlain);
+    assert.match(inPartPlain, /does not rule your airframe out/, inPartPlain);
+    // Near the once-per-rev but outside what the head speed explains: never "your
+    // main rotor shook", on the card or in its plain line.
+    const near = copied.inPartNear;
+    assert.ok(near.ids.includes('AIRFRAME_TONE_ABOVE_LEVEL_IN_PART'), `${near.ids}`);
+    const nearPlain = near.plain.AIRFRAME_TONE_ABOVE_LEVEL_IN_PART;
+    assert.match(nearPlain, new RegExp('^Something on your helicopter shook it close to your rotor\'s own '
+      + 'speed, but further from it than your logged head speed explains, above a cautious'), nearPlain);
+    assert.doesNotMatch(near.text, /Your main rotor|main rotor's own|which is the main rotor's/, near.text);
+    assert.match(near.text, /near the main rotor's once-per-rev, outside what the logged head speed allows/,
+      near.text);
+
+    // The vibration panel says the same: no green "clear" over a tone above the
+    // threshold for part of the window, and every peak above it at its size
+    // while it was there — never only an average that reads under it.
+    const panels = copied.panels;
+    assert.match(panels.inPart, /above the attention threshold for part of the window only/, panels.inPart);
+    assert.match(panels.inPart, /above the attention threshold for part of it/, panels.inPart);
+    assert.doesNotMatch(panels.inPart, /no persistent vibration above/, panels.inPart);
+    for (const [name, panel] of Object.entries(panels)) {
+      const sizes = [...panel.matchAll(/(?:at least )?([\d.]+)°\/s while above it, (\d+)% of the window/g)];
+      assert.ok(sizes.length >= 1, `${name}: ${panel}`);
+      for (const [, size, share] of sizes) {
+        assert.ok(Number(size) >= 8 && Number(share) > 0 && Number(share) < 100, `${name}: ${panel}`);
+      }
+    }
+    assert.match(panels.intermittent, /([\d.]+)°\/s averaged/, panels.intermittent);
+
+    // Copy review of 3 October 2026, finding 3: a tone the analyser NAMED the
+    // once-per-rev, 1.6 Hz off it with the head logged steady, is near that order
+    // and outside what the head speed explains — the airframe card says so, and the
+    // panel drew a green "main 1/rev" with "its order 1 lands on this frequency".
+    const panelHtml = copied.panelHtml;
+    assert.match(panelHtml.inPartNear,
+      /<span class="pill warn">near main 1\/rev — outside the logged head speed<\/span>/, panelHtml.inPartNear);
+    assert.doesNotMatch(panelHtml.inPartNear, /<span class="pill good">main 1\/rev<\/span>/, panelHtml.inPartNear);
+    assert.doesNotMatch(panels.inPartNear, /lands on this frequency/, panels.inPartNear);
+    // The control: on the order, it is still the rotor's own.
+    assert.match(panelHtml.inPart, /<span class="pill good">main 1\/rev<\/span>/, panelHtml.inPart);
+    assert.match(panels.inPart, /lands on this frequency/, panels.inPart);
+    // Finding 8: a burst listed for reaching the threshold is not counted as a
+    // persistent tone. Every axis carries the same signal here: one small steady
+    // tone and one three-second burst.
+    const counts = [...panels.burst.matchAll(/Persistent tones\s*(\d+).*?Short bursts\s*(\d+)/g)];
+    assert.equal(counts.length, 3, panels.burst);
+    for (const [, persistent, bursts] of counts) {
+      assert.deepEqual([Number(persistent), Number(bursts)], [1, 1], panels.burst);
+    }
+    assert.doesNotMatch(panels.inPart, /Short bursts/, panels.inPart);
+
+    // Finding 4: near the TAIL rotor's once-per-rev is judged on the logged tail
+    // speed, and said so — never "your logged head speed".
+    const tailNear = copied.inPartTailNear;
+    assert.ok(tailNear.ids.includes('AIRFRAME_TONE_ABOVE_LEVEL_IN_PART'), `${tailNear.ids}`);
+    const tailNearPlain = tailNear.plain.AIRFRAME_TONE_ABOVE_LEVEL_IN_PART;
+    assert.match(tailNearPlain, new RegExp('^Something on your helicopter shook it close to your tail rotor\'s '
+      + 'own speed, but further from it than your logged tail speed explains, above a cautious'), tailNearPlain);
+    assert.doesNotMatch(tailNear.text, /logged head speed/, tailNear.text);
+    assert.match(tailNear.text, /near the tail rotor's once-per-rev, outside what the logged tail speed allows/,
+      tailNear.text);
+
+    // Finding 6: why it was not judged a steady tone, from the criterion it
+    // failed. The 30% block was above the limit in enough windows, bunched into
+    // one part of the flight; the three-second burst was in too few of them.
+    assert.match(inPartPlain, /bunched into one part of this flight/, inPartPlain);
+    assert.doesNotMatch(inPartPlain, /too little of the flight/, inPartPlain);
+    const burstPlain = copied.burst.plain.AIRFRAME_TONE_ABOVE_LEVEL_IN_PART;
+    assert.ok(burstPlain, `${copied.burst.ids}`);
+    assert.match(burstPlain, /That is too little of the flight to judge, so this flight does not rule your airframe out/,
+      burstPlain);
+    assert.doesNotMatch(burstPlain, /bunched/, burstPlain);
 
     // Past three times the level: a blocker, said as its size.
     assert.equal(copied.large.status, 'attention', JSON.stringify(copied.large.reasons));
@@ -2587,12 +2741,14 @@ test('the engine and shell run in a real browser', {
             const pTerm = 0.105 * error;
             const iTerm = ki * integral;
             const dTerm = 0.0014 * derivative;
-            delay.push(pTerm + iTerm + dTerm);
+            // 3 October 2026: a static feedforward (kf) and a gyro noise level
+            // (noiseDps), each leaving every earlier flight here bit-identical.
+            delay.push(pTerm + iTerm + dTerm + (options.kf ? options.kf * command : 0));
             actuator += (delay.shift() - actuator) * (0.001 / 0.02);
             const external = (options.torque || 0)
               * Math.sin(2 * Math.PI * (options.hz || 0.8) * t + (options.phase || 0));
             rate += (800 * actuator - 2 * rate + (options.disturbance || 0) + external) * 0.001;
-            const noise = (random() - 0.5) * 1.6;
+            const noise = (random() - 0.5) * (options.noiseDps ? 2 * options.noiseDps : 1.6);
             measured += (rate + noise * 0.25 - measured) * (0.001 / 0.0015);
             records.push({timeUs: Math.round(t * 1e6), setpoint: [0, 0, command],
               gyro: [0, 0, measured], raw: [0, 0, rate + noise], terms: [pTerm, iTerm, dTerm],
@@ -2635,6 +2791,9 @@ test('the engine and shell run in a real browser', {
           return stops;
         };
         const fourHovers = [1, 12, 23, 34].map(atS => ({atS, amplitudeDps: 120, holdS: 0.3}));
+        const quickHovers = [1, 9.5, 18, 26.5].map(atS => ({atS, amplitudeDps: 120, holdS: 0.3}));
+        const turnsBothWays = [1, -1, 1, -1].map((sign, at) => ({atS: 1.8 + at * 7.5,
+          amplitudeDps: 200 * sign, holdS: 6.9}));
         return JSON.stringify({
           tiny: cards(lagged([0.01, 0.012]), 0.5),
           buried: cards(lagged([0.08, 0.09]), 40),
@@ -2653,7 +2812,16 @@ test('the engine and shell run in a real browser', {
             stops: pulses(6.5, 40)}), 0.5),
           someMoved: cards(loop({ki: 0, disturbance: 400, durationS: 46, stops: fourHovers,
             headspeed: t => (t > 14 && t < 22 ? 1800 * (1 + 0.08 * Math.sin(2 * Math.PI * 0.2 * t))
-              : 1800)}), 0.5)
+              : 1800)}), 0.5),
+          // 3 October 2026: turns both ways with no integrator, short of the
+          // command in every turn, and carried past it by a feedforward; and a
+          // standing error under gyro noise that hid the band beside it.
+          followsShort: cards(loop({ki: 0, durationS: 32, stops: turnsBothWays}), 0.5),
+          followsPast: cards(loop({ki: 0, kf: 0.01, durationS: 32, stops: turnsBothWays}), 0.5),
+          coveredNoise: cards(loop({ki: 0, disturbance: 1100, torque: 1300, hz: 1.0, noiseDps: 250,
+            durationS: 35, stops: quickHovers}), 0.5),
+          coveredShake: cards(loop({ki: 0, disturbance: 909, torque: 880, hz: 0.78, noiseDps: 200,
+            durationS: 35, stops: quickHovers}), 0.5)
         });
       })()`,
       awaitPromise: true,
@@ -2723,6 +2891,42 @@ test('the engine and shell run in a real browser', {
     assert.ok(someMovedPlain, `${holds.someMoved.ids}`);
     assert.match(someMovedPlain, /only holds during which your head speed stayed steady/, someMovedPlain);
     assert.doesNotMatch(someMovedPlain, /only from the ones where it held/, someMovedPlain);
+
+    // 3 October 2026 (re-review of round three). An error that follows the stick
+    // is said with the side it was on: short of the command in every turn, or
+    // carried past it — which is what a feedforward set too high does, and which
+    // the plain copy used to call the error sitting "on the side the turn went".
+    for (const [name, side, words, not] of [
+      ['followsShort', 'RATE_SHORT_OF_COMMAND_IN_EVERY_TURN', /more slowly than you asked/,
+        /faster than you asked|feedforward/],
+      ['followsPast', 'RATE_PAST_COMMAND_IN_EVERY_TURN', /faster than you asked.*feedforward/,
+        /more slowly than you asked|too little I/]]) {
+      const plain = holds[name].plain.I_TERM_NOT_JUDGED;
+      assert.ok(plain, `${name}: ${holds[name].ids}`);
+      const codes = holds[name].codes.I_TERM_NOT_JUDGED;
+      assert.ok(codes.includes('STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION') && codes.includes(side),
+        `${name}: the fixture must follow the stick on that side: ${codes}`);
+      assert.match(plain, words, plain);
+      assert.doesNotMatch(plain, not, plain);
+      assert.doesNotMatch(plain, /on the side the turn went/, plain);
+      assert.match(plain, /not an all-clear/, plain);
+    }
+    // A standing error under a cover that hid the band beside it: never "Raise
+    // I", and the plain copy says the offset was seen and what hid the rest.
+    for (const [name, cover, words] of [
+      ['coveredNoise', 'SLOW_RIPPLE_NOT_CLEAR_OF_NOISE', /gyro's own noise/],
+      ['coveredShake', 'OSCILLATION_ABOVE_I_TERM_BAND', /shake/]]) {
+      assert.ok(!holds[name].ids.includes('I_TOO_LOW'), `${name}: ${holds[name].ids}`);
+      assert.ok(!holds[name].ids.includes('I_TERM_WITHIN_TOLERANCE'), `${name}: ${holds[name].ids}`);
+      const plain = holds[name].plain.I_TERM_NOT_JUDGED;
+      assert.ok(plain, `${name}: ${holds[name].ids}`);
+      const codes = holds[name].codes.I_TERM_NOT_JUDGED;
+      assert.ok(codes.includes('STANDING_ERROR_WITH_UNMEASURED_BAND') && codes.includes(cover),
+        `${name}: ${codes}`);
+      assert.match(plain, /same side in every hold/, plain);
+      assert.match(plain, words, plain);
+      assert.match(plain, /not an all-clear/, plain);
+    }
 
     // 13. IMPORT PROGRESS, on the events MainActivity actually sends.
     //

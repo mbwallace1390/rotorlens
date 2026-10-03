@@ -680,7 +680,9 @@ export function holdManoeuvre(axis) {
   const settleSeconds = round((limits.holdSettleUs ?? 1_000_000) / 1e6, 1);
   const measureSeconds = round((limits.minimumHoldMeasureUs ?? 400_000) / 1e6, 1);
   const totalSeconds = round((limits.minimumHoldDurationUs ?? 1_400_000) / 1e6, 1);
-  const needed = limits.minimumHolds ?? 2;
+  // Enough for every reading, a standing error's included (3 October 2026): this
+  // asked for `minimumHolds`, 2, after a standing error came to need 3.
+  const needed = evidence.HOLDS_FOR_A_FULL_READING;
   const offAxis = limits.offAxisCommandLimitDps ?? 30;
 
   return Object.freeze({
@@ -861,7 +863,9 @@ export function describeStopCapture(diagnostics, context = {}) {
 /** The same treatment for hold evidence, which is what measures the I term. */
 export function describeHoldCapture(holdEvidence, context = {}) {
   const axis = context.axis ?? holdEvidence?.axis ?? 'this axis';
-  const needed = evidence.EVIDENCE_LIMITS?.minimumHolds ?? 2;
+  // The count the brief below asks for (3 October 2026), so the panel does not
+  // say "2 are needed" above "Repeat until you have 3 such holds".
+  const needed = evidence.HOLDS_FOR_A_FULL_READING;
   const holds = holdEvidence?.holds ?? [];
   const rejected = holdEvidence?.rejectedHoldCounts ?? {};
 

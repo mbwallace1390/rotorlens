@@ -21,6 +21,9 @@ import {
 } from '../src/analysis/axis-report.mjs';
 import {STOP_DETECTION_DEFAULTS} from '../src/analysis/records.mjs';
 import {EVIDENCE_LIMITS} from '../src/analysis/pid-evidence.mjs';
+// By namespace, for one export added 3 October 2026: a named import of an export
+// the module lacks is a link error that would take every test here down with it.
+import * as pidEvidence from '../src/analysis/pid-evidence.mjs';
 
 /**
  * Deterministic PRNG, so a sweep that fails fails again on the next run.
@@ -961,7 +964,14 @@ test('the manoeuvre brief quotes the gates that will actually judge it', () => {
   const hold = holdManoeuvre('pitch').steps.join(' ');
   assert.ok(hold.includes(`${EVIDENCE_LIMITS.minimumHoldDurationUs / 1e6} s`));
   assert.ok(hold.includes(`${EVIDENCE_LIMITS.offAxisCommandLimitDps}°/s`));
-  assert.ok(hold.includes(`${EVIDENCE_LIMITS.minimumHolds} such holds`));
+  // UPDATED 3 October 2026 (re-review of round three): this pinned
+  // `minimumHolds`, 2, and the brief asked for 2 holds while a standing error
+  // is read only from `minimumHoldsForStandingError`, 3. A pilot who flew it
+  // came back to "2 holds are too few". The pin was the defect: the brief asks
+  // for the larger of the two, which every hold count in the copy now quotes.
+  assert.equal(pidEvidence.HOLDS_FOR_A_FULL_READING,
+    Math.max(EVIDENCE_LIMITS.minimumHolds, EVIDENCE_LIMITS.minimumHoldsForStandingError));
+  assert.ok(hold.includes(`${pidEvidence.HOLDS_FOR_A_FULL_READING} such holds`), hold);
 });
 
 test('hold capture separates never-flown from set-aside', () => {
@@ -984,8 +994,11 @@ test('hold capture separates never-flown from set-aside', () => {
   assert.equal(partial.state, 'partial');
   assert.match(partial.headline, /nothing is concluded/);
   // The count in the sentence is the evidence module's, not a literal here.
-  assert.equal(partial.needed, EVIDENCE_LIMITS.minimumHolds);
-  assert.match(partial.headline, new RegExp(`${EVIDENCE_LIMITS.minimumHolds} are needed`));
+  // UPDATED 3 October 2026, for the reason given in the brief's test above: it
+  // pinned `minimumHolds`, 2, the count a standing error cannot be read from.
+  assert.equal(partial.needed, pidEvidence.HOLDS_FOR_A_FULL_READING);
+  assert.match(partial.headline,
+    new RegExp(`${pidEvidence.HOLDS_FOR_A_FULL_READING} are needed`), partial.headline);
 });
 
 test('an unrecognised refusal code degrades to words, not to a shouted enum', () => {

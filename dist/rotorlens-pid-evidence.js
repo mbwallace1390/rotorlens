@@ -305,6 +305,19 @@
     maximumReasonCodes: 32
   });
 
+  /**
+   * How many holds a sentence asks a pilot to fly (3 October 2026, the re-review
+   * of round three): the larger of the two minimums above. Holds are captured from
+   * `minimumHolds`, but a standing error is read only from
+   * `minimumHoldsForStandingError`, and the copy went on asking for the smaller —
+   * "Repeat until you have 2 such holds", "fly two long still holds" — after the
+   * second was raised to three. A pilot with too little I who flew what he was
+   * told came back to "2 holds are too few to call that a standing error". Every
+   * count of holds the copy asks for is this one, so the two cannot drift apart.
+   */
+  const HOLDS_FOR_A_FULL_READING = Math.max(
+    EVIDENCE_LIMITS.minimumHolds, EVIDENCE_LIMITS.minimumHoldsForStandingError);
+
   // ---------------------------------------------------------------------------
   // Small numeric helpers. Kept local so this module stays dependency-free.
   // ---------------------------------------------------------------------------
@@ -1499,7 +1512,9 @@
     // Exempt above the band: an oscillation at f leaves at most A/(pi f T) in a
     // T-second mean — under 3% of its amplitude at 3 Hz over a 5 s hold — so it
     // cannot manufacture a standing error. It CAN hide a hunt under it, though,
-    // which this rule is not about: the per-hold rule below refuses that.
+    // which this rule is not about: below, the per-hold rule refuses that where
+    // the oscillation moves more than the mean, and STANDING_ERROR_WITH_UNMEASURED_
+    // BAND where it moves less.
     const slowEnoughToLeaveAMean = oscillationHz <= huntingBandHz[1];
     const standingClearOfMovement = !slowEnoughToLeaveAMean
       || summary.meanAbsoluteSteadyStateErrorDps > ripple;
@@ -1542,7 +1557,27 @@
       const refusal = standingErrorRefusal(evidence.holds ?? [],
         options.minimumHoldsForStandingError ?? EVIDENCE_LIMITS.minimumHoldsForStandingError);
       if (refusal) {
-        addCode(codes, refusal);
+        for (const code of refusal) {
+          addCode(codes, code);
+        }
+        return Object.freeze({indication: 'hold', confidence: 'low', codes});
+      }
+      // ...AND NOT BESIDE A BAND NOTHING COULD SEE INTO (3 October 2026, the
+      // re-review of round three). A standing error with an in-band hunt beside it
+      // is the conflicting signature, refused above — but only where the hunt was
+      // SEEN. Under an oscillation above the band, which dominates the crossing
+      // count, or a slow ripple no larger than the noise, a hunt is neither read
+      // nor ruled out; and a cover that moved LESS than the mean in every hold
+      // passed every rule above, so "increase" here was reached by elimination. The
+      // review laid a 6-15 Hz torque, or 50-400 deg/s of gyro noise, smaller than
+      // the standing error, over an aircraft with no integrator AND an in-band
+      // wobble, and got "Raise I" in 2 and 10 of 40 flights.
+      //
+      // A fast oscillation too small to register — its slow part under
+      // `huntingRippleDps`, so neither code is set — is a measurement that would
+      // have seen a hunt of that size beside the error, and is still read.
+      if (rippleWithinNoise || codes.includes('OSCILLATION_ABOVE_I_TERM_BAND')) {
+        addCode(codes, 'STANDING_ERROR_WITH_UNMEASURED_BAND');
         return Object.freeze({indication: 'hold', confidence: 'low', codes});
       }
       return Object.freeze({
@@ -1576,7 +1611,8 @@
   }
 
   /**
-   * Why a standing error over these holds is NOT read as one, or null when it is.
+   * Why a standing error over these holds is NOT read as one — the codes that say
+   * so — or null when it is.
    *
    * Added 2 October 2026, round three of the review. A real shortfall of I is
    * CONSISTENT: the integrator leaves the same error, on the same side of the
@@ -1591,7 +1627,10 @@
    *      fast oscillation: it cannot manufacture a mean, but it hides a hunt
    *      under it, and a standing error with a hunt is the conflicting signature,
    *      which is refused — "Raise I" was given to an aircraft with no integrator
-   *      and an in-band wobble once a 12 Hz vibration was laid over it.
+   *      and an in-band wobble once a 12 Hz vibration was laid over it. This rule
+   *      refuses that only where the oscillation moves MORE than the mean; where
+   *      it moves less, `interpretHoldEvidence` refuses it after this one
+   *      (STANDING_ERROR_WITH_UNMEASURED_BAND, re-review of 3 October 2026).
    *   2. Every hold must sit on the same side of the command
    *      (STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS). The side is the error's own
    *      sign, for holds at zero and at a rate alike. The review suggested
@@ -1601,8 +1640,13 @@
    *      healthy flights whose turns alternated in step with a wander, passed 28
    *      of the 57 the round-two rule had read as "increase". An error that
    *      changes side exactly with the stick is named for what it is
-   *      (STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION): a loop lagging behind every
-   *      turn, or a wander in step with them, which these holds cannot separate.
+   *      (STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION), with the side it was on in
+   *      every turn, in that turn's own direction (re-review of 3 October 2026):
+   *      the rate short of the command in every turn — a loop lagging behind
+   *      each one — or past it in every turn, which is what a feedforward set too
+   *      high does (RATE_SHORT_OF_COMMAND_IN_EVERY_TURN, RATE_PAST_COMMAND_IN_
+   *      EVERY_TURN). Either way a wander in step with the turns does the same,
+   *      and these holds cannot separate them.
    *   3. At least `minimum` holds (TOO_FEW_HOLDS_FOR_A_STANDING_ERROR); see
    *      `EVIDENCE_LIMITS.minimumHoldsForStandingError`.
    *
@@ -1615,19 +1659,28 @@
   function standingErrorRefusal(holds, minimum) {
     const errors = holds.map(hold => hold.steadyStateErrorDps);
     if (holds.some(hold => !(Math.abs(hold.steadyStateErrorDps) > hold.errorRippleRmsDps))) {
-      return 'STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD';
+      return ['STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD'];
     }
-    const oneSide = values => values.every(value => value > 0) || values.every(value => value < 0);
-    if (!oneSide(errors)) {
+    const allAbove = values => values.every(value => value > 0);
+    const allBelow = values => values.every(value => value < 0);
+    if (!allAbove(errors) && !allBelow(errors)) {
       const directions = holds.map(hold =>
         (hold.holdKind === 'sustained' ? Math.sign(hold.setpointMedianDps) : 0));
-      const bothWays = directions.includes(1) && directions.includes(-1);
-      return bothWays && oneSide(errors.map((error, index) => error * directions[index]))
-        ? 'STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION'
-        : 'STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS';
+      if (directions.includes(1) && directions.includes(-1)) {
+        // Setpoint minus gyro, in each turn's own direction: positive is a rate
+        // short of the command, negative a rate past it.
+        const inTurn = errors.map((error, index) => error * directions[index]);
+        if (allAbove(inTurn)) {
+          return ['STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION', 'RATE_SHORT_OF_COMMAND_IN_EVERY_TURN'];
+        }
+        if (allBelow(inTurn)) {
+          return ['STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION', 'RATE_PAST_COMMAND_IN_EVERY_TURN'];
+        }
+      }
+      return ['STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS'];
     }
     if (holds.length < minimum) {
-      return 'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR';
+      return ['TOO_FEW_HOLDS_FOR_A_STANDING_ERROR'];
     }
     return null;
   }
@@ -1780,6 +1833,7 @@
     HOLD_EVIDENCE_KIND: HOLD_EVIDENCE_KIND,
     HUNTING_BAND_HZ: HUNTING_BAND_HZ,
     EVIDENCE_LIMITS: EVIDENCE_LIMITS,
+    HOLDS_FOR_A_FULL_READING: HOLDS_FOR_A_FULL_READING,
     mean: mean,
     extremes: extremes,
     weightedMean: weightedMean,

@@ -97,6 +97,7 @@ import {
   CROSSINGS_PER_CYCLE,
   DIRECTIONS,
   EVIDENCE_LIMITS,
+  HOLDS_FOR_A_FULL_READING,
   HOLD_READING_THRESHOLDS,
   buildDirectionalStopEvidence,
   buildHoldEvidence,
@@ -119,8 +120,11 @@ import {
   evaluateHeadspeedGate,
   evaluateGainRecommendationGates,
   evaluateStabilityGate,
+  rotorOrderMatchDistance,
+  rotorOrderMatchEstablished,
   sweepCombinations,
-  sweepDirectionalConclusion
+  sweepDirectionalConclusion,
+  toneAboveLevelInPartBlocks
 } from './advisor/recommendation-gates.mjs';
 
 export const RECOMMENDATIONS_SCHEMA_VERSION = 1;
@@ -342,8 +346,38 @@ export const BIND_LIMITS = Object.freeze({
   windUpToDriftRatio: 5,
 
   /** A drift below this is not going anywhere; units are I-term units/second. */
-  minimumITermDriftPerSecond: 0.5
+  minimumITermDriftPerSecond: 0.5,
+
+  /**
+   * JUDGEMENT, round seven (3 October 2026). Where the I term wound toward the
+   * error in every hold, the share of the error over the earlier half of the
+   * holds that must still stand over the later half for the winding to read as
+   * held against something rather than closing the error. A working integrator
+   * closes a standing error with a time constant of a few seconds — about 2.2 s
+   * on the test file's closed loop, (kp x authority + damping) / (ki x
+   * authority), shorter than the 4 s a hold must measure — so one that keeps
+   * winding toward an error across holds spanning 15 s or more leaves a fraction
+   * of it; a bound control leaves all of it. Half sits between; see
+   * `integratorHeldAgainst` for what it was measured against.
+   */
+  windingErrorHeldShare: 0.5
 });
+
+/**
+ * The per-hold refusals that say an error over the holds was NOT a standing one
+ * (`interpretHoldEvidence`, round three): it moved as much as it averaged, in
+ * all the holds together or in one of them, or it changed side between them, or
+ * changed side with the stick. A bind is a standing error the integrator cannot
+ * beat, so none of these may sit under one (re-review of 3 October 2026).
+ * TOO_FEW_HOLDS_FOR_A_STANDING_ERROR is deliberately absent: it says the holds
+ * were few, not that the error moved.
+ */
+const STANDING_ERROR_REFUSALS = Object.freeze([
+  'STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT',
+  'STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD',
+  'STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS',
+  'STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION'
+]);
 
 /**
  * ADDED 13 AUGUST 2026, after an adversarial review reproduced four ways this
@@ -1263,14 +1297,26 @@ function rangeOf(values) {
  * stretches, and of the whole result otherwise. A peak from a stretch whose head
  * speed was steady was genuinely compared, whatever the stretch beside it did,
  * and "matches no rotor order" is then a measurement rather than a guess.
+ *
+ * Stage 2d: a peak that was above the attention level in some windows without
+ * being attention-eligible is admitted whatever its persistence too, as
+ * `aboveLevelInPart`. While it was there it was above the level, which no
+ * persistence floor can make small, and an oscillation sitting on it must reach
+ * the coincidence rule as surely as one sitting on a steady tone. Every tone
+ * carries its size while present and the share of the range it was above the
+ * level for, where the analyser measured them.
  */
-function tonesOf(entry, toneLimits, correlation) {
+function tonesOf(entry, toneLimits, correlation, thresholdDps) {
   const out = [];
   for (const peak of entry?.peaks ?? []) {
     if (!Number.isFinite(peak?.frequencyHz)) {
       continue;
     }
-    if (peak?.attentionEligible !== true
+    const whilePresent = Number.isFinite(peak?.attentionWindowBandRmsDps)
+      && (!Number.isFinite(thresholdDps) || peak.attentionWindowBandRmsDps >= thresholdDps)
+      ? peak.attentionWindowBandRmsDps : null;
+    const aboveLevelInPart = peak?.attentionEligible !== true && whilePresent !== null;
+    if (peak?.attentionEligible !== true && !aboveLevelInPart
         && (peak?.persistenceRatio ?? 0) < toneLimits.persistenceRatioFloor) {
       continue;
     }
@@ -1279,16 +1325,132 @@ function tonesOf(entry, toneLimits, correlation) {
       axis: entry?.axis ?? null,
       frequencyHz: peak.frequencyHz,
       bandRmsDps: Number.isFinite(peak?.bandRmsDps) ? peak.bandRmsDps : null,
+      // Its size while it was above the attention level, the share of the
+      // analysed windows it was above it in, and whether that size is only a
+      // lower bound; null where it never reached the level.
+      aboveLevelBandRmsDps: whilePresent,
+      aboveLevelShare: whilePresent !== null && Number.isFinite(peak.attentionPersistenceRatio)
+        ? peak.attentionPersistenceRatio : null,
+      sizeIsLowerBound: whilePresent !== null && peak.attentionWindowSizeIsLowerBound === true,
+      // Which of the attention criteria it did not meet, as the analyser
+      // published them ("window-count", "span", "quarters", "gap"), so a card
+      // says why it was not a steady tone rather than guessing; null where the
+      // analyser did not say (copy review of 3 October 2026, finding 6).
+      aboveLevelCriteriaUnmet: whilePresent !== null && Array.isArray(peak.attentionCriteriaUnmet)
+        ? frozen([...peak.attentionCriteriaUnmet]) : null,
       bandwidthHz: Number.isFinite(peak?.bandwidthHz) ? peak.bandwidthHz : null,
       persistenceRatio: peak.persistenceRatio ?? null,
       attentionEligible: peak.attentionEligible === true,
+      aboveLevelInPart,
+      // What the airframe gate did with it, when it was above the level in part:
+      // null up to the ceiling, otherwise the code it blocked on.
+      blocks: aboveLevelInPart ? toneAboveLevelInPartBlocks(entry, peak, thresholdDps) : null,
       rotor: peak.harmonicMatch?.rotor ?? null,
       order: peak.harmonicMatch?.order ?? null,
+      // Whether the order it is named sits where the logged head speed puts it
+      // (Stage 2d follow-up, item 3): true, false where it was measured outside
+      // that, and null where it is matched to nothing or the distance was not
+      // published — the same measurement the airframe gate judges identity on.
+      orderEstablished: peak.harmonicMatch && rotorOrderMatchDistance(peak) !== null
+        ? rotorOrderMatchEstablished(peak) : null,
       rotorCompared: peak.harmonicMatch ? true : comparison?.state === 'evaluated',
       chunkRangeUs: Array.isArray(peak.chunkRangeUs) ? frozen([...peak.chunkRangeUs]) : null
     }));
   }
   return out;
+}
+
+/**
+ * "head speed", or "tail speed" for a tone matched to the tail rotor: the logged
+ * speed its identity was judged against. Copy review of 3 October 2026, finding
+ * 4: a tail-rotor match is judged on the TAIL speed's own spread, and every card
+ * said "outside what the logged head speed allows" of it.
+ */
+function loggedSpeed(tone) {
+  return tone?.rotor === 'tail' ? 'tail speed' : 'head speed';
+}
+
+/**
+ * ", which is the main rotor's once-per-rev", or — for a tone named that order
+ * but measured outside what the logged speed of that rotor allows (Stage 2d
+ * follow-up, item 3) — ", near the main rotor's once-per-rev, outside what the
+ * logged head speed allows". Nothing for a tone matched to no order.
+ */
+function orderClause(tone) {
+  if (!tone?.rotor || !Number.isFinite(tone.order)) {
+    return '';
+  }
+  return tone.orderEstablished === false
+    ? `, near the ${tone.rotor} rotor's ${perRev(tone.order)}, outside what the logged `
+      + `${loggedSpeed(tone)} allows`
+    : `, which is the ${tone.rotor} rotor's ${perRev(tone.order)}`;
+}
+
+/**
+ * Why a tone above the level for part of the range was not judged a steady one,
+ * as a sentence without its full stop — worded from the attention criteria the
+ * analyser says it did not meet. Copy review of 3 October 2026, finding 6: every
+ * such tone was "too little of the flight to judge it as a steady tone", including
+ * tones above the level in a quarter or more of the windows that failed only on
+ * being bunched into one part of the range. The card about the tone and the card
+ * about an oscillation sitting on it both say this sentence, so they cannot
+ * disagree.
+ */
+function notSteadySentence(tone) {
+  const unmet = tone?.aboveLevelCriteriaUnmet;
+  if (!Array.isArray(unmet) || unmet.length === 0) {
+    return 'That is too few of the analysis windows, or too bunched together, to judge it as a '
+      + 'steady tone';
+  }
+  if (unmet.includes('window-count')) {
+    return 'That is too little of the flight to judge it as a steady tone';
+  }
+  return 'It was above that level in enough of the analysis windows, but they were too bunched '
+    + `together — ${bunchedHow(tone).join(' and ')} — to judge it as a steady tone`;
+}
+
+/** "spanning under half of the range", "in fewer than three of its four quarters", "with a long gap between them". */
+function bunchedHow(tone) {
+  const unmet = tone.aboveLevelCriteriaUnmet ?? [];
+  return [
+    ...(unmet.includes('span') ? [`spanning under half of ${toneScope(tone)}`] : []),
+    ...(unmet.includes('quarters') ? ['in fewer than three of its four quarters'] : []),
+    ...(unmet.includes('gap') ? ['with a long gap between them'] : [])
+  ];
+}
+
+/** The same reason, for a basis row's source: what the windows it was above the level in were. */
+function notSteadySource(tone) {
+  const unmet = tone?.aboveLevelCriteriaUnmet;
+  if (!Array.isArray(unmet) || unmet.length === 0) {
+    return 'too few of them, or too bunched together, for the vibration check to call it a steady '
+      + 'tone';
+  }
+  if (unmet.includes('window-count')) {
+    return 'too few of them for the vibration check to call it a steady tone';
+  }
+  return `enough of them, but too bunched together (${bunchedHow(tone).join(', ')}) for the `
+    + 'vibration check to call it a steady tone';
+}
+
+/** The code the plain copy reads that reason from; none where the analyser did not say. */
+function notSteadyCode(tone) {
+  const unmet = tone?.aboveLevelCriteriaUnmet;
+  if (!Array.isArray(unmet) || unmet.length === 0) {
+    return [];
+  }
+  return [unmet.includes('window-count') ? 'TONE_ABOVE_LEVEL_IN_TOO_FEW_WINDOWS'
+    : 'TONE_ABOVE_LEVEL_TOO_BUNCHED'];
+}
+
+/**
+ * How loud a tone is, for choosing which copy of it speaks for it: its size
+ * while above the level where it reached the level, its average otherwise. A
+ * copy that reached the level is always the louder — its size is at least the
+ * level, and a copy that never reached it averaged under it.
+ */
+function loudness(tone) {
+  return tone.aboveLevelBandRmsDps ?? tone.bandRmsDps ?? -Infinity;
 }
 
 /**
@@ -1319,7 +1481,9 @@ function distinctTones(tones) {
       continue;
     }
     const stretches = [...same.stretches, stretch];
-    if ((tone.bandRmsDps ?? -Infinity) > (same.bandRmsDps ?? -Infinity)) {
+    // The loudest copy — by its size while present where it reached the level
+    // (Stage 2d), never by an average its quiet windows pulled down.
+    if (loudness(tone) > loudness(same)) {
       Object.assign(same, tone);
     }
     same.stretches = stretches;
@@ -1432,8 +1596,7 @@ export function unmatchedTone(tones, frequencyHz, limits = TONE_LIMITS) {
 export function airframeAmbiguity(tones, frequencyHz) {
   const tone = unmatchedTone(tones, frequencyHz);
   const sighting = tone
-    ? `The spectrum on this axis does carry a persistent tone at ${round(tone.frequencyHz, 1)} Hz `
-      + `(${round(tone.bandRmsDps, 2)} deg/s), matching no rotor order — which is equally `
+    ? `The spectrum on this axis does carry ${sightingOf(tone)} — which is equally `
       + 'consistent with the loop ringing and with the airframe ringing. '
     : 'No airframe tone was measured at that frequency, which makes the loop the better '
       + 'explanation but does not settle it: a mode excited only by a release need not show '
@@ -1453,6 +1616,29 @@ export function airframeAmbiguity(tones, frequencyHz) {
       + 'control authority and the fault still there.',
     tone
   };
+}
+
+/**
+ * An unmatched tone as the ambiguity note names it. Stage 2d follow-up, item 2:
+ * one that reached the attention level is said at its size while it was there,
+ * for how long, and its average beside them — "a persistent tone (4.69 deg/s)"
+ * was said of a tone above the level in a tenth of the flight at three times
+ * that size, beside a card calling it too little of the flight to be steady.
+ * One that never reached the level is the persistent tone it is, at its average.
+ */
+function sightingOf(tone) {
+  const match = tone.rotorCompared === false ? 'not compared against the rotor' : 'matching no rotor order';
+  if (!Number.isFinite(tone.aboveLevelBandRmsDps)) {
+    return `a persistent tone at ${round(tone.frequencyHz, 1)} Hz (${round(tone.bandRmsDps, 2)} deg/s), `
+      + match;
+  }
+  const share = Number.isFinite(tone.aboveLevelShare) ? Math.round(tone.aboveLevelShare * 100) : null;
+  const average = Number.isFinite(tone.bandRmsDps) ? round(tone.bandRmsDps, 1) : null;
+  return `a tone at ${round(tone.frequencyHz, 1)} Hz, ${match}, at `
+    + `${tone.sizeIsLowerBound ? 'least ' : ''}${round(tone.aboveLevelBandRmsDps, 1)} deg/s while it was `
+    + 'above the attention level'
+    + (share !== null ? `, for ${share}% of ${toneScope(tone)}` : '')
+    + (average !== null ? ` (${average} deg/s averaged over all of it)` : '');
 }
 
 export function assessAirframe(mechanical, options = {}) {
@@ -1500,7 +1686,7 @@ export function assessAirframe(mechanical, options = {}) {
        * mentioned. Carrying it here is what lets the finding layer say what was
        * actually seen instead of "a positive measurement of absence".
        */
-      tones: frozen(tonesOf(entry, toneLimits, mechanical?.harmonicCorrelation ?? null))
+      tones: frozen(tonesOf(entry, toneLimits, mechanical?.harmonicCorrelation ?? null, threshold))
     }));
   }
 
@@ -1529,10 +1715,17 @@ export function assessAirframe(mechanical, options = {}) {
   // refuse every flight. They are a reason not to claim absence, and a reason
   // not to blame a gain for an oscillation sitting on top of one — which is why
   // they travel in their own field rather than in `codes`.
+  //
+  // A tone that was above the level for part of the range is NOT one of them
+  // (Stage 2d): it travels in a field of its own, and is never said to have been
+  // below a level it was measured above.
   const subThresholdTones = [];
+  const tonesAboveLevelInPart = [];
   for (const entry of axes) {
     for (const tone of entry.tones) {
-      if (!tone.attentionEligible) {
+      if (tone.aboveLevelInPart) {
+        tonesAboveLevelInPart.push(tone);
+      } else if (!tone.attentionEligible) {
         subThresholdTones.push(tone);
       }
     }
@@ -1551,6 +1744,14 @@ export function assessAirframe(mechanical, options = {}) {
     elevatedAxes: frozen(elevated),
     /** Measured, named, and below the attention level. Not a blocker. */
     subThresholdTones: frozen(subThresholdTones),
+    /**
+     * Above the attention level for only part of the range, and not
+     * attention-eligible (Stage 2d). Never an all-clear; up to the ceiling not a
+     * blocker on its own, past it a blocker through the upstream gate.
+     */
+    tonesAboveLevelInPart: frozen(tonesAboveLevelInPart),
+    /** The ceiling any tone is judged against: three times the published level. */
+    toneCeilingDps: upstream.measured?.toneCeilingDps ?? null,
     /**
      * Main-rotor 1/rev and 2/rev above the experimental attention level, when
      * they are ALL that is above it. Not a blocker either, by owner decision of
@@ -1581,14 +1782,15 @@ function perRev(order) {
   return order === 2 ? 'twice-per-rev' : `${order} times-per-rev`;
 }
 
-/** "29.3 Hz on roll, the main rotor's once-per-rev, at 4.6 deg/s" */
+/**
+ * "29.3 Hz on roll, which is the main rotor's once-per-rev, at 4.6 deg/s" — or
+ * "near" it, where the order it is named sits outside what the logged head speed
+ * allows (see `orderClause`).
+ */
 function describeTone(tone) {
   const where = tone.axis ? ` on ${tone.axis}` : '';
-  const order = tone.rotor && Number.isFinite(tone.order)
-    ? `, which is the ${tone.rotor} rotor's ${perRev(tone.order)}`
-    : '';
   const size = Number.isFinite(tone.bandRmsDps) ? `, at ${round(tone.bandRmsDps, 1)} deg/s` : '';
-  return `${round(tone.frequencyHz, 1)} Hz${where}${order}${size}`;
+  return `${round(tone.frequencyHz, 1)} Hz${where}${orderClause(tone)}${size}`;
 }
 
 /* ------------------------------------------------------ the headspeed assessment */
@@ -1878,6 +2080,125 @@ function countHeadspeedSegments(options) {
 /* ------------------------------------------------------------ the hold assessment */
 
 /**
+ * Whether the integrator, hold by hold, stayed held against the error the way
+ * one wound against an obstacle does — the bind gate's answer to a per-hold
+ * refusal (re-review of 3 October 2026). Returns which reading held, or null.
+ *
+ * A per-hold refusal says the error MOVED: as much as it averaged, or from one
+ * side to the other. A healthy integrator following a slow wander does that,
+ * and so does a genuine bind with something else moving the aircraft too — a
+ * control that cannot move far enough against a standing torque, with a
+ * governor hunting or wind on top. What separates them is the integrator. A
+ * bind's has been totting up an error it cannot close, so it stays on that
+ * error's side, or keeps growing on one side; a healthy one following a slow
+ * torque lags it, and changes side or falls back as the torque turns.
+ *
+ *  - 'on-the-error-side': the error on one side in every hold, and the I term's
+ *    mean on that same side in every hold;
+ *  - 'growing-on-one-side': the I term's mean on one side in every hold, its
+ *    size never smaller than in the hold before, and its drift over the holds
+ *    pointing the same way;
+ *  - 'winding-toward-the-error' (round seven, 3 October 2026): the error on one
+ *    side in every hold, the I term winding toward that side in every hold at
+ *    `minimumITermDriftPerSecond` or faster, and the error over the later half
+ *    of the holds still `windingErrorHeldShare` or more of what it was over the
+ *    earlier half — the integrator kept pushing and the error did not close.
+ *
+ * WHY THE THIRD, WHICH READS NO POSITION. The first two read where the I term
+ * SITS, and an I term carrying a trim sits wherever the trim puts it (on real
+ * flights with holds, 12 of 50 axes failed the first reading). A bind against an
+ * opposite trim — the error at +5 deg/s, the I term trimmed at -40 and winding
+ * up through -30 — is on neither side and is not growing, so in moving air the
+ * first two switched it off (code review of round six). The third reads
+ * only MOVEMENT. Its drift sign alone is no evidence — any integrator winds the
+ * way its error points — so the evidence is the other two clauses: winding past
+ * the floor in EVERY hold says the error was not closed in any of them, and the
+ * error standing across the holds says the winding did not close it either. A
+ * working integrator would have; what it cannot be told from is one following a
+ * torque that keeps growing the same way for the whole flight, which from the
+ * holds alone is the same picture, and reads as a bind — failing safe.
+ *
+ * THE SIGN CONVENTION WAS CHECKED, not assumed. RotorLens computes the error as
+ * setpoint minus gyro; the I term is whatever the firmware logged. On the
+ * reference Rotorflight 4.6 log, over 50 ms windows whose mean error was past 5
+ * deg/s, the logged I term moved the way that error pointed in 443 of 467
+ * windows on roll, 395 of 407 on pitch and 81 of 81 on yaw. A test holds it
+ * there.
+ *
+ * MEASURED on the closed loop, among flights that already carried the winding
+ * or pinned signature and a per-hold refusal: the review's 192 healthy cells
+ * under a 0.03-0.04 Hz torque, 0 kept as binds; its 96 cells with a low
+ * iterm_limit, 0; 400 broad healthy slow-torque flights, 0; genuine binds in
+ * moving air, 74 of the 75 that carry the signature kept, where the refusal
+ * alone kept 37. Neither reading is evidence of a bind on its own: on real
+ * flights with holds the I term sat on the error's side in every hold in 38 of
+ * 50 axes, and grew on one side in 14 — none of them with an error past the
+ * 3 deg/s a bind needs. And where an aircraft carries a large trim, a healthy
+ * integrator under a slow wander can look like either: 3 of 200 such flights
+ * now read as a bind (7 of 200 did before any refusal gated it). That error
+ * fails safe — a linkage checked by hand — where the one it replaces did not.
+ *
+ * MEASURED FOR THE THIRD (round seven), through this function's caller on the
+ * same closed loop, without it and with it. Genuine binds against a trim of -60
+ * to +60 in logged units, bind errors 3-10 deg/s, winding 0.5-4 a second, a
+ * wander up to 100 deg/s² and gusts: 136 of 200 named before, 151 after; with
+ * the trim kept opposite the error for the whole flight, 32 and 85 of 200 — of
+ * the 80 where the I term sat opposite in every hold, 21 and 46. Most of the
+ * rest moved too much for any reading of the holds: in 113 of those 400 the
+ * error changed side between them. No bind was lost, and none was added on the
+ * healthy families above or on 300 more broad ones (7 before and after). Both
+ * clauses are load-bearing: without the floor two of the review's cells read as
+ * binds; without the standing clause, a soft integrator trimmed opposite its
+ * error and catching up with a step torque in moving air does — it winds past
+ * the floor in every hold too, and only its error closing tells it apart. What
+ * it admits: a torque so slow it is nearly a ramp across the flight, under a
+ * wander, built to look exactly like this — 6 more of 300 read as binds (16
+ * before). On real flights it changes nothing: the whole pattern appeared on 2
+ * of 50 axes with holds, both already read by one of the first two, neither
+ * with an error a bind needs.
+ */
+function integratorHeldAgainst(holds, meanITermDriftPerSecond, bindLimits = BIND_LIMITS) {
+  if (holds.length === 0) {
+    return null;
+  }
+  const errorSide = Math.sign(holds[0].steadyStateErrorDps);
+  const onErrorSide = errorSide !== 0
+    && holds.every(entry => Math.sign(entry.steadyStateErrorDps) === errorSide
+      && Math.sign(entry.iTermMean) === errorSide);
+  if (onErrorSide) {
+    return 'on-the-error-side';
+  }
+  const iSide = Math.sign(holds[0].iTermMean);
+  const growingOutward = iSide !== 0
+    && holds.every(entry => Math.sign(entry.iTermMean) === iSide)
+    && holds.every((entry, at) => at === 0
+        || Math.abs(entry.iTermMean) >= Math.abs(holds[at - 1].iTermMean))
+    && Math.sign(meanITermDriftPerSecond ?? 0) === iSide;
+  if (growingOutward) {
+    return 'growing-on-one-side';
+  }
+  // The third reading: wherever the trim puts the I term, it wound toward the
+  // error, past the floor, in every hold ...
+  const windingEveryHold = errorSide !== 0
+    && holds.every(entry => Math.sign(entry.steadyStateErrorDps) === errorSide
+      && Math.sign(entry.iTermDriftPerSecond) === errorSide
+      && Math.abs(entry.iTermDriftPerSecond) >= bindLimits.minimumITermDriftPerSecond);
+  // ... and the error did not close: over the later half of the holds it still
+  // stood at the share it held over the earlier half, each weighted by how long
+  // it was measured. The middle hold of an odd count is in neither half.
+  const half = Math.floor(holds.length / 2);
+  const towardErrorSide = list => list.reduce((total, entry) =>
+    total + errorSide * entry.steadyStateErrorDps * entry.measuredDurationUs, 0)
+    / list.reduce((total, entry) => total + entry.measuredDurationUs, 0);
+  if (windingEveryHold && half > 0
+      && towardErrorSide(holds.slice(holds.length - half))
+        >= bindLimits.windingErrorHeldShare * towardErrorSide(holds.slice(0, half))) {
+    return 'winding-toward-the-error';
+  }
+  return null;
+}
+
+/**
  * The I-term reading, with the two things `interpretHoldEvidence` cannot do.
  *
  * FIRST, the bind discriminator. `interpretHoldEvidence` reads only the error —
@@ -1998,7 +2319,32 @@ export function assessHoldIndication(records, axis, options = {}) {
     const iDrift = Math.abs(summary.meanITermDriftPerSecond ?? 0);
     const growing = iDrift >= bindLimits.minimumITermDriftPerSecond;
     const woundUp = iDrift > 0 && iRms >= iDrift * bindLimits.windUpToDriftRatio;
-    const standingError = error > bindLimits.errorDpsThreshold;
+    // ONLY WHERE THE ERROR WAS READ AS STANDING (3 October 2026, the re-review of
+    // round three). `error` is the |mean| over the holds, and a slow wander
+    // leaves a slice of its cycle in each hold's mean: a healthy integrator under
+    // a 0.03-0.035 Hz torque, flown as three ordinary holds, read 10-17 deg/s of
+    // "standing" error with the I term following the torque — winding, by the
+    // numbers above — and was called a bind, a blocker on every gain on the axis,
+    // although the per-hold test had already refused that error as a standing
+    // one (10 of the review's 192 cells). A bind is a standing error the
+    // integrator cannot beat, so it is read only where that test did not refuse
+    // the error; otherwise the hold findings say what moved. Too few holds is not
+    // such a refusal: it says nothing about whether the error moved.
+    //
+    // ...BUT A REFUSAL ALONE NEVER SWITCHES A BIND OFF (re-review of 3 October
+    // 2026). A genuine bind with anything else moving the aircraft too — a
+    // governor hunting, wind — has its error refused hold by hold exactly as a
+    // wander's is, and the gate above then dropped the blocker and let a gain
+    // change on another axis become the one instruction while the linkage bound:
+    // 12 of 12 such flights in the review, and 36 of 60 binds in moving air lost
+    // on one axis. Mechanical faults outrank gains, so the bind stays unless the
+    // integrator ALSO behaved like one following the movement rather than one
+    // held against something; see `integratorHeldAgainst`.
+    const notStanding = STANDING_ERROR_REFUSALS.find(code => shipped.codes.includes(code)) ?? null;
+    const held = integratorHeldAgainst(evidence.holds ?? [], summary.meanITermDriftPerSecond,
+      bindLimits);
+    const standingError = error > bindLimits.errorDpsThreshold
+      && (notStanding === null || held !== null);
 
     // SECOND SIGNATURE, added 13 August 2026. The one above needs the I term to
     // be still WINDING, and every real flight controller clamps its integrator,
@@ -2021,7 +2367,13 @@ export function assessHoldIndication(records, axis, options = {}) {
       meanITermDriftPerSecond: summary.meanITermDriftPerSecond ?? null,
       meanITermTravelShare: authority.meanITermTravelShare,
       meanITermToPTermRatio: authority.meanITermToPTermRatio,
-      errorDpsThreshold: bindLimits.errorDpsThreshold
+      errorDpsThreshold: bindLimits.errorDpsThreshold,
+      // The per-hold refusal that kept the error from being read as a standing
+      // one, when there was one: the reason a winding I term was not a bind,
+      // unless the integrator held against the error anyway (below), in which
+      // case the bind was read through the movement and the card says so.
+      standingErrorRefusal: notStanding,
+      integratorHeldAgainstTheError: held
     });
     if (winding) {
       codes.push('STANDING_ERROR_WITH_WOUND_UP_I_TERM');
@@ -2710,6 +3062,10 @@ const ROTOR_ORDER_REFUSAL_WORDING = Object.freeze({
   ATTENTION_PEAK_LIST_INCOMPLETE: 'the spectrum held attention-level peaks too close together '
     + 'to list separately, so not every one of them could be checked against the rotor',
   TONE_SIZE_NOT_MEASURED: 'the size of one of the tones was not measured',
+  // Stage 2d: named the rotor's order by the analyser's wide match, but further
+  // from it than the logged head speed's own spread and half a bin account for.
+  ROTOR_ORDER_MATCH_NOT_ESTABLISHED: 'one of the tones sits further from the rotor\'s own '
+    + 'frequency than the logged head speed accounts for',
   ATTENTION_THRESHOLD_UNKNOWN: 'the attention level it was judged against did not come with '
     + 'the result'
 });
@@ -2733,6 +3089,29 @@ function unexplainedBecause(attentionTones, airframe) {
   }
   if (parts.length > 0) {
     return `Above the attention level it carries ${parts.join(', and ')}.`;
+  }
+  const near = attentionTones.filter(tone => tone.orderEstablished === false);
+  if (near.length > 0) {
+    // Named the once- or twice-per-rev, and measured outside what the logged head
+    // speed allows (Stage 2d follow-up, item 3): near it, never "lines up with" it.
+    const refusal = airframe.rotorOrderRefusal;
+    const also = refusal && refusal !== 'ROTOR_ORDER_MATCH_NOT_ESTABLISHED'
+      && ROTOR_ORDER_REFUSAL_WORDING[refusal] ? `, and ${ROTOR_ORDER_REFUSAL_WORDING[refusal]}` : '';
+    if (!attentionTones.some(tone => tone.orderEstablished === true)) {
+      return 'What it measured sits near the main rotor\'s once- or twice-per-rev, but outside what '
+        + `the logged head speed allows${also}, so it is not established as the rotor's own.`;
+    }
+    // Only some of it (copy review of 3 October 2026, finding 5): this said "What it
+    // measured sits near" of everything, beside a tone sitting exactly where the
+    // head speed puts its order. The rest is said as lining up, and each tone that
+    // does not is named as near its order.
+    const named = distinctTones(near).slice(0, 6).map(tone =>
+      `${round(tone.frequencyHz, 1)} Hz on ${tone.axis}, near the ${tone.rotor} rotor's ${perRev(tone.order)}`);
+    const one = named.length === 1;
+    return 'What it measured lines up with the main rotor\'s once- or twice-per-rev, except '
+      + `${one ? 'the tone at' : 'the tones at'} ${named.join('; and ')}, which ${one ? 'sits' : 'sit'} `
+      + `outside what the logged head speed allows${also}, so ${one ? 'it is' : 'they are'} not `
+      + 'established as the rotor\'s own.';
   }
   if (attentionTones.length > 0) {
     const why = ROTOR_ORDER_REFUSAL_WORDING[airframe.rotorOrderRefusal]
@@ -2763,19 +3142,31 @@ function toneAgainstLevel(airframe, tones) {
   return {sorted, strongest, ratio};
 }
 
-/** "13.6 deg/s on roll at 1800 rpm", the tone's size while present. */
+/**
+ * "13.6 deg/s on roll at 1800 rpm", the tone's size while present — "at least"
+ * it, where no analysis window held the tone whole (Stage 2d), because then the
+ * windows that saw it held it for part of their length only.
+ */
 function toneSize(tone) {
-  return `${round(tone.aboveLevelBandRmsDps, 1)} deg/s on ${tone.axis}`
+  return `${tone.sizeIsLowerBound ? 'at least ' : ''}${round(tone.aboveLevelBandRmsDps, 1)} deg/s `
+    + `on ${tone.axis}`
     + (Number.isFinite(tone.headspeedRpm) ? ` at ${tone.headspeedRpm} rpm` : '');
 }
 
-/** What a tone's share and average are OF: the range, or the stretch it was worst in. */
+/**
+ * What a tone's share and average are OF: the range, the stretch it was measured
+ * in, or — measured in more than one — the stretch it was worst in, whose share
+ * and average they are. Stage 2d, item 4: the plain copy read the last two as
+ * one and said "the part of this flight it was measured in" of a tone measured
+ * over all of it, so the scope travels in the basis label, in these words.
+ */
 function toneScope(tone) {
   if (!Array.isArray(tone.chunkRangeUs)) {
     return 'the range';
   }
-  return (tone.chunkRangesUs ?? []).length > 1
-    ? 'the stretch it was worst in' : 'the stretch it was measured in';
+  const stretches = Array.isArray(tone.chunkRangesUs) ? tone.chunkRangesUs.length
+    : (tone.stretchCount ?? 1);
+  return stretches > 1 ? 'the stretch it was worst in' : 'the stretch it was measured in';
 }
 
 /**
@@ -2794,6 +3185,21 @@ function tonePresence(tone, aboveIt) {
     + 'deg/s over all of it';
 }
 
+/**
+ * " 0.12 Hz from it, within the 1.01 Hz the logged head speed allows (half its
+ * p5-p95 spread at that order, plus half an analysis bin)" — how closely a tone
+ * sits on the order it was matched to, stated rather than implied (Stage 2d).
+ */
+function matchNote(tone) {
+  if (!Number.isFinite(tone.matchOffsetHz) || !Number.isFinite(tone.matchToleranceHz)) {
+    return '';
+  }
+  return `, ${round(tone.matchOffsetHz, 2)} Hz from it, `
+    + `${tone.matchOffsetHz <= tone.matchToleranceHz ? 'within' : 'outside'} the `
+    + `${round(tone.matchToleranceHz, 2)} Hz the logged head speed allows (half its p5-p95 spread `
+    + 'at that order, plus half an analysis bin)';
+}
+
 /** One basis row per distinct tone, its size while present, naming the stretch it was worst in. */
 function rotorToneBasis(tones, rangeStartUs, suffix = '') {
   return tones.slice(0, 6).map(tone => basisEntry(
@@ -2801,14 +3207,21 @@ function rotorToneBasis(tones, rangeStartUs, suffix = '') {
       + suffix + stretchNote(tone, rangeStartUs, (tone.chunkRangesUs ?? []).length > 1),
     round(tone.aboveLevelBandRmsDps, 3), 'deg/s',
     `RMS over the analysis windows in which the spectrum peak at ${round(tone.frequencyHz, 1)} Hz `
-    + `reached the attention level; matched to main-rotor order ${tone.order}`
+    + `reached the attention level${tone.sizeIsLowerBound
+      ? ' — a lower bound: no window held the tone for the whole of its length' : ''}`
+    + `; matched to main-rotor order ${tone.order}`
     + `${Number.isFinite(tone.headspeedRpm) ? ` at ${tone.headspeedRpm} rpm` : ''}`
+    + matchNote(tone)
+    + (tone.attentionEligible === false ? '; above the level for only part of the range' : '')
   ));
 }
 
-/** The strongest tone's share of the range above the level, and its average over all of it. */
+/**
+ * The strongest tone's share of the range above the level, and its average over
+ * all of it — labelled with what they are OF, as `toneScope` words it.
+ */
 function strongestToneBasis(tone) {
-  const scope = toneScope(tone) === 'the range' ? 'the range' : 'its stretch';
+  const scope = toneScope(tone);
   return [
     basisEntry(`strongest tone, share of ${scope} above the attention level`,
       Number.isFinite(tone.aboveLevelShare) ? Math.round(tone.aboveLevelShare * 100) : null, '%',
@@ -2858,9 +3271,17 @@ function rotorOrderToneFinding(airframe, basis) {
         ? `; ${others} more main-rotor ${others === 1 ? 'tone is' : 'tones are'} listed below`
         : '')
       + '.',
-    reasoning: 'This is a measurement, not a verdict. Everything above the attention level on '
-      + 'this flight is the main rotor\'s own once- or twice-per-rev, measured on unfiltered '
-      + 'gyro and matched against the logged head speed. The '
+    reasoning: 'This is a measurement, not a verdict. Everything the vibration check found '
+      + 'above the attention level across this flight is the main rotor\'s own once- or '
+      // Stage 2d follow-up, item 5: the tolerance the identity rule applies, as the
+      // basis row below states it — the spread alone understated it.
+      + 'twice-per-rev, measured on unfiltered gyro, each within the head speed\'s own spread '
+      + 'at that order plus half an analysis bin of the frequency the logged head speed puts '
+      + 'that order at'
+      + ((airframe.tonesAboveLevelInPart ?? []).length > 0
+        ? '; what was above it for only part of the flight is on a card of its own'
+        : '')
+      + '. The '
       + `${threshold} level is experimental: it was calibrated on synthetic signals and `
       + 'has not yet been validated on a known out-of-track aircraft, and on real flights '
       + 'tones like this one cross it more often than not. So, up to '
@@ -2878,6 +3299,14 @@ function rotorOrderToneFinding(airframe, basis) {
       ...strongestToneBasis(strongest),
       basisEntry('head speed the strongest tone was matched against', strongest.headspeedRpm,
         'rpm', 'logged head speed, through the spectrum analyser\'s rotor-order match'),
+      // Stage 2d: how closely it sits on that order, against what the logged head
+      // speed allows — the tolerance the rule applied, on the card.
+      basisEntry('strongest tone, distance from the order it was matched to',
+        Number.isFinite(strongest.matchOffsetHz) ? round(strongest.matchOffsetHz, 3) : null, 'Hz',
+        Number.isFinite(strongest.matchToleranceHz)
+          ? `within ${round(strongest.matchToleranceHz, 3)} Hz: half the logged head speed's `
+            + 'p5-p95 spread at that order, plus half an analysis bin (recommendation-gates.mjs)'
+          : 'not measured'),
       basisEntry('severity ceiling for a main-rotor tone', airframe.rotorOrderToneCeilingDps,
         'deg/s', 'three times the attention threshold (recommendation-gates.mjs); a safety '
         + 'backstop, not a calibration'),
@@ -2950,6 +3379,189 @@ function rotorOrderToneLargeFinding(airframe, basis) {
   });
 }
 
+/**
+ * "46.9 Hz on roll, at 9.6 deg/s while above it, for 45% of the range (4.4 deg/s
+ * averaged over all of it)" — a tone ABOVE the level, said as its size while it
+ * was there, how long, and beside them its average. Stage 2d, item 5: the
+ * vibration card's rows printed the average alone, which for a tone present part
+ * of the time reads under the very level the row says it was above.
+ *
+ * `whileAbove` is "while above it" in a row that has just named the level, and
+ * "while it was above the attention level" where nothing has.
+ */
+function describeAboveLevel(tone, whileAbove = 'while above it') {
+  const where = tone.axis ? ` on ${tone.axis}` : '';
+  // "Which is" the order only where it sits where the head speed puts it; "near"
+  // it otherwise (Stage 2d follow-up, item 3; see `orderClause`).
+  const head = `${round(tone.frequencyHz, 1)} Hz${where}${orderClause(tone)}`;
+  if (!Number.isFinite(tone.aboveLevelBandRmsDps)) {
+    return `${head}, its size ${whileAbove} not measured`;
+  }
+  const share = Number.isFinite(tone.aboveLevelShare) ? Math.round(tone.aboveLevelShare * 100) : null;
+  const average = Number.isFinite(tone.bandRmsDps) ? round(tone.bandRmsDps, 1) : null;
+  return `${head}, at ${tone.sizeIsLowerBound ? 'least ' : ''}${round(tone.aboveLevelBandRmsDps, 1)} `
+    + `deg/s ${whileAbove}`
+    + (share !== null ? `, for ${share}% of ${toneScope(tone)}` : '')
+    + (average !== null ? ` (${average} deg/s averaged over all of it)` : '');
+}
+
+/** One basis row per tone above the level for part of the range, its size while present. */
+function aboveLevelInPartRows(tones, rangeStartUs) {
+  return tones.slice(0, 6).map(tone => basisEntry(
+    `tone above the attention level for part of the range: ${describeAboveLevel(tone)}`
+      + stretchNote(tone, rangeStartUs, tone.stretchCount > 1),
+    round(tone.aboveLevelBandRmsDps, 3), 'deg/s',
+    'RMS over the analysis windows in which the spectrum peak reached the attention level'
+    + (tone.sizeIsLowerBound ? ' — a lower bound: no window held the tone for the whole of its '
+      + 'length' : '')
+    // Which it was, as the analyser judged it (copy review, finding 6).
+    + `; ${notSteadySource(tone)}`
+  ));
+}
+
+/**
+ * A tone above the experimental level for only PART of the flight, said as a
+ * measurement and as not ruled out — never as an all-clear.
+ *
+ * Stage 2d, review of 3 October 2026; pre-existing on main. The vibration check
+ * calls a tone attention-worthy only when it is above the level across enough of
+ * the flight, so a tone above it for a fifth of the flight is not, and the
+ * result can read "clear". This rung read that as "a positive measurement of
+ * absence", or listed the tone "below the level worth chasing" under "quiet
+ * enough to judge the tune over", while it measured three to six times the level
+ * whenever it was there. It is neither absent nor small: it is a tone whose size
+ * is known and whose cause one flight cannot show.
+ *
+ * Emitted only where the airframe rung is otherwise permitted: up to the ceiling
+ * the tone does not hold the gains back on its own — the vibration check's own
+ * persistence rules exist so that one bump does not stop a tune, and they are
+ * not overruled here — and beside another airframe blocker that would be false,
+ * so its rows go into that blocker's basis instead. Past the ceiling the gate
+ * blocks on it, and it is said on the large-tone or the vibration card.
+ */
+function toneAboveLevelInPartFinding(airframe, inPartTones, basis) {
+  const {sorted: tones, strongest, ratio} = toneAgainstLevel(airframe, inPartTones);
+  const others = tones.length - 1;
+  const threshold = Number.isFinite(airframe.attentionThresholdDps)
+    ? `${airframe.attentionThresholdDps} deg/s` : 'attention';
+  const ceiling = airframe.toneCeilingDps;
+  const rangeStartUs = airframe.upstream.measured?.rangeStartTimeUs ?? null;
+  // Named an order but measured outside what the logged speed of that rotor
+  // allows (Stage 2d follow-up, item 3): "near" that order, never the rotor's own
+  // — and judged on the TAIL speed for a tail-rotor match (copy review, finding 4).
+  const named = Boolean(strongest.rotor) && Number.isFinite(strongest.order);
+  const nearOnly = named && strongest.orderEstablished === false;
+  let what = strongest.rotorCompared ? ', matching no rotor order,' : ', not compared against the rotor,';
+  if (named) {
+    what = nearOnly
+      ? `, near the ${strongest.rotor} rotor's ${perRev(strongest.order)}, outside what the logged `
+        + `${loggedSpeed(strongest)} allows,`
+      : `, the ${strongest.rotor} rotor's ${perRev(strongest.order)},`;
+  }
+  const share = Number.isFinite(strongest.aboveLevelShare)
+    ? Math.round(strongest.aboveLevelShare * 100) : null;
+  const average = Number.isFinite(strongest.bandRmsDps) ? round(strongest.bandRmsDps, 1) : null;
+  // The order of the STRONGEST tone, which the headline and the plain copy name;
+  // none where it is not the main rotor's own 1/rev or 2/rev.
+  const orders = !nearOnly && strongest.rotor === 'main'
+    && (strongest.order === 1 || strongest.order === 2) ? [strongest.order] : [];
+  const below = distinctTones(airframe.subThresholdTones ?? []);
+  const onTopOf = onTopOfInPartTones(tones);
+  return makeFinding({
+    id: 'AIRFRAME_TONE_ABOVE_LEVEL_IN_PART',
+    rung: 'airframe',
+    kind: 'next-flight',
+    confidence: 'none',
+    headline: `A tone at ${round(strongest.frequencyHz, 1)} Hz${what} measured ${toneSize(strongest)} `
+      + `while it was above the experimental ${threshold} level`
+      + (ratio !== null ? `, ${ratio} times that level` : '')
+      + (share !== null ? `, for ${share}% of ${toneScope(strongest)}` : '')
+      + (average !== null ? `, and averaged ${average} deg/s over all of it` : '')
+      + (others > 0
+        ? `; ${others} more ${others === 1 ? 'tone was' : 'tones were'} above it for part of the `
+          + 'flight and are listed below'
+        : '')
+      // Why it was not a steady tone, from the criterion it failed (copy review,
+      // finding 6) — the sentence the card about a ring sitting on it says too.
+      + `. ${notSteadySentence(strongest)}, so the airframe is not ruled out.`,
+    reasoning: 'The vibration check calls a tone worth attention only when it is above the '
+      + 'level across enough of the flight — in a quarter of the analysis windows, spanning half '
+      + 'of the range and three of its four quarters, with no long gap — so that one bump does '
+      + 'not stop a tune. This one was not, so it does not on its own hold back the rest of the '
+      + 'advice. But while '
+      + 'it was there it was above the level, which is not the same as being small, and '
+      + '"nothing reached the attention level" would be false. Up to '
+      + `${Number.isFinite(ceiling) ? `${ceiling} deg/s while present, ` : ''}three times the `
+      + `level, such a tone is reported here; past that it would block. ${onTopOf} `
+      + 'The level is experimental, calibrated on synthetic signals.',
+    basis: [
+      ...aboveLevelInPartRows(tones, rangeStartUs),
+      basisEntry('strongest tone, band RMS while above the attention level',
+        round(strongest.aboveLevelBandRmsDps, 3), 'deg/s',
+        'RMS over the analysis windows in which it reached the attention level'
+        + (strongest.sizeIsLowerBound ? ' — a lower bound' : '')),
+      basisEntry('strongest tone against the experimental level', ratio, 'times',
+        'its band RMS while above the attention level, over the attention threshold'),
+      ...strongestToneBasis(strongest),
+      basisEntry('severity ceiling for a tone above the level', ceiling, 'deg/s',
+        'three times the attention threshold (recommendation-gates.mjs); a safety backstop, '
+        + 'not a calibration'),
+      ...below.slice(0, 6).map(tone => basisEntry(
+        `persistent tone below the attention level: ${describeTone(tone)}`
+          + stretchNote(tone, rangeStartUs, tone.stretchCount > 1),
+        round(tone.bandRmsDps, 3), 'deg/s',
+        `spectrum peak, present in ${Math.round((tone.persistenceRatio ?? 0) * 100)}% of the `
+        + 'analysed windows'
+      )),
+      ...basis
+    ],
+    confirm: 'Fly the same flight again and watch whether this tone comes back, and when: one '
+      + 'that comes and goes with a manoeuvre, a head speed or a collective setting points at '
+      + 'what excites it. A once- or twice-per-rev of the main rotor points at blade tracking '
+      + 'and balance first; a tone matching no rotor order, at anything that turns at its own '
+      + 'speed — bearings, belts, fans — or anything loose.',
+    codes: [
+      'TONE_ABOVE_ATTENTION_LEVEL_IN_PART',
+      ...orders.map(order => `MAIN_ROTOR_ORDER_${order}`),
+      // Named an order and measured outside what the head speed allows: the cue
+      // the plain copy reads to say "close to" the rotor rather than "your rotor"
+      // — and, for the tail rotor, to say the tail and its speed (finding 4).
+      ...(nearOnly ? ['ROTOR_ORDER_MATCH_NOT_ESTABLISHED'] : []),
+      ...(nearOnly && strongest.rotor === 'tail' ? ['NEAR_TAIL_ROTOR_ORDER'] : []),
+      // Too few windows, or enough of them bunched together (finding 6).
+      ...notSteadyCode(strongest)
+    ]
+  });
+}
+
+/**
+ * What happens to an oscillation sitting on top of one of `tones`, said only as
+ * the coincidence rule does it. Stage 2d follow-up, item 2: the card said every
+ * such oscillation "is refused on its own card rather than blamed on a gain".
+ * `coincidentTone` refuses only on a tone matched to a rotor order. Off one, the
+ * loop's own ring IS a tone like this — on the committed gain-fault fixtures it
+ * is exactly this tone — so refusing there would refuse every genuine D finding,
+ * and the gain is named with the warning that one flight cannot rule out the
+ * airframe instead (`airframeAmbiguity`). The card says whichever of those is
+ * true of the tones it lists.
+ */
+function onTopOfInPartTones(tones) {
+  const matched = tones.some(tone => tone.rotor !== null && tone.rotor !== undefined);
+  const unmatched = tones.some(tone => tone.rotor === null || tone.rotor === undefined);
+  const refused = 'that axis is refused on its own card rather than blamed on a gain.';
+  const caveat = 'the loop ringing and the airframe ringing look the same there, so a gain read off '
+    + 'that oscillation is named only with the warning that one flight cannot rule out the '
+    + 'airframe, and with the flight that tells the two apart.';
+  if (matched && unmatched) {
+    return 'Where an oscillation on one axis sits on top of one at or near a rotor order, '
+      + `${refused} Where it sits on top of one matching no rotor order, ${caveat}`;
+  }
+  if (matched) {
+    return `Where an oscillation on one axis sits on top of it, ${refused}`;
+  }
+  return `Where an oscillation on one axis sits on top of it, ${caveat}`;
+}
+
 function airframeFindings(airframe, mechanical) {
   const out = [];
   const basis = [];
@@ -2987,22 +3599,53 @@ function airframeFindings(airframe, mechanical) {
   // go into the basis every airframe blocker below carries, so the measurement is
   // still on screen beside what does block.
   const rotorRangeStartUs = airframe.upstream.measured?.rangeStartTimeUs ?? null;
+  // Stage 2d: tones above the level for only part of the range, one per tone.
+  // Those up to the ceiling are reported; those past it block, and are said on
+  // the card that blocks on them below.
+  //
+  // Sorted by what the gate did with EACH COPY before the copies of one tone are
+  // merged (copy review of 3 October 2026, finding 7): merged first, a copy only
+  // near the once-per-rev in one stretch — blocking as unexplained past the
+  // ceiling, or reported under it — was spoken for by a louder copy from another
+  // stretch that IS the rotor's own, and the gate blocked on a code no card named,
+  // or the tone was on no card at all.
+  const inPartOf = outcome => distinctTones((airframe.tonesAboveLevelInPart ?? [])
+    .filter(tone => tone.blocks === outcome));
+  const inPartReported = inPartOf(null);
   const rotorToneRows = [];
   if ((airframe.rotorOrderTones ?? []).length > 0) {
     if (airframe.status === 'permitted') {
       out.push(rotorOrderToneFinding(airframe, basis));
+      if (inPartReported.length > 0) {
+        out.push(toneAboveLevelInPartFinding(airframe, inPartReported, basis));
+      }
       return out;
     }
     rotorToneRows.push(...rotorToneBasis(toneAgainstLevel(airframe, airframe.rotorOrderTones).sorted,
       rotorRangeStartUs, ' (a main-rotor tone; not what blocks here)'));
-    basis.push(...rotorToneRows);
   }
+  // Beside another airframe blocker, a tone above the level for part of the range
+  // goes into the basis every blocker below carries, as the rotor-order tones do:
+  // measured, on screen, and never said to have been below the level.
+  if (airframe.status !== 'permitted') {
+    rotorToneRows.push(...aboveLevelInPartRows(inPartReported, rotorRangeStartUs));
+  }
+  basis.push(...rotorToneRows);
 
   // Past the severity ceiling the same tones block, and say so first: they are
   // the specific, measured thing to sort before anything else on this rung.
   if ((airframe.rotorOrderTonesLarge ?? []).length > 0
       && airframe.upstream.codes.includes('MAIN_ROTOR_ORDER_TONE_LARGE')) {
     out.push(rotorOrderToneLargeFinding(airframe, basis));
+  }
+
+  // Above the level for part of the range, up to the ceiling, and nothing else
+  // stops the airframe (Stage 2d): not ruled out, and never an all-clear. It
+  // stands in for AIRFRAME_TONE_BELOW_ATTENTION and AIRFRAME_CLEAR, both of which
+  // would be false, and carries the tones that were below the level with it.
+  if (airframe.status === 'permitted' && inPartReported.length > 0) {
+    out.push(toneAboveLevelInPartFinding(airframe, inPartReported, basis));
+    return out;
   }
 
   // A tone that was measured, named and found small is not silence, and the old
@@ -3139,9 +3782,15 @@ function airframeFindings(airframe, mechanical) {
   // checked here as well so the two can never drift apart again.
   const upstreamCodes = airframe.upstream.codes;
   const measuredStatus = airframe.upstream.measured?.mechanicalStatus ?? null;
-  if (upstreamCodes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED') && measuredStatus === 'attention') {
-    const attentionTones = airframe.axes.flatMap(entry =>
+  // Stage 2d: a tone above the level for part of the range, past the ceiling and
+  // not judged the main rotor's own, is measured vibration nothing explains —
+  // on a result whose status may well read "clear".
+  const unexplainedInPart = inPartOf('MECHANICAL_EVIDENCE_GATE_BLOCKED');
+  if (upstreamCodes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED')
+      && (measuredStatus === 'attention' || unexplainedInPart.length > 0)) {
+    const persistentTones = airframe.axes.flatMap(entry =>
       entry.tones.filter(tone => tone.attentionEligible));
+    const attentionTones = [...persistentTones, ...unexplainedInPart];
     // Every tone seen IS a main-rotor 1/rev or 2/rev, and the rotor-order rule
     // still refused: something else about the result — a stretch that could not
     // be measured, a filtered axis — means "only the rotor" was not established.
@@ -3189,23 +3838,34 @@ function airframeFindings(airframe, mechanical) {
         + 'a known faulty aircraft — and is listed below beside the measurement, so the margin '
         + 'can be judged rather than taken on trust.',
       basis: [
-        // One row per tone, however many stretches it was measured in.
-        ...distinctTones(attentionTones).slice(0, 6).map(tone => basisEntry(
-          `persistent tone above the attention level: ${describeTone(tone)}`
+        // One row per tone, however many stretches it was measured in, stating its
+        // size while it was above the level, how long, and its average beside
+        // them (Stage 2d, item 5) — never the average alone, which for a tone
+        // present part of the time reads under the level the row says it was above.
+        ...distinctTones(persistentTones).slice(0, 6).map(tone => basisEntry(
+          `persistent tone above the attention level: ${describeAboveLevel(tone)}`
             + stretchNote(tone, rotorRangeStartUs, tone.stretchCount > 1),
-          round(tone.bandRmsDps, 3), 'deg/s',
-          `spectrum peak, present in ${Math.round((tone.persistenceRatio ?? 0) * 100)}% of the `
-          + 'analysed windows'
+          Number.isFinite(tone.aboveLevelBandRmsDps) ? round(tone.aboveLevelBandRmsDps, 3) : null,
+          'deg/s',
+          'RMS over the analysis windows in which the spectrum peak reached the attention level'
+          + (tone.sizeIsLowerBound ? ' — a lower bound' : '')
+          + `; present in ${Math.round((tone.persistenceRatio ?? 0) * 100)}% of the analysed windows`
         )),
+        ...aboveLevelInPartRows(unexplainedInPart, rotorRangeStartUs),
         ...basis
       ],
       confirm: 'Sort the airframe, then fly the same manoeuvres again and compare this '
         + 'number rather than the gains.',
       // Where every tone IS the rotor's, which condition of the rule did not hold,
-      // so the plain copy can say that one rather than guess.
-      codes: ['MECHANICAL_EVIDENCE_GATE_BLOCKED', cause,
+      // so the plain copy can say that one rather than guess — and, where a tone
+      // is only near the order (Stage 2d follow-up, item 3), that too, which a
+      // tone above the level for part of a "clear" range says nowhere else.
+      codes: [...new Set(['MECHANICAL_EVIDENCE_GATE_BLOCKED', cause,
         ...(cause === 'ROTOR_ORDER_NOT_ESTABLISHED' && airframe.rotorOrderRefusal
-          ? [airframe.rotorOrderRefusal] : [])]
+          ? [airframe.rotorOrderRefusal] : []),
+        ...(cause === 'ROTOR_ORDER_NOT_ESTABLISHED'
+          && attentionTones.some(tone => tone.orderEstablished === false)
+          ? ['ROTOR_ORDER_MATCH_NOT_ESTABLISHED'] : [])])]
     }));
   }
 
@@ -3540,9 +4200,13 @@ function headspeedFindings(headspeed) {
         + 'head speed could be read.' + mixedNote + ' This is not an all-clear on the head '
         + 'speed, and it does not hold back the rest of the advice.',
       basis,
-      confirm: `Fly ${needed} or more still hovers, each held for ${holdSeconds} s or more with `
-        + 'the sticks centred and the governor settled, and watch the head-speed trace across '
-        + 'them. If it moves in most of them, the governor is the place to start.',
+      // Hovers are holds, so the count asked for is the one a full reading of the
+      // I term needs as well (re-review of 3 October 2026): the governor's own
+      // minimum was 2, a count a standing error cannot be read from.
+      confirm: `Fly ${Math.max(needed, HOLDS_FOR_A_FULL_READING)} or more still hovers, each held `
+        + `for ${holdSeconds} s or more with the sticks centred and the governor settled, and `
+        + 'watch the head-speed trace across them. If it moves in most of them, the governor is '
+        + 'the place to start.',
       codes: [...headspeed.codes, 'HEADSPEED_MOVED_TOO_FEW_SEGMENTS_TO_JUDGE']
     }));
   }
@@ -4008,6 +4672,14 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
     codes: [...(finding.codes ?? []), ambiguity.code]
   });
 
+  // Copy review of 3 October 2026, finding 2: `tonesOf` admits a tone above the
+  // level for only part of the range, and a short burst, to the coincidence rule,
+  // and this card still called it "a persistent tone" at its flight average that
+  // "did not reach the level worth chasing" — beside the airframe card stating the
+  // same tone at its size while it was there. A tone that reached the level is
+  // said as the airframe rung says it, and why it was not judged a steady tone in
+  // that card's own sentence.
+  const reachedLevel = candidate => Number.isFinite(candidate.aboveLevelBandRmsDps);
   const toneFinding = () => makeFinding({
     id: 'OSCILLATION_MATCHES_AIRFRAME_TONE',
     rung: 'axis-mechanical',
@@ -4015,9 +4687,20 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
     kind: 'next-flight',
     confidence: 'low',
     headline: `${axis} oscillates at the same frequency as something the airframe is already `
-      + `doing — ${describeTone(tone)} — so a gain change here would be a guess.`,
-    reasoning: 'The spectrum on this axis carries a persistent tone at that frequency, and it '
-      + `lines up with the ${tone.rotor} rotor's own turning speed. `
+      + `doing — ${reachedLevel(tone)
+        ? describeAboveLevel(tone, 'while it was above the attention level')
+        : describeTone(tone)} — so a gain change here would be a guess.`,
+    reasoning: `The spectrum on this axis carries ${tone.aboveLevelInPart
+      ? 'a tone at that frequency that was above the attention level for only part of the flight'
+      : 'a persistent tone at that frequency'}, and it `
+      + (tone.orderEstablished === false
+        // Named the order, but outside what the logged speed of that rotor allows
+        // (Stage 2d follow-up, item 3; the tail's own speed for the tail, finding
+        // 4): not established as the rotor's, too close to rule out.
+        ? `sits near the ${tone.rotor} rotor's own turning speed — outside what the logged `
+          + `${loggedSpeed(tone)} allows, so not established as the rotor's own, but too close to `
+          + 'rule it out. '
+        : `lines up with the ${tone.rotor} rotor's own turning speed. `)
       + (tone.attentionEligible
         // Since 2 October 2026 a main-rotor 1/rev or 2/rev above the experimental
         // level is reported on the airframe rung instead of blocking it, so this
@@ -4026,8 +4709,11 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
         // own observation card, or the basis of whatever blocks there.
         ? 'It is above the experimental attention level, and the airframe rung above lists '
           + 'it with its measured size. But a control '
-        : 'It did not reach the level worth chasing on its own, which is why nothing above '
-          + 'calls it a fault. But a control ')
+        : (tone.aboveLevelInPart
+          ? `${notSteadySentence(tone)}; the airframe rung above lists it with its measured size. `
+            + 'But a control '
+          : 'It did not reach the level worth chasing on its own, which is why nothing above '
+            + 'calls it a fault. But a control '))
       + 'loop does not get to choose to oscillate at exactly the speed the rotor turns at, so '
       + 'this coincidence is worth something: it says a mechanical explanation is on the table '
       + 'and this flight cannot rule it out. Lowering a gain to quieten a rotor order does not '
@@ -4035,9 +4721,27 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
       + 'a machine that may be telling you something about a blade, a damper or a balance.',
     basis: [
       ...ringingBasis,
-      basisEntry('persistent airframe tone at this frequency', round(tone.frequencyHz, 2), 'Hz',
-        'spectrum peak on this axis'),
-      basisEntry('how large that tone is', round(tone.bandRmsDps, 3), 'deg/s', 'spectrum peak'),
+      basisEntry(tone.aboveLevelInPart
+        ? 'airframe tone at this frequency, above the attention level for part of the range'
+        : 'persistent airframe tone at this frequency', round(tone.frequencyHz, 2), 'Hz',
+      'spectrum peak on this axis'),
+      // Its size while it was above the level, for how long, and its average
+      // beside them — never the average alone — where it reached the level.
+      ...(reachedLevel(tone)
+        ? [
+          basisEntry('how large that tone was while above the attention level',
+            round(tone.aboveLevelBandRmsDps, 3), 'deg/s',
+            'RMS over the analysis windows in which the spectrum peak reached the attention level'
+            + (tone.sizeIsLowerBound ? ' — a lower bound: no window held the tone for the whole '
+              + 'of its length' : '')),
+          basisEntry(`share of ${toneScope(tone)} it was above the attention level for`,
+            Number.isFinite(tone.aboveLevelShare) ? Math.round(tone.aboveLevelShare * 100) : null, '%',
+            'analysis windows in which its band reached the attention level'),
+          basisEntry(`how large that tone was, averaged over all of ${toneScope(tone)}`,
+            round(tone.bandRmsDps, 3), 'deg/s',
+            'Welch average over every analysis window, the windows it was absent from included')
+        ]
+        : [basisEntry('how large that tone is', round(tone.bandRmsDps, 3), 'deg/s', 'spectrum peak')]),
       basisEntry('how much of the flight it was present for',
         round(tone.persistenceRatio, 3), 'share', 'spectrum peak persistence'),
       basisEntry('rotor order it matches',
@@ -4606,7 +5310,12 @@ const I_TERM_ALL_CLEAR_EXCLUDED = Object.freeze(new Set([
   'STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD',
   'STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS',
   'STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION',
-  'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR'
+  'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR',
+  // The re-review of round three, 3 October 2026: a standing error beside a band
+  // a cover hid, and the side a turn-following error was on.
+  'STANDING_ERROR_WITH_UNMEASURED_BAND',
+  'RATE_SHORT_OF_COMMAND_IN_EVERY_TURN',
+  'RATE_PAST_COMMAND_IN_EVERY_TURN'
 ]));
 
 /**
@@ -4637,7 +5346,7 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
   const codes = hold.codes;
   const has = code => codes.includes(code);
   const holdCount = hold.holdCount;
-  const needed = EVIDENCE_LIMITS.minimumHoldsForStandingError;
+  const needed = HOLDS_FOR_A_FULL_READING;
   const seconds = round(EVIDENCE_LIMITS.minimumHoldDurationUs / 1e6, 1);
   const noise = round(summary?.meanErrorNoiseRmsDps, 1);
   const inBand = oscillationHz >= bandLow && oscillationHz <= bandHigh;
@@ -4648,6 +5357,22 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
       ? `faster than the ${bandLow}-${bandHigh} Hz band an integrator can cause`
       : `slower than the ${bandLow}-${bandHigh} Hz band an integrator can cause`;
   const movementNamed = has('OSCILLATION_ABOVE_I_TERM_BAND') || has('SLOW_RIPPLE_NOT_CLEAR_OF_NOISE');
+
+  // WHAT HID THE BAND IS DEALT WITH FIRST (re-review of 3 October 2026). A fast
+  // oscillation has to be settled, and a noisy gyro checked, before anything
+  // slower can be read under it — and the branches further down replaced the
+  // confirm that said so: a flight whose error changed side between holds under
+  // a 4-12 Hz shake was sent straight to a calm-air hold. Whatever a branch asks
+  // for is flown after this.
+  const firstStep = has('OSCILLATION_ABOVE_I_TERM_BAND')
+    ? 'Settle what is shaking first — the stop and vibration findings on this flight say '
+      + 'whether it is the airframe, P or D.'
+    : has('SLOW_RIPPLE_NOT_CLEAR_OF_NOISE')
+      ? 'Check the gyro mounting and the vibration findings on this flight first.'
+      : null;
+  const afterFirstStep = ask => (firstStep === null
+    ? ask
+    : `${firstStep} Then ${ask.charAt(0).toLowerCase()}${ask.slice(1)}`);
 
   const sentences = [];
   const candidates = [];
@@ -4665,9 +5390,7 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
       + 'could not be seen.');
     candidates.push('too much P or D, or a frame or tail resonance, shaking the axis',
       'under it, an I term that is right, too small or too large — this flight cannot say');
-    confirm = 'Settle what is shaking first — the stop and vibration findings on this flight say '
-      + `whether it is the airframe, P or D — then fly ${needed} or more still holds of `
-      + `${seconds} s or more again.`;
+    confirm = afterFirstStep(`Fly ${needed} or more still holds of ${seconds} s or more again.`);
   } else if (has('SLOW_RIPPLE_NOT_CLEAR_OF_NOISE')) {
     headline = `${axis} moved slowly during the holds, but no more than its own gyro noise, so `
       + 'the I term was not judged.';
@@ -4677,8 +5400,7 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
     candidates.push(...(inBand ? ['too much I term, hunting under the noise'] : []),
       'the governor, the drive or the wind moving the aircraft',
       'vibration or noise reaching the gyro');
-    confirm = 'Check the gyro mounting and the vibration findings on this flight, then fly '
-      + `${needed} or more still holds of ${seconds} s or more in calm air.`;
+    confirm = afterFirstStep(`Fly ${needed} or more still holds of ${seconds} s or more in calm air.`);
   }
 
   if (has('STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT')
@@ -4691,16 +5413,49 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
       candidates.push('the governor, the drive or the wind moving the aircraft');
     }
   } else if (has('STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION')) {
-    headline = `The ${axis} error changed side with the direction of each turn, so the I term `
-      + 'was not judged from these turns.';
-    sentences.push(`In every turn the error sat ${meanError} deg/s or so on the same side `
-      + `relative to the turn (${errorList} deg/s, hold by hold). A loop that lags behind every `
-      + 'turn does that — and so does a slow wander that happens to keep step with the turns, '
-      + 'and these holds cannot tell the two apart.');
-    candidates.push('too little I term on this axis',
-      'a slow wander in step with the turns — the governor, the drive or the wind');
-    confirm = `Fly ${needed} or more steady turns all in one direction, each held for ${seconds} `
-      + 's or more, or the same number of still hovers.';
+    // Said with the side it was on in every turn, in that turn's own direction
+    // (re-review of 3 October 2026): this card said "a loop that lags behind
+    // every turn" of an aircraft turning FASTER than commanded both ways, which
+    // is what a feedforward set too high does.
+    const past = has('RATE_PAST_COMMAND_IN_EVERY_TURN');
+    const short = has('RATE_SHORT_OF_COMMAND_IN_EVERY_TURN');
+    const turnByTurn = (hold.evidence.holds ?? [])
+      .map(entry => round(Math.abs(entry.steadyStateErrorDps), 1)).join(', ');
+    const wanderInStep = 'a slow wander in step with the turns — the governor, the drive or the wind';
+    if (past) {
+      headline = `The ${axis} rate ran past the command in every turn, whichever way it turned, `
+        + 'so the I term was not judged from these turns.';
+      sentences.push(`In every turn the rate ran past the command by about ${meanError} deg/s, `
+        + `measured in that turn's own direction (${turnByTurn} deg/s, turn by turn): the `
+        + 'aircraft turned faster than it was asked to, whichever way it turned. A feedforward '
+        + 'set too high does that, carrying every turn past the rate asked for, with nothing '
+        + 'closing the excess over the held turn — and so does a slow wander that happens to '
+        + 'keep step with the turns, and these holds cannot tell them apart.');
+      candidates.push('too much feedforward on this axis, carrying every turn past the rate asked for',
+        'too little I term on this axis to take that excess back out over a held turn',
+        wanderInStep);
+      confirm = afterFirstStep(`Fly ${needed} or more still hovers of ${seconds} s or more on this `
+        + 'axis, with the other two axes quiet: a feedforward adds nothing while nothing is '
+        + 'commanded, so an error that is gone there came with the turns. Then fly the same number '
+        + 'of steady turns all in one direction.');
+    } else {
+      headline = short
+        ? `The ${axis} rate fell short of the command in every turn, whichever way it turned, so `
+          + 'the I term was not judged from these turns.'
+        : `The ${axis} error changed side with the direction of each turn, so the I term was not `
+          + 'judged from these turns.';
+      sentences.push(short
+        ? `In every turn the rate fell short of the command by about ${meanError} deg/s, measured `
+          + `in that turn's own direction (${turnByTurn} deg/s, turn by turn), so the error changed `
+          + 'side whenever the turn did. A loop that lags behind every turn does that — and so '
+          + 'does a slow wander that happens to keep step with the turns, and these holds cannot '
+          + 'tell the two apart.'
+        : `In every turn the error sat ${meanError} deg/s or so on the same side relative to the `
+          + `turn (${errorList} deg/s, hold by hold), and these holds cannot say what put it there.`);
+      candidates.push('too little I term on this axis', wanderInStep);
+      confirm = afterFirstStep(`Fly ${needed} or more steady turns all in one direction, each held `
+        + `for ${seconds} s or more, or the same number of still hovers.`);
+    }
   } else if (has('STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS')) {
     // Reached only when the movement inside the holds was NOT below the band
     // (review of 3 October 2026); below it, this is SLOW_WANDER_NOT_FROM_THE_I_TERM.
@@ -4718,8 +5473,9 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
       + 'flight cannot say.');
     candidates.push('too little I term on this axis, under whatever moved the averages',
       'something moving the aircraft between holds — the governor, the drive or the wind');
-    confirm = `Fly ${needed} or more still holds of ${seconds} s or more on this axis in calm air, `
-      + 'with the other two axes quiet, and watch the head-speed trace across them.';
+    confirm = afterFirstStep(`Fly ${needed} or more still holds of ${seconds} s or more on this `
+      + 'axis in calm air, with the other two axes quiet, and watch the head-speed trace across '
+      + 'them.');
   } else if (has('TOO_FEW_HOLDS_FOR_A_STANDING_ERROR')) {
     headline = `The ${axis} holds sat off the commanded rate on the same side each time, but `
       + `${holdCount} holds are too few to call that a standing error.`;
@@ -4731,8 +5487,24 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
     candidates.push('too little I term on this axis',
       'part of a slow wander — the governor, the drive or the wind — caught on the same side '
         + 'each time');
-    confirm = `Fly ${needed} or more still holds of ${seconds} s or more on this axis, with the `
-      + 'other two axes quiet. The pilot guide asks for five.';
+    confirm = afterFirstStep(`Fly ${needed} or more still holds of ${seconds} s or more on this `
+      + 'axis, with the other two axes quiet. The pilot guide asks for five.');
+  } else if (has('STANDING_ERROR_WITH_UNMEASURED_BAND')) {
+    // Re-review of 3 October 2026: a standing error that passed every per-hold
+    // rule, beside a band the shake or the noise above hid. Too little I is a
+    // standing error with nothing moving slowly beside it, and whether something
+    // was could not be measured; the confirm stays the one above, which deals
+    // with what hid it first.
+    sentences.push(`The holds also sat ${meanError} deg/s off the commanded rate, on the same `
+      + `side in every one of the ${holdCount} holds and larger than its own movement in each `
+      + `(${errorList} deg/s) — what too little I looks like. But a wobble inside the `
+      + `${bandLow}-${bandHigh} Hz band beside that error would make it the conflicting `
+      + 'signature, which is not too little I, and '
+      + `${has('OSCILLATION_ABOVE_I_TERM_BAND') ? 'the faster shake' : 'the noise'} hid whether `
+      + 'there was one, so it was not read as too little I.');
+    candidates.push('too little I term on this axis',
+      'something outside the I term moving the aircraft both ways at once — a binding linkage, '
+        + 'the governor or the wind');
   }
 
   return {
@@ -4790,6 +5562,32 @@ function holdFindings({axis, hold, airframe}) {
 
   if (hold.bind?.suspected) {
     const pinned = hold.bind.pattern === 'pinned';
+    // READ THROUGH A MOVEMENT (re-review of 3 October 2026): where the error moved
+    // hold by hold and only the integrator said bind, the card says the error
+    // moved, rather than calling it a steady hold.
+    const refusal = hold.bind.standingErrorRefusal;
+    const heldAs = hold.bind.integratorHeldAgainstTheError;
+    const howItMoved = refusal === 'STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS'
+      ? 'from one side of the command to the other between holds'
+      : refusal === 'STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION'
+        ? 'from one side of the command to the other with each turn'
+        : 'as much as it averaged, in some of the holds';
+    // Said as whichever reading held. The third reads no position, because the
+    // I term may be carrying a trim on the far side and unwinding toward zero
+    // (round seven), so it is never called large or growing.
+    const heldHow = heldAs === 'growing-on-one-side'
+      ? 'the I term stayed on one side through every hold, no smaller in each than in the one '
+        + 'before. '
+      : heldAs === 'winding-toward-the-error'
+        ? 'the I term wound toward that error in every hold, and the error did not close: over '
+          + 'the later holds it still stood at half or more of what it was over the earlier ones. '
+        : 'the I term sat on the side of that error in every hold. ';
+    const movedFirst = refusal
+      ? `The error moved during the holds — ${howItMoved} — so something else, the governor, `
+        + 'the drive or the wind, was moving the aircraft as well, and on its own that would read '
+        + 'as a slow wander rather than a bind. But '
+        + heldHow
+      : '';
     out.push(makeFinding({
       id: 'SUSPECTED_MECHANICAL_BIND',
       rung: 'axis-mechanical',
@@ -4799,8 +5597,10 @@ function holdFindings({axis, hold, airframe}) {
       confidence: 'medium',
       headline: `Something on ${axis} is holding against the controller. Look at the `
         + 'linkage before any gain.',
-      reasoning: pinned
-        ? 'During a steady hold the aircraft sat off the commanded rate and stayed there, '
+      reasoning: movedFirst + (pinned
+        ? (refusal
+          ? 'Through the holds the aircraft sat off the commanded rate, '
+          : 'During a steady hold the aircraft sat off the commanded rate and stayed there, ')
           + 'while the I term — the term whose whole job is to remove exactly that error — sat '
           + 'large and DID NOT MOVE. An integrator facing a standing error has no choice but '
           + 'to move; it is the running total of that error. One that is large and stationary '
@@ -4808,12 +5608,17 @@ function holdFindings({axis, hold, airframe}) {
           + 'already asked for everything it is allowed to ask for and the aircraft still is '
           + 'not doing it. That is a control run binding, a servo out of travel, or a tail out '
           + 'of authority. Raising I here asks for more of something that is already capped.'
-        : 'During a steady hold the error stayed put while the I term wound up large '
-          + 'and kept growing against it — the loop pushing harder and harder at something it '
+        : (refusal
+          ? (heldAs === 'winding-toward-the-error'
+            ? 'It kept winding toward the error, hold after hold'
+            : 'It wound up large and kept growing against the error')
+          : 'During a steady hold the error stayed put while the I term wound up large '
+            + 'and kept growing against it')
+          + ' — the loop pushing harder and harder at something it '
           + 'cannot beat. That is what a binding linkage, a tight ball link or a servo hitting '
           + 'a limit looks like from inside the log. An error alone would have read as too '
           + 'little I, and adding I to an aircraft that is binding winds the term further into '
-          + 'a fight it still loses.',
+          + 'a fight it still loses.'),
       basis,
       confirm: 'With the motor disconnected, move that control through its full travel by '
         + 'hand and feel for a tight spot. Check the ball links, the servo arm and that '
@@ -4832,8 +5637,12 @@ function holdFindings({axis, hold, airframe}) {
         axis,
         kind: 'next-flight',
         confidence: 'none',
-        headline: `${hold.holdCount} usable steady hold on ${axis}, and ${hold.minimumHolds} `
-          + 'are needed before the I term can be called.',
+        // The count a full reading needs, not the capture minimum (re-review of 3
+        // October 2026): two holds are captured, but a standing error is read
+        // only from three, and "2 are needed" sent a pilot to fly two.
+        headline: `${hold.holdCount} usable steady hold on ${axis}, and `
+          + `${Math.max(hold.minimumHolds ?? EVIDENCE_LIMITS.minimumHolds, HOLDS_FOR_A_FULL_READING)} `
+          + 'are needed before the I term can be called either way.',
         reasoning: 'One window is one sample of one flight condition. What was measured in '
           + 'it is shown below so you can see how close this is — the difference between '
           + '"the evidence was weak" and "there was only one window" matters, and this is '
@@ -4880,7 +5689,10 @@ function holdFindings({axis, hold, airframe}) {
       entries.map(entry => entry.absoluteSteadyStateErrorDps),
       entries.map(entry => entry.measuredDurationUs)
     ), 2));
-    const needed = hold.minimumHolds ?? EVIDENCE_LIMITS.minimumHolds;
+    // Enough of one kind for every reading, a standing error's included (re-review
+    // of 3 October 2026).
+    const needed = Math.max(hold.minimumHolds ?? EVIDENCE_LIMITS.minimumHolds,
+      HOLDS_FOR_A_FULL_READING);
     const seconds = round(EVIDENCE_LIMITS.minimumHoldDurationUs / 1e6, 1);
     const offAxis = EVIDENCE_LIMITS.offAxisCommandLimitDps;
     const rateKind = {yaw: 'pirouettes or turns', pitch: 'turns', roll: 'rolls'}[axis]
@@ -4970,8 +5782,8 @@ function holdFindings({axis, hold, airframe}) {
         basisEntry('sweep points', hold.sweepRunCount, 'count', 'HOLD_SWEEP')
       ],
       candidates,
-      confirm: 'Fly two or three more long, still holds on this axis — hands off the other '
-        + 'two — and the reading will settle one way or the other.',
+      confirm: `Fly another ${HOLDS_FOR_A_FULL_READING} or more long, still holds on this axis — `
+        + 'hands off the other two — so the reading can settle one way or the other.',
       codes: [...hold.codes]
     }));
     return out;
@@ -5001,7 +5813,7 @@ function holdFindings({axis, hold, airframe}) {
         + 'told apart. The error is reported below exactly as measured; the diagnosis is not.',
       basis,
       confirm: 'Turn the PID term fields on in the Blackbox logging setup — axisP, axisI and '
-        + 'axisD — and fly the same two long, still holds again.',
+        + `axisD — and fly ${HOLDS_FOR_A_FULL_READING} or more long, still holds again.`,
       codes: [...hold.codes]
     }));
     return out;
@@ -5062,9 +5874,11 @@ function holdFindings({axis, hold, airframe}) {
         + 'sitting still while something else moves the aircraft. The reading held at every '
         + 'filter length that could see it, and at every ripple threshold tried.',
       basis,
-      confirm: `Lower ${axis} I one step, change nothing else, and fly two long still holds `
-        + 'again. The slow wander should shrink. If a standing error appears instead, you '
-        + 'have gone one step too far.',
+      // Three or more since round three: a standing error appearing after the
+      // change is read only from that many (re-review of 3 October 2026).
+      confirm: `Lower ${axis} I one step, change nothing else, and fly ${HOLDS_FOR_A_FULL_READING} `
+        + 'or more long still holds again. The slow wander should shrink. If a standing error '
+        + 'appears instead, you have gone one step too far.',
       codes: [...hold.codes]
     }));
     return out;
@@ -5080,18 +5894,25 @@ function holdFindings({axis, hold, airframe}) {
       direction: 'increase',
       confidence: hold.confidence,
       headline: `Raise ${axis} I.`,
+      // Worded as what was measured (re-review of 3 October 2026). It said the
+      // side was kept "which a slow wander does not do"; a wander slow enough
+      // keeps its side through three holds, and what refuses it is the per-hold
+      // clearance — the error larger than its own movement in every hold.
       reasoning: 'During the steady holds the aircraft sat off the commanded rate and stayed '
-        + `there — on the same side in every one of the ${hold.holdCount} holds, which a slow `
-        + 'wander does not do — and the I term, the one whose job is exactly that error, is '
-        + 'small and is not winding up against it. That is an integrator that is not doing '
+        + `there — on the same side in every one of the ${hold.holdCount} holds, and larger than `
+        + 'its own movement in each — and the I term, the one whose job is exactly that error, '
+        + 'is small and is not winding up against it. That is an integrator that is not doing '
         + 'enough, and it is specifically NOT the pattern a binding linkage makes, which is the '
         + 'same error with the I term wound large and still growing.',
       basis: [...basis, basisEntry('average error in each hold',
         (hold.evidence.holds ?? []).map(entry => round(entry.steadyStateErrorDps, 1)).join(', '),
         'deg/s', 'measureHold, signed')],
-      confirm: `Raise ${axis} I one step, change nothing else, and fly two long still holds `
-        + 'again. The standing error should close up. If the aircraft starts wandering slowly '
-        + 'either side of the target instead, you have gone one step too far.',
+      // Three or more, or the re-fly cannot read a standing error that is still
+      // there (re-review of 3 October 2026).
+      confirm: `Raise ${axis} I one step, change nothing else, and fly ${HOLDS_FOR_A_FULL_READING} `
+        + 'or more long still holds again. The standing error should close up. If the aircraft '
+        + 'starts wandering slowly either side of the target instead, you have gone one step too '
+        + 'far.',
       codes: [...hold.codes]
     }));
     return out;
@@ -5151,8 +5972,9 @@ function holdFindings({axis, hold, airframe}) {
         'wind or turbulence during the holds'
       ],
       confirm: 'First, with the motor disconnected, move this control through its full travel '
-        + 'by hand and feel for a tight spot. Then fly two long, still holds in calm air and '
-        + 'watch the head-speed trace across them. If the wobble tracks head speed, it is the '
+        + `by hand and feel for a tight spot. Then fly ${HOLDS_FOR_A_FULL_READING} or more long, `
+        + 'still holds in calm air and watch the head-speed trace across them. If the wobble '
+        + 'tracks head speed, it is the '
         + 'governor; if it is gone in calm air, it was the wind; if both remain on a free '
         + 'linkage and a steady head speed, the holds from that flight will read the I term.',
       codes: [...hold.codes]

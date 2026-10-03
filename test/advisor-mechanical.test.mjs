@@ -52,7 +52,11 @@ import {
 import * as spectrum from '../src/analysis/advisor/mechanical-spectrum.mjs';
 import {makePackage} from '../src/analysis/advisor/evidence-contract.mjs';
 import {detectPitchPumps} from '../src/analysis/advisor/deterministic-metrics.mjs';
-import {evaluateAirframeGate} from '../src/analysis/advisor/recommendation-gates.mjs';
+import {
+  evaluateAirframeGate,
+  rotorOrderMatchDistance,
+  rotorOrderMatchEstablished
+} from '../src/analysis/advisor/recommendation-gates.mjs';
 
 /**
  * The real log is never committed — it declares GPS home coordinates — so it is
@@ -1756,6 +1760,301 @@ test('a tone\'s size while present is measured window by window, and its flight 
     assert.equal(quietPeak.attentionWindowBandRmsDps, null);
   });
 
+/* ---------------------------------------------------------------------------
+ * Stage 2d, airframe review of 3 October 2026.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Roll carries `tones`, each present while `on(at)` says so (throughout when it
+ * has none); pitch and yaw are quiet; the head turns at 1800 rpm. The real
+ * analyser's input, built in memory.
+ */
+function gatedToneSeries({rateHz = 1000, seconds = 60, tones, seed}) {
+  const next = rng(seed);
+  const count = Math.round(rateHz * seconds);
+  const timeUs = new Float64Array(count);
+  const roll = new Float64Array(count);
+  const quiet = new Float64Array(count);
+  const head = new Float64Array(count);
+  for (let index = 0; index < count; index += 1) {
+    const at = index / rateHz;
+    timeUs[index] = Math.round(at * 1e6);
+    let value = 0;
+    for (const tone of tones) {
+      if (!tone.on || tone.on(at)) {
+        value += tone.amp * Math.sin(2 * Math.PI * tone.hz * at + (tone.phase ?? 0));
+      }
+    }
+    roll[index] = value + (next() - 0.5);
+    quiet[index] = next() - 0.5;
+    head[index] = 1800 + (next() - 0.5) * 4;
+  }
+  return {timeUs, gyro: {roll, pitch: quiet, yaw: quiet}, gyroSources: UNFILTERED,
+    headspeedRpm: head, tailspeedRpm: new Float64Array(count).fill(Number.NaN)};
+}
+
+/** The listed roll peak within 3 Hz of `hz`, or null. */
+async function rollPeakNear(series, hz) {
+  const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+  return result.axes.find(axis => axis.axis === 'roll').peaks
+    .find(peak => Math.abs(peak.frequencyHz - hz) <= 3) ?? null;
+}
+
+test('a tone above the attention level for only part of the range is listed whatever outranks '
+  + 'it, and never as a small tone', async () => {
+    // Stage 2d, item 1. Small peaks are capped at five, ranked on persistence. A
+    // tone above the level for a quarter of the flight is not attention-eligible
+    // (too few windows, too short a span, or too few quarters of the flight), so
+    // it competed for those five places on persistence it does not have, and
+    // five small steady harmonics were enough to push it off the list. The
+    // airframe rung then read the flight as clear, over a tone measured at three
+    // to six times the level while it was there.
+    const shapes = [
+      ['the first quarter', at => at < 15],
+      ['the first 40%', at => at < 24],
+      ['a block in the middle', at => at >= 20 && at < 36],
+      ['the last third', at => at >= 40],
+      ['2 s in every 10', at => at % 10 < 2],
+      ['1.5 s in every 6', at => at % 6 < 1.5]
+    ];
+    const random = rng(2026);
+    const steadyHz = [60, 90, 120, 150, 180, 210, 240, 270];
+    let reached = 0;
+    let outranked = 0;
+    for (const [shape, on] of shapes) {
+      for (const hz of [30, 47]) {
+        for (const crowd of [0, 6, 8]) {
+          const amp = (24 + random() * 24) * Math.SQRT2;
+          const tones = [{hz, amp, on}];
+          for (let index = 0; index < crowd; index += 1) {
+            tones.push({hz: steadyHz[index], amp: 3 + random() * 3, phase: random() * 6});
+          }
+          const series = gatedToneSeries({tones, seed: 31 + reached + crowd});
+          const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+          const roll = result.axes.find(axis => axis.axis === 'roll');
+          const label = `${hz} Hz at ${(amp / Math.SQRT2).toFixed(1)} deg/s over ${shape}, among `
+            + `${crowd} small steady tones: ${JSON.stringify(roll.peaks.map(peak => [peak.frequencyHz,
+              peak.persistenceRatio, peak.attentionWindowBandRmsDps, peak.attentionEligible]))}`;
+          const peak = roll.peaks.find(entry => Math.abs(entry.frequencyHz - hz) <= 3);
+          // The guarded property: it is on the list, as what it is.
+          assert.ok(peak, `${label}: the tone was cut from the list`);
+          assert.ok(peak.attentionWindowBandRmsDps >= 8, label);
+          if (peak.attentionEligible) {
+            continue;
+          }
+          reached += 1;
+          // And the cap on SMALL tones still holds: the tone is not one of them, so
+          // it neither takes a small tone's place nor is counted among them.
+          const small = roll.peaks.filter(entry => entry.attentionWindowBandRmsDps === null);
+          assert.ok(small.length <= SUB_THRESHOLD_PEAK_CAP, label);
+          assert.equal(small.length, Math.min(SUB_THRESHOLD_PEAK_CAP, crowd), label);
+          if (crowd >= SUB_THRESHOLD_PEAK_CAP
+              && small.every(entry => entry.persistenceRatio > peak.persistenceRatio)) {
+            outranked += 1;
+          }
+        }
+      }
+    }
+    // The sweep reached the hole: tones that were not attention-eligible, and ones
+    // that every small tone outranked with enough of them to fill the cap.
+    assert.ok(reached >= 24, `only ${reached} configurations were above the level in part`);
+    assert.ok(outranked >= 12, `only ${outranked} were outranked by a full cap of small tones`);
+  });
+
+test('a short burst of a large tone is listed as above the level in part, however little of the '
+  + 'range it fills', async () => {
+    // Stage 2d follow-up, item 1 — pre-existing on main. A peak present in fewer
+    // than a quarter of the analysis windows (MIN_PERSISTENCE_RATIO) was dropped
+    // before its size in each window was measured, so a burst of a few seconds at
+    // three to seven times the level was never listed at all, and the airframe
+    // rung read AIRFRAME_CLEAR over it. Swept over 40 s to five-minute ranges —
+    // five minutes is two stretches — and bursts of 1.5 to 15 seconds.
+    //
+    // A burst can only be seen by a window that holds it. At 1000 Hz a window is
+    // 512 samples, the windows step by half of one, and at most
+    // MECHANICAL_CONSTANTS.maximumWelchWindows of them are analysed per stretch,
+    // evenly spread. Every burst below is longer than the widest step between
+    // analysed windows plus a window, which is asserted from the published
+    // counts, so each one is held whole by at least one analysed window: a burst
+    // that is not listed is the analyser dropping it, never the sampling missing it.
+    const windowS = 0.512;
+    const grid = [[40, [1.5, 3, 6, 15]], [90, [1.5, 4, 10]], [150, [3, 8]], [300, [3, 6, 15]]];
+    const random = rng(1503);
+    let configuration = 0;
+    let underPresence = 0;
+    let inPart = 0;
+    for (const [seconds, bursts] of grid) {
+      for (const burstS of bursts) {
+        configuration += 1;
+        const hz = configuration % 2 === 0 ? 30 : 47;
+        const strength = 1.5 + random() * 5.5;
+        // Clear of the middle, where a five-minute range is split in two.
+        const fromS = (0.08 + random() * 0.3) * seconds;
+        const series = gatedToneSeries({seconds, seed: 1500 + configuration, tones: [{hz,
+          amp: strength * 8 * Math.SQRT2, phase: configuration, on: at => at >= fromS && at < fromS + burstS}]});
+        const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+        const roll = result.axes.find(axis => axis.axis === 'roll');
+        const stretches = Array.isArray(result.chunks) ? result.chunks.length : 1;
+        const stepS = Math.ceil((roll.candidateWindowCount / stretches - 1)
+          / (roll.windowCount / stretches - 1)) * windowS / 2;
+        const label = `${hz} Hz at ${(strength * 8).toFixed(1)} deg/s for ${burstS} s of ${seconds} s `
+          + `(analysed windows ${stepS.toFixed(3)} s apart): ${JSON.stringify(roll.peaks.map(peak =>
+            [peak.frequencyHz, peak.persistenceRatio, peak.attentionWindowBandRmsDps, peak.attentionEligible]))}`;
+        // Some analysed window starts in every stretch of `stepS`, so one starts in
+        // the first (burst - window) of the burst, and ends inside it.
+        assert.ok(burstS >= stepS + windowS + 0.01, `the sweep must hold only bursts a window `
+          + `can see whole: ${label}`);
+        const peak = roll.peaks.find(entry => Math.abs(entry.frequencyHz - hz) <= 2);
+        // The guarded property: it is on the list, at its size while present.
+        assert.ok(peak, `${label}: the burst was cut from the list`);
+        assert.ok(peak.attentionWindowBandRmsDps >= 8, label);
+        assert.ok(peak.attentionWindowBandRmsDps <= strength * 8 * 1.02, label);
+        // Nothing else reached the level: the burst is listed as one tone, and no
+        // stray neighbour of it is listed beside it as a second one.
+        assert.deepEqual(roll.peaks.filter(entry => entry.attentionWindowBandRmsDps !== null)
+          .map(entry => entry.frequencyHz), [peak.frequencyHz], label);
+        const required = Math.max(MECHANICAL_CONSTANTS.minimumWelchWindows,
+          Math.ceil(peak.evaluatedWindowCount * MECHANICAL_CONSTANTS.minimumPersistenceRatio));
+        if (peak.supportingWindowCount < required) {
+          underPresence += 1;
+        }
+        // A burst is never one the analyser calls worth attention on its own —
+        // what keeps one bump from stopping a tune — so it is listed in part.
+        if (!peak.attentionEligible) {
+          inPart += 1;
+        }
+        // Not persistent, so the result says nothing persistent was found — the
+        // burst is the airframe rung's to judge, as a tone above the level in part.
+        if (peak.supportingWindowCount < required && result.status === 'clear') {
+          assert.ok(!result.reasonCodes.includes('PERSISTENT_NARROWBAND_ENERGY_BELOW_ATTENTION_THRESHOLD'),
+            `${label}: ${result.reasonCodes}`);
+          assert.deepEqual(result.findings.map(finding => finding.id),
+            Array(stretches).fill('mechanical-no-persistent-narrowband-peak'), label);
+        }
+      }
+    }
+    // The sweep reached the hole: bursts under the persistence the list used to
+    // demand — 7 of the 12 when this was written, in every range length. (White
+    // noise alone is "present" in a sixth to a fifth of the windows, so longer
+    // bursts in short ranges clear the floor.)
+    assert.ok(underPresence >= 6, `only ${underPresence} bursts were under the persistence floor`);
+    assert.equal(inPart, configuration);
+  });
+
+test('a tone\'s size while present leaves out the windows that straddle it switching on or off',
+  async () => {
+    // Stage 2d, item 3. A window that straddles a switch holds the tone for part
+    // of its length, still passes the level, and was averaged in at that partial
+    // power: the size while present read 7-13% low at on-times of 1-3 s, and a
+    // tone just past three times the level was waved under the ceiling. Windows
+    // with no above-level window a whole window length before and after them are
+    // left out; where that leaves none, the size is published as a lower bound.
+    const steadyCache = new Map();
+    const steadyOf = async (rateHz, seconds, amp) => {
+      const key = `${rateHz}/${seconds}/${amp}`;
+      if (!steadyCache.has(key)) {
+        const peak = await rollPeakNear(gatedToneSeries({rateHz, seconds, seed: 1,
+          tones: [{hz: 30, amp}]}), 30);
+        steadyCache.set(key, peak.bandRmsDps);
+      }
+      return steadyCache.get(key);
+    };
+    let exact = 0;
+    let bounded = 0;
+    let configuration = 0;
+    for (const [rateHz, seconds] of [[1000, 20], [500, 60], [1000, 60], [1000, 120]]) {
+      // Three to three and a half times the level: either side of the ceiling.
+      for (const strength of [3.0, 3.2, 3.4]) {
+        const amp = strength * 8 * Math.SQRT2;
+        const steady = await steadyOf(rateHz, seconds, amp);
+        for (const [onS, offS] of [[2.5, 7.5], [3, 3], [5, 5], [1.5, 4], [0.6, 3]]) {
+          if (seconds === 20 && onS + offS > 8) {
+            continue;
+          }
+          configuration += 1;
+          const peak = await rollPeakNear(gatedToneSeries({rateHz, seconds, seed: 200 + configuration,
+            tones: [{hz: 30, amp, phase: configuration, on: at => at % (onS + offS) < onS}]}), 30);
+          const label = `${rateHz} Hz, ${seconds} s, ${strength}x on ${onS} s off ${offS} s `
+            + `(steady ${steady}): ${JSON.stringify(peak)}`;
+          assert.ok(peak && Number.isFinite(peak.attentionWindowBandRmsDps), label);
+          const size = peak.attentionWindowBandRmsDps;
+          assert.equal(typeof peak.attentionWindowSizeIsLowerBound, 'boolean', label);
+          // Never above what the tone measures while it is there, never under its
+          // average or the level it was above.
+          assert.ok(size <= steady * 1.01, label);
+          assert.ok(size >= peak.bandRmsDps && size >= 8, label);
+          if (peak.attentionWindowSizeIsLowerBound) {
+            bounded += 1;
+            continue;
+          }
+          // Not a bound: then it is the tone's size, to within one percent.
+          assert.ok(Math.abs(size / steady - 1) <= 0.01, `${label}: ${(size / steady).toFixed(3)}`);
+          exact += 1;
+        }
+      }
+    }
+    // Both halves were exercised: on-times long enough to be measured whole, at
+    // every rate and length — 60 s and 120 s windows sample rather than tile —
+    // and pulses shorter than a window, which can only be a bound.
+    assert.ok(exact >= 30, `only ${exact} configurations were measured whole`);
+    assert.ok(bounded >= 6, `only ${bounded} were published as a lower bound`);
+    // A pulse shorter than one analysis window is never seen whole.
+    const pulse = await rollPeakNear(gatedToneSeries({rateHz: 1000, seconds: 60, seed: 9,
+      tones: [{hz: 30, amp: 4 * 8 * Math.SQRT2, on: at => at % 3 < 0.35}]}), 30);
+    assert.ok(pulse?.attentionWindowSizeIsLowerBound === true, JSON.stringify(pulse));
+    // Leaving the edges out may only ever raise the size. A tone that announces
+    // each stretch with a burst ten times the level, too short to have anything
+    // but edges, then holds just over the level, is loudest in exactly the
+    // windows left out: its size is still never under its average.
+    const burst = await rollPeakNear(gatedToneSeries({rateHz: 1000, seconds: 30, seed: 12, tones: [
+      {hz: 30, amp: 80 * Math.SQRT2, on: at => at % 4 < 0.2},
+      {hz: 30, amp: 9.5 * Math.SQRT2, on: at => at % 4 >= 0.8 && at % 4 < 3}]}), 30);
+    assert.ok(burst && burst.attentionWindowBandRmsDps >= burst.bandRmsDps
+      && burst.attentionWindowBandRmsDps >= 8, JSON.stringify(burst));
+    // A tone above the level throughout has no switch to straddle.
+    const steady = await rollPeakNear(gatedToneSeries({rateHz: 1000, seconds: 60, seed: 10,
+      tones: [{hz: 30, amp: 20}]}), 30);
+    assert.equal(steady.attentionWindowSizeIsLowerBound, false);
+    assert.ok(Math.abs(steady.attentionWindowBandRmsDps - steady.bandRmsDps) <= 0.002,
+      JSON.stringify(steady));
+  });
+
+test('a peak\'s frequency is interpolated between bins, and its rotor match carries what a '
+  + 'tolerance would be built from', async () => {
+    // Stage 2d, item 2. The bin a tone lands in is up to half a bin (about 1 Hz
+    // at the 2 Hz resolution) from the tone, so "matched to the rotor" could only
+    // ever be judged to within a bin and a half. The interpolated frequency is
+    // the log-parabola through the peak bin and its neighbours.
+    let binWorst = 0;
+    let index = 0;
+    for (const rateHz of [500, 1000, 2000]) {
+      for (let hz = 28; hz <= 32.001; hz += 0.25) {
+        index += 1;
+        const series = gatedToneSeries({rateHz, seconds: 20, seed: 400 + index,
+          tones: [{hz, amp: 14, phase: index}]});
+        const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+        const peak = result.axes.find(axis => axis.axis === 'roll').peaks
+          .find(entry => Math.abs(entry.frequencyHz - hz) <= 2);
+        const label = `${hz.toFixed(2)} Hz at ${rateHz} Hz: ${JSON.stringify(peak)}`;
+        assert.ok(peak, label);
+        binWorst = Math.max(binWorst, Math.abs(peak.frequencyHz - hz));
+        assert.ok(Math.abs(peak.interpolatedFrequencyHz - hz) <= 0.1, label);
+        // The match carries the head speed's own spread at that order and the
+        // analysis resolution, as measured, so a caller can build a tolerance from
+        // them rather than from the analyser's wider naming tolerance.
+        const match = peak.harmonicMatch;
+        assert.ok(match && match.rotor === 'main' && match.order === 1, label);
+        const headspeed = result.rpmEvidence.headspeed;
+        assert.ok(Math.abs(match.spreadHz - headspeed.relativeSpread * match.predictedHz / 2) <= 0.001,
+          `${label}: spread ${match.spreadHz} vs ${headspeed.relativeSpread}`);
+        assert.ok(Math.abs(match.frequencyResolutionHz - result.quality.frequencyResolutionHz) <= 0.001,
+          label);
+      }
+    }
+    // The bin alone was half a bin out somewhere in the sweep, or this proves nothing.
+    assert.ok(binWorst >= 0.8, `the bin was never far from the tone: ${binWorst}`);
+  });
+
 test('a missing or out-of-bounds range is refused, never guessed', async () => {
   const series = toneSeries({rateHz: 1000, seconds: 10, tones: [{hz: 50, amp: 5}], seed: 55});
   await assert.rejects(
@@ -1868,7 +2167,7 @@ test('summarizeMechanicalVibration returns a plain, JSON-safe, measurement-only 
         assert.ok(Number.isFinite(peak.frequencyHz));
         assert.ok(Number.isFinite(peak.amplitudeDps));
         assert.equal(typeof peak.aboveAttentionThreshold, 'boolean');
-        assert.ok(['explained', 'not-explained', 'not-checked']
+        assert.ok(['explained', 'near-order', 'not-explained', 'not-checked']
           .includes(peak.rotorHarmonic.state));
       }
     }
@@ -1949,6 +2248,178 @@ test('summarizeMechanicalVibration reports what it could not measure, and throws
       ),
       error => error.code === 'MECHANICAL_GYRO_SOURCE_INVALID'
     );
+  });
+
+/* ---------------------------------------------------------------------------
+ * Stage 2d follow-up, copy review of 3 October 2026, findings 3, 6 and 8.
+ * ------------------------------------------------------------------------- */
+
+test('the vibration summary calls a peak its rotor\'s order only where the logged speed puts it, '
+  + 'and "near" that order otherwise', async () => {
+    // Finding 3. `peakRotorAttribution` published every peak the analyser NAMED a
+    // rotor order — by its wide match, a bin and a half or 2.5% — as "explained",
+    // so the panel drew a green "main 1/rev" and "its order 1 lands on this
+    // frequency" over a tone 1.6 Hz off the once-per-rev of a head logged steady,
+    // while the airframe gate, judging identity on the logged speed's own spread
+    // plus half a bin, called the same tone not the rotor's own. The summary's
+    // answer must be the gate's answer, peak by peak, swept across the order.
+    const seen = {explained: 0, near: 0, tailNear: 0, tailExplained: 0};
+    const round3 = value => Math.round(value * 1000) / 1000;
+    let configuration = 0;
+    const check = (result, label) => {
+      const summary = spectrum.summarizeMechanicalResult(result);
+      const raw = result.axes.find(axis => axis.axis === 'roll').peaks;
+      const view = summary.axes.find(axis => axis.axis === 'roll').peaks;
+      assert.equal(view.length, raw.length, label);
+      return raw.map((peak, index) => {
+        const harmonic = view[index].rotorHarmonic;
+        const where = `${label}: ${JSON.stringify(peak)} -> ${JSON.stringify(harmonic)}`;
+        if (!peak.harmonicMatch) {
+          assert.ok(['not-explained', 'not-checked'].includes(harmonic.state), where);
+          return null;
+        }
+        const established = rotorOrderMatchEstablished(peak);
+        const distance = rotorOrderMatchDistance(peak);
+        assert.equal(harmonic.state, established ? 'explained' : 'near-order', where);
+        assert.equal(harmonic.rotor, peak.harmonicMatch.rotor, where);
+        assert.equal(harmonic.order, peak.harmonicMatch.order, where);
+        // How far, and how far the logged speed allows: the gate's own numbers.
+        assert.equal(harmonic.offsetFromOrderHz, round3(distance.offsetHz), where);
+        assert.equal(harmonic.offsetAllowedHz, round3(distance.toleranceHz), where);
+        return {rotor: peak.harmonicMatch.rotor, established};
+      }).filter(Boolean);
+    };
+    for (const order of [1, 2]) {
+      for (const offsetHz of [-2.6, -1.8, -1.2, -0.6, -0.2, 0, 0.3, 0.8, 1.4, 2.0, 2.6]) {
+        configuration += 1;
+        const series = gatedToneSeries({seconds: 30, seed: 3000 + configuration,
+          tones: [{hz: 30 * order + offsetHz, amp: 2 * 8 * Math.SQRT2, phase: configuration}]});
+        const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+        for (const match of check(result, `${30 * order + offsetHz} Hz`)) {
+          seen[match.established ? 'explained' : 'near'] += 1;
+        }
+      }
+    }
+    // The tail rotor, judged against the logged TAIL speed: 6500 rpm is 108.3 Hz,
+    // and no main-rotor order of 1800 rpm is near it.
+    for (const offsetHz of [0, 0.2, 1.6, -1.8, -1.4]) {
+      configuration += 1;
+      const series = gatedToneSeries({seconds: 30, seed: 3000 + configuration,
+        tones: [{hz: 6500 / 60 + offsetHz, amp: 2 * 8 * Math.SQRT2, phase: configuration}]});
+      const next = rng(configuration);
+      series.tailspeedRpm = Float64Array.from(series.timeUs, () => 6500 + (next() - 0.5) * 4);
+      const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+      const matches = check(result, `tail, ${offsetHz} Hz off its once-per-rev`);
+      assert.ok(matches.length > 0 && matches.every(match => match.rotor === 'tail'),
+        `${offsetHz} Hz off the tail's once-per-rev: ${JSON.stringify(matches)}`);
+      for (const match of matches) {
+        seen[match.established ? 'tailExplained' : 'tailNear'] += 1;
+      }
+    }
+    assert.ok(seen.explained >= 6 && seen.near >= 6 && seen.tailNear >= 2 && seen.tailExplained >= 2,
+      JSON.stringify(seen));
+  });
+
+/** The criteria a peak above the level in some window failed, recomputed from its published counts. */
+function attentionCriteriaFailed(peak) {
+  const required = Math.max(MECHANICAL_CONSTANTS.minimumWelchWindows,
+    Math.ceil(peak.evaluatedWindowCount * MECHANICAL_CONSTANTS.minimumPersistenceRatio));
+  return [
+    ...(peak.attentionSupportingWindowCount < required ? ['window-count'] : []),
+    ...(peak.attentionTemporalSpanRatio < 0.5 ? ['span'] : []),
+    ...(peak.attentionOccupiedBucketCount < MECHANICAL_CONSTANTS.minimumAttentionOccupiedBuckets
+      ? ['quarters'] : []),
+    ...(peak.attentionMaximumGapRatio > MECHANICAL_CONSTANTS.maximumAttentionUnsupportedGapRatio
+      ? ['gap'] : [])
+  ];
+}
+
+const ABOVE_LEVEL_SHAPES = Object.freeze([
+  ['throughout', () => true],
+  ['the first quarter', at => at < 15],
+  ['the first 40%', at => at < 24],
+  ['a block in the middle', at => at >= 20 && at < 38],
+  ['2 s in every 10', at => at % 10 < 2],
+  ['1.5 s in every 6', at => at % 6 < 1.5],
+  ['the first and last fifths', at => at < 12 || at >= 48],
+  ['three stretches with a long gap', at => at < 8 || (at >= 30 && at < 34) || at >= 52],
+  ['a 3 s burst', at => at >= 20 && at < 23]
+]);
+
+test('a peak publishes which attention criteria it did not meet, and is attention-eligible exactly '
+  + 'when it met them all', async () => {
+    // Finding 6. A tone above the level for part of the range was said to be "too
+    // little of the flight to judge it as a steady tone" whichever criterion it
+    // failed — including tones above the level in a quarter or more of the windows
+    // that failed only on being bunched together. Only the analyser applies the
+    // criteria, so it publishes which failed; checked here against its published
+    // counts and its own constants, in one analysis and in two stretches.
+    const seen = new Set();
+    let eligible = 0;
+    let configuration = 0;
+    for (const [shape, on] of ABOVE_LEVEL_SHAPES) {
+      for (const hz of [30, 47]) {
+        for (const strength of [1.4, 2.6]) {
+          configuration += 1;
+          const series = gatedToneSeries({seed: 4000 + configuration,
+            tones: [{hz, amp: strength * 8 * Math.SQRT2, phase: configuration, on}]});
+          const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+          for (const peak of result.axes.find(axis => axis.axis === 'roll').peaks) {
+            const label = `${hz} Hz at ${strength}x over ${shape}: ${JSON.stringify(peak)}`;
+            const expected = attentionCriteriaFailed(peak);
+            assert.deepEqual(peak.attentionCriteriaUnmet, expected, label);
+            assert.equal(peak.attentionEligible, expected.length === 0, label);
+            expected.forEach(code => seen.add(code));
+            eligible += expected.length === 0 ? 1 : 0;
+          }
+        }
+      }
+    }
+    // Two stretches: each copy carries its own stretch's criteria.
+    const series = gatedToneSeries({seconds: 300, seed: 4999, tones: [
+      {hz: 47, amp: 2.6 * 8 * Math.SQRT2, on: at => at < 40 || (at >= 150 && at % 10 < 3)}]});
+    const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+    assert.equal(result.chunks.length, 2);
+    const copies = result.axes.find(axis => axis.axis === 'roll').peaks
+      .filter(peak => Math.abs(peak.frequencyHz - 47) <= 2);
+    assert.equal(copies.length, 2, JSON.stringify(copies));
+    for (const peak of copies) {
+      assert.deepEqual(peak.attentionCriteriaUnmet, attentionCriteriaFailed(peak), JSON.stringify(peak));
+    }
+    assert.deepEqual([...seen].sort(), ['gap', 'quarters', 'span', 'window-count']);
+    assert.ok(eligible >= 4, `${eligible}`);
+  });
+
+test('the vibration summary says which listed tones are persistent and which are short bursts',
+  async () => {
+    // Finding 8. Since the Stage 2d follow-up a burst in too few windows to be a
+    // persistent tone is listed when it reached the attention level, and the
+    // panel counted it under "Persistent tones". The summary says which each peak
+    // is, by the presence rule the analyser applies to its own findings.
+    const seen = {persistent: 0, burst: 0};
+    let configuration = 0;
+    const shapes = [...ABOVE_LEVEL_SHAPES,
+      ['a 1.5 s burst', at => at >= 41 && at < 42.5], ['a 2 s burst', at => at >= 9 && at < 11]];
+    for (const [shape, on] of shapes) {
+      for (const strength of [0.6, 2.2, 4]) {
+        configuration += 1;
+        const series = gatedToneSeries({seed: 5000 + configuration,
+          tones: [{hz: 47, amp: strength * 8 * Math.SQRT2, phase: configuration, on}]});
+        const result = await spectrum.analyzeMechanicalWindow(series, wholeRange(series));
+        const view = spectrum.summarizeMechanicalResult(result);
+        const raw = result.axes.find(axis => axis.axis === 'roll').peaks;
+        const listed = view.axes.find(axis => axis.axis === 'roll').peaks;
+        raw.forEach((peak, index) => {
+          const required = Math.max(MECHANICAL_CONSTANTS.minimumWelchWindows,
+            Math.ceil(peak.evaluatedWindowCount * MECHANICAL_CONSTANTS.minimumPersistenceRatio));
+          const persistent = peak.attentionEligible || peak.supportingWindowCount >= required;
+          assert.equal(listed[index].persistent, persistent,
+            `${strength}x over ${shape}: ${JSON.stringify(peak)}`);
+          seen[persistent ? 'persistent' : 'burst'] += 1;
+        });
+      }
+    }
+    assert.ok(seen.persistent >= 10 && seen.burst >= 3, JSON.stringify(seen));
   });
 
 /* ------------------------------------ the unresolved product decision, pinned */
