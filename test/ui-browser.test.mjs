@@ -1103,6 +1103,9 @@ test('the engine and shell run in a real browser', {
         // A filtered gyro publishes no peaks and cannot read as clear.
         const filtered = await measure({withHeadspeed: true, rpm: 2040, toneHz: 102,
           filtered: true});
+        // A five-minute pack at 1 kHz: over one analysis's 262,144-sample cap.
+        // It must be measured whole, in stretches, not refused or cut short.
+        const long = await measure({withHeadspeed: true, rpm: 2040, toneHz: 102, seconds: 300});
 
         // Render the not-checked one into the live panel and measure it at 384.
         box.innerHTML = notChecked.html;
@@ -1153,6 +1156,15 @@ test('the engine and shell run in a real browser', {
             saysNotQuiet: filtered.html.indexOf('not a quiet aircraft') !== -1,
             claimsClear: filtered.html.indexOf(
               'no persistent vibration above the attention threshold') !== -1},
+          long: {status: long.view.status, reasonCodes: long.view.reasonCodes,
+            seconds: long.view.range.durationUs / 1e6,
+            stretches: (long.view.chunks || []).length,
+            saysStretches: long.html.indexOf('consecutive stretches') !== -1,
+            // No single head speed was measured across the stretches, so none
+            // may be published; each stretch's own is shown instead.
+            publishesOneMedian: Number.isFinite(long.view.rotorCorrelation.headspeed.medianRpm),
+            saysStretchHeadspeed: long.html.indexOf('rpm median in its') !== -1,
+            ms: long.elapsedMs},
           notCheckedOverflow, notCheckedWidest, notCheckedMetrics, notCheckedText,
           instructions: /suggests (more|less)|reduce your|increase your|raise the|lower the/i
             .test(notCheckedText + ' ' + live)
@@ -1230,6 +1242,21 @@ test('the engine and shell run in a real browser', {
       'the panel must say the samples came out of the filter chain');
     assert.equal(vib.filtered.saysNotQuiet, true,
       'an empty peak list from a filtered gyro must say it is not a quiet aircraft');
+
+    // A whole five-minute pack, through the panel's own entry point. Until
+    // 2 October 2026 this came back "not measured" — over the per-analysis
+    // sample cap — or was cut to its first 262 s.
+    assert.notEqual(vib.long.status, 'insufficient',
+      `a 300 s window was not measured: ${JSON.stringify(vib.long.reasonCodes)}`);
+    assert.ok(Math.abs(vib.long.seconds - 300) < 0.01,
+      `the panel measured ${vib.long.seconds} s of a 300 s window`);
+    assert.ok(vib.long.stretches >= 2, `measured in ${vib.long.stretches} stretches`);
+    assert.equal(vib.long.saysStretches, true,
+      'a result combined from stretches must say so where it is shown');
+    assert.equal(vib.long.publishesOneMedian, false,
+      'a head speed combined from stretches is one no stretch measured');
+    assert.equal(vib.long.saysStretchHeadspeed, true,
+      'the panel must show each stretch\'s own head speed instead');
 
     // Legible on the phone this app ships to.
     assert.equal(vib.notCheckedOverflow, 0,
@@ -1648,7 +1675,7 @@ test('the engine and shell run in a real browser', {
           cards: document.querySelectorAll('#recommend .finding').length,
           tiles: document.querySelectorAll('#axis-stats .stat').length,
           text: document.getElementById('recommend').textContent
-            .replace(/\s+/g, ' ').trim().slice(0, 200),
+            .replace(/\\s+/g, ' ').trim().slice(0, 200),
           status: document.getElementById('recommend-status').textContent
         };
         const draggedTiles = tiles();
@@ -2352,6 +2379,405 @@ test('the engine and shell run in a real browser', {
     // A finding is data, and every string in it can come from a log.
     assert.equal(drawn.pwned, false, 'a finding\'s text must never execute');
     assert.equal(drawn.injected, 0, 'a finding\'s text must not create elements');
+
+    // 12b. WHAT THE AIRFRAME CARD SAYS, from the real analyser through the
+    // shipped renderer. Audit of 2 October 2026: a 40 Hz log that could not be
+    // measured at all was told "Your helicopter is shaking", and the main
+    // rotor's own once-per-rev was told the same thing on almost every real
+    // flight. Plain copy is the words a pilot actually reads, so it is checked
+    // where it is painted.
+    const airframeCopy = await client.send('Runtime.evaluate', {
+      expression: `(async () => {
+        const app = await import('/ui/app.mjs');
+        const engine = await import('/src/analysis/recommendations.mjs');
+        const mech = await import('/src/analysis/advisor/mechanical-spectrum.mjs');
+        const flat = value => String(value).replace(/\\s+/g, ' ').trim();
+        const box = document.getElementById('recommend');
+
+        // Three axes of unfiltered gyro and a rock-steady 1800 rpm head.
+        function series(options) {
+          const rateHz = options.rateHz || 1000;
+          const count = Math.round(rateHz * (options.seconds || 20));
+          const timeUs = [];
+          const gyro = [];
+          const head = [];
+          let seed = 99;
+          const noise = () => {
+            seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+            return seed / 0x7fffffff - 0.5;
+          };
+          for (let i = 0; i < count; i += 1) {
+            const stamp = Math.round(i * 1e6 / rateHz);
+            // A logger falling behind: from thinFromS on, one sample in six.
+            if (options.thinFromS && stamp >= options.thinFromS * 1e6 && i % 6 !== 0) {
+              continue;
+            }
+            timeUs.push(stamp);
+            // A tone that comes and goes: present for onS of every periodS.
+            const present = !options.periodS || (stamp / 1e6) % options.periodS < options.onS;
+            // Gyro dropouts: the first share of the window carries no gyro at all.
+            gyro.push(options.dropoutShare && i < count * options.dropoutShare ? NaN
+              : (present ? (options.toneDps || 0) : 0)
+                * Math.sin(2 * Math.PI * (options.toneHz || 30) * stamp / 1e6) + noise());
+            head.push(1800 + noise() * 4);
+          }
+          const values = Float64Array.from(gyro);
+          return {timeUs: Float64Array.from(timeUs), gyro: {roll: values, pitch: values, yaw: values},
+            gyroSources: {roll: 'gyroRAW', pitch: 'gyroRAW', yaw: 'gyroRAW'},
+            headspeedRpm: Float64Array.from(head),
+            tailspeedRpm: new Float64Array(timeUs.length).fill(NaN)};
+        }
+        async function render(options) {
+          const s = series(options);
+          const mechanical = await mech.analyzeMechanicalWindow(s, {timeRangeUs: {
+            startTimeUs: s.timeUs[0], endTimeUs: s.timeUs[s.timeUs.length - 1]}});
+          const result = engine.buildRecommendations({mechanical});
+          box.innerHTML = app.recommendationsHtml(result, {});
+          const text = flat(box.textContent);
+          // The plain line of each card on its own, as the shipped renderer
+          // paints it: the engine's headline is drawn underneath and would
+          // otherwise answer for it.
+          const plain = {};
+          for (const finding of result.findings) {
+            box.innerHTML = app.findingHtml(finding);
+            plain[finding.id] = flat(box.querySelector('p.plain').textContent);
+          }
+          box.innerHTML = '';
+          return {status: mechanical.status, reasons: mechanical.reasonCodes,
+            ids: result.findings.map(finding => finding.id), text, plain};
+        }
+        return JSON.stringify({
+          // 40 samples a second: nothing can be measured.
+          lowRate: await render({rateHz: 40}),
+          // The main rotor's once-per-rev at 20 deg/s, and nothing else.
+          rotorOrder: await render({toneHz: 30, toneDps: 20}),
+          // The same once-per-rev at 60 deg/s: past three times the level.
+          large: await render({toneHz: 30, toneDps: 60}),
+          // 71 Hz is no order of an 1800 rpm head.
+          unexplained: await render({toneHz: 71, toneDps: 26}),
+          // The first 30% of the window carries no gyro.
+          dropouts: await render({toneHz: 30, toneDps: 20, dropoutShare: 0.3}),
+          // Five minutes, so two stretches, the logger falling behind for the
+          // last fifty seconds of it.
+          partly: await render({rateHz: 1007, seconds: 300, toneHz: 30, toneDps: 20,
+            thinFromS: 250}),
+          // A minute with the once-per-rev there three seconds in every ten: above
+          // the limit while it is there, under it averaged over the flight.
+          intermittent: await render({seconds: 60, toneHz: 30, toneDps: 14, onS: 3, periodS: 10}),
+          // The long flight measured in part, carrying a once-per-rev far past the
+          // ceiling in the stretch that was measured.
+          partlyLarge: await render({rateHz: 1007, seconds: 300, toneHz: 30, toneDps: 60,
+            thinFromS: 250})
+        });
+      })()`,
+      awaitPromise: true,
+      returnByValue: true
+    }, sessionId);
+    assert.equal(airframeCopy.exceptionDetails, undefined,
+      `the airframe copy check threw: ${JSON.stringify(airframeCopy.exceptionDetails)}`);
+    const copied = JSON.parse(airframeCopy.result.value);
+
+    assert.equal(copied.lowRate.status, 'insufficient', JSON.stringify(copied.lowRate.reasons));
+    assert.ok(!copied.lowRate.ids.includes('AIRFRAME_VIBRATION_PRESENT'), `${copied.lowRate.ids}`);
+    assert.doesNotMatch(copied.lowRate.text, /shaking/i,
+      'a log that could not be measured was told its helicopter is shaking');
+    assert.doesNotMatch(copied.lowRate.text, /moved too much/i,
+      'a head speed that was never read was blamed for moving');
+    assert.match(copied.lowRate.text, /sample rate/i,
+      'the pilot must be told WHY the vibration could not be read');
+
+    assert.equal(copied.rotorOrder.status, 'attention', JSON.stringify(copied.rotorOrder.reasons));
+    assert.ok(copied.rotorOrder.ids.includes('AIRFRAME_ROTOR_ORDER_TONE'), `${copied.rotorOrder.ids}`);
+    assert.ok(!copied.rotorOrder.ids.includes('AIRFRAME_VIBRATION_PRESENT'),
+      `${copied.rotorOrder.ids}`);
+    assert.match(copied.rotorOrder.text, /once (?:per|every) turn/i);
+    assert.match(copied.rotorOrder.text, /tracking or balance/i);
+    assert.match(copied.rotorOrder.text, /unproven/i);
+    assert.doesNotMatch(copied.rotorOrder.text, /Your helicopter is shaking/,
+      'a once-per-rev above an unproven limit is not "your helicopter is shaking"');
+    // The plain line itself states the size and how far past the limit it is.
+    // It used to say "a little above" whatever was measured.
+    const rotorPlain = copied.rotorOrder.plain.AIRFRAME_ROTOR_ORDER_TONE;
+    assert.match(rotorPlain, /\d+(?:\.\d+)? degrees a second/, rotorPlain);
+    assert.match(rotorPlain, /\d+(?:\.\d+)? times/, rotorPlain);
+    assert.doesNotMatch(rotorPlain, /a little|slightly/i, rotorPlain);
+    assert.match(rotorPlain, /for 100% of this flight/, rotorPlain);
+
+    // Round 3: a tone that comes and goes is said at its size while it was
+    // there, for how long, and beside its flight average — never as a fraction
+    // of the limit it was above, and never with an average called its strongest.
+    assert.ok(copied.intermittent.ids.includes('AIRFRAME_ROTOR_ORDER_TONE'),
+      `${copied.intermittent.ids}`);
+    const comesAndGoes = copied.intermittent.plain.AIRFRAME_ROTOR_ORDER_TONE;
+    const told = new RegExp('([\\d.]+) degrees a second while it was above a cautious, '
+      + 'still-unproven limit, ([\\d.]+) times that limit\\. It was above that limit for '
+      + '(\\d+)% of this flight, and averaged ([\\d.]+) degrees a second over all of it\\.')
+      .exec(comesAndGoes);
+    assert.ok(told, comesAndGoes);
+    assert.ok(Number(told[1]) >= 8 && Number(told[2]) >= 1, comesAndGoes);
+    assert.ok(Number(told[3]) < 50 && Number(told[4]) < 8,
+      `the fixture must average under the limit it was above: ${comesAndGoes}`);
+    assert.doesNotMatch(comesAndGoes, /\b0(?:\.\d+)? times|at its strongest/, comesAndGoes);
+
+    // Far past the ceiling in the stretch that was measured: named as large, and
+    // ahead of what else stops the airframe.
+    const partlyLarge = copied.partlyLarge;
+    assert.ok(partlyLarge.ids.includes('AIRFRAME_ROTOR_ORDER_TONE_LARGE'), `${partlyLarge.ids}`);
+    assert.ok(partlyLarge.ids.indexOf('AIRFRAME_ROTOR_ORDER_TONE_LARGE')
+      < partlyLarge.ids.indexOf('AIRFRAME_VIBRATION_PRESENT'), `${partlyLarge.ids}`);
+    const partlyLargePlain = partlyLarge.plain.AIRFRAME_ROTOR_ORDER_TONE_LARGE;
+    assert.match(partlyLargePlain, /the part of this flight it was measured in/, partlyLargePlain);
+    assert.match(partlyLargePlain, /tracking and balance/i, partlyLargePlain);
+
+    // Past three times the level: a blocker, said as its size.
+    assert.equal(copied.large.status, 'attention', JSON.stringify(copied.large.reasons));
+    assert.ok(copied.large.ids.includes('AIRFRAME_ROTOR_ORDER_TONE_LARGE'), `${copied.large.ids}`);
+    assert.ok(!copied.large.ids.includes('AIRFRAME_ROTOR_ORDER_TONE'), `${copied.large.ids}`);
+    const largePlain = copied.large.plain.AIRFRAME_ROTOR_ORDER_TONE_LARGE;
+    assert.match(largePlain, /\d+(?:\.\d+)? degrees a second/, largePlain);
+    assert.match(largePlain, /\d+(?:\.\d+)? times/, largePlain);
+    assert.match(largePlain, /tracking and balance/i, largePlain);
+    assert.doesNotMatch(copied.large.text, /does not (?:stop|hold back) the rest/i,
+      'a tone that blocks every gain must not be said not to');
+
+    // Gyro dropouts are their own reason, said as one.
+    assert.ok(copied.dropouts.ids.includes('AIRFRAME_BROADBAND_NOT_MEASURED'),
+      `${copied.dropouts.ids} ${copied.dropouts.reasons}`);
+    const dropoutPlain = copied.dropouts.plain.AIRFRAME_BROADBAND_NOT_MEASURED;
+    assert.match(dropoutPlain, /continuous gyro/i, dropoutPlain);
+    assert.doesNotMatch(dropoutPlain, /at all/, dropoutPlain);
+
+    // A long flight measured in part: "part of", in both cards, and never "never".
+    const partlyMissing = copied.partly.plain.AIRFRAME_BROADBAND_NOT_MEASURED;
+    assert.ok(partlyMissing, `${copied.partly.ids}`);
+    assert.match(partlyMissing, /part of this flight/, partlyMissing);
+    assert.match(partlyMissing, /gaps/, partlyMissing);
+    const partlyRotor = copied.partly.plain.AIRFRAME_ROTOR_NOT_COMPARED;
+    assert.ok(partlyRotor, `${copied.partly.ids}`);
+    assert.match(partlyRotor, /part of this flight/, partlyRotor);
+    assert.doesNotMatch(partlyRotor, /never compared|could not measure this flight/, partlyRotor);
+    const partlyVibration = copied.partly.plain.AIRFRAME_VIBRATION_PRESENT;
+    assert.match(partlyVibration, /part of the flight could not be measured/, partlyVibration);
+
+    assert.ok(copied.unexplained.ids.includes('AIRFRAME_VIBRATION_PRESENT'),
+      `${copied.unexplained.ids}`);
+    assert.match(copied.unexplained.text, /unexplained/i,
+      'measured vibration the rotor does not account for is said to be unexplained');
+    assert.doesNotMatch(copied.unexplained.text, /Your helicopter is shaking\./,
+      'the copy states a measurement, not an unqualified verdict');
+
+    // 12b. THE HOLD, SHAPE AND HEAD-SPEED COPY (2 October 2026, round two).
+    //
+    // Five flights that used to be told something their own engine findings
+    // contradicted: a healthy tail's tiny shortfall and a noisy gyro's shortfall
+    // read as "keeps going ... instead of stopping"; both hold signatures at once,
+    // and a slow wander below the band, read as "Nothing ... calls for an I
+    // change"; and a head speed that moved in the one segment it was read in,
+    // read as "held steady enough". Built in the page and pushed through the real
+    // engine and the real card renderer, as the pilot gets them.
+    const holdCopy = await client.send('Runtime.evaluate', {
+      expression: `(async () => {
+        const app = await import('/ui/app.mjs');
+        const engine = await import('/src/analysis/recommendations.mjs');
+        const spaces = new RegExp('[ ' + String.fromCharCode(9, 10, 13, 160) + ']+', 'g');
+        const flat = value => String(value).replace(spaces, ' ').trim();
+        const box = document.getElementById('recommend');
+        function rng(seed) {
+          let state = (seed >>> 0) || 1;
+          return () => {
+            state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+            return state / 4294967296;
+          };
+        }
+        // A healthy, lagging tail flown as big, fast stops, short by a set share.
+        function lagged(shortfalls) {
+          const random = rng(7);
+          const periodMs = 100 + 1500 + 20 + 2600;
+          const totalMs = 3000 + periodMs * 8 + 1000;
+          const records = [];
+          let rate = 0;
+          let side = 0;
+          for (let ms = 0; ms < totalMs; ms += 1) {
+            const which = Math.floor((ms - 3000) / periodMs);
+            const local = ms - 3000 - which * periodMs;
+            let command = 0;
+            if (ms >= 3000 && which < 8) {
+              side = which % 2;
+              const peak = (side === 0 ? 1 : -1) * [300, 350][side];
+              if (local < 100) { command = peak * (local / 100); }
+              else if (local < 1600) { command = peak; }
+              else if (local < 1620) { command = peak * (1 - (local - 1600) / 20); }
+            }
+            rate += (command * (1 - shortfalls[side]) - rate) / [36, 40][side];
+            const gyro = [0, 0, rate + (random() - 0.5) * 0.6];
+            records.push({timeUs: ms * 1000, setpoint: [0, 0, command], gyro, raw: [...gyro],
+              terms: [0, 0, 0], headspeed: 1800, collective: 0, vbat: 24});
+          }
+          return records;
+        }
+        // The closed-loop yaw simulator from test/recommendations.test.mjs.
+        function loop(options) {
+          const ki = options.ki;
+          const durationS = options.durationS || 30;
+          const random = rng(9001);
+          const delay = [0, 0, 0];
+          let rate = 0; let actuator = 0; let integral = 0; let previousError = 0;
+          let derivative = 0; let measured = 0;
+          const records = [];
+          for (let step = 0; step < durationS * 1000; step += 1) {
+            const t = step / 1000;
+            let command = 0;
+            if (options.stops) {
+              for (const stop of options.stops) {
+                if (t >= stop.atS && t < stop.atS + 0.1) { command = stop.amplitudeDps * (t - stop.atS) / 0.1; }
+                else if (t >= stop.atS + 0.1 && t < stop.atS + 0.1 + stop.holdS) { command = stop.amplitudeDps; }
+              }
+            } else if ((t >= 1 && t < 1.4) || (t >= 12 && t < 12.4)) {
+              command = 120;
+            }
+            const error = command - measured;
+            integral += error * 0.001;
+            derivative += ((error - previousError) / 0.001 - derivative) * (0.001 / 0.003);
+            previousError = error;
+            const pTerm = 0.105 * error;
+            const iTerm = ki * integral;
+            const dTerm = 0.0014 * derivative;
+            delay.push(pTerm + iTerm + dTerm);
+            actuator += (delay.shift() - actuator) * (0.001 / 0.02);
+            const external = (options.torque || 0)
+              * Math.sin(2 * Math.PI * (options.hz || 0.8) * t + (options.phase || 0));
+            rate += (800 * actuator - 2 * rate + (options.disturbance || 0) + external) * 0.001;
+            const noise = (random() - 0.5) * 1.6;
+            measured += (rate + noise * 0.25 - measured) * (0.001 / 0.0015);
+            records.push({timeUs: Math.round(t * 1e6), setpoint: [0, 0, command],
+              gyro: [0, 0, measured], raw: [0, 0, rate + noise], terms: [pTerm, iTerm, dTerm],
+              headspeed: options.headspeed ? options.headspeed(t) : 1800, collective: 0, vbat: 24});
+          }
+          return records;
+        }
+        const airframe = () => ({
+          status: 'clear', reasonCodes: [],
+          tuningEvidenceGate: {status: 'permitted', reasonCodes: []},
+          harmonicCorrelation: {state: 'evaluated'},
+          rpmEvidence: {headspeed: {relativeSpread: 0.03, state: 'trustworthy'}},
+          attentionThreshold: {bandRmsDps: 8, basis: 'experimental-synthetic-calibration'},
+          range: {startTimeUs: 0, endTimeUs: 10000000000},
+          analyzedBandHz: [5, 450],
+          axes: ['roll', 'pitch', 'yaw'].map(axis => ({axis, source: 'gyroRAW', available: true,
+            medianNoisePsdDps2PerHz: 0.0002, broadbandRmsDps: 1.2, peaks: []}))
+        });
+        function cards(records, noise) {
+          const result = engine.buildRecommendations({records, mechanical: airframe(),
+            axes: {yaw: {...engine.analyseAxisEvidence(records, 'yaw'), records}},
+            axisSummaries: {yaw: {gyroHighFrequencyRmsDps: noise}}});
+          const plain = {};
+          const codes = {};
+          for (const finding of result.findings) {
+            box.innerHTML = app.findingHtml(finding);
+            plain[finding.id] = flat(box.querySelector('p.plain').textContent);
+            codes[finding.id] = [...finding.codes];
+          }
+          box.innerHTML = '';
+          return {ids: result.findings.map(finding => finding.id), plain, codes};
+        }
+        const wobble = t => (t > 3 && t < 13 ? 1800 * (1 + 0.08 * Math.sin(2 * Math.PI * 0.2 * t)) : 1800);
+        // Round three: a short pulse every so many seconds, from 1 s.
+        const pulses = (everyS, untilS) => {
+          const stops = [];
+          for (let atS = 1; atS < untilS - 5; atS += everyS) {
+            stops.push({atS, amplitudeDps: 120, holdS: 0.3});
+          }
+          return stops;
+        };
+        const fourHovers = [1, 12, 23, 34].map(atS => ({atS, amplitudeDps: 120, holdS: 0.3}));
+        return JSON.stringify({
+          tiny: cards(lagged([0.01, 0.012]), 0.5),
+          buried: cards(lagged([0.08, 0.09]), 40),
+          both: cards(loop({ki: 0, disturbance: 400, torque: 1000, hz: 1.0}), 0.5),
+          slow: cards(loop({ki: 0.05, torque: 6000, hz: 0.16, durationS: 40}), 0.5),
+          tooFew: cards(loop({ki: 0.05, disturbance: 400, durationS: 14,
+            stops: [{atS: 1, amplitudeDps: 120, holdS: 0.3}], headspeed: wobble}), 0.5),
+          // Round three: a fast shake on a healthy tail; no integrator over two
+          // holds; a slow torque flown as ordinary short holds; and a head speed
+          // that moved in one hover of four.
+          fast: cards(loop({ki: 0.05, torque: 3000, hz: 4.0}), 0.5),
+          twoHolds: cards(loop({ki: 0, disturbance: 400}), 0.5),
+          // A slow torque whose half period is the hold spacing: every hold
+          // clear of its own movement, and on alternate sides of the command.
+          sides: cards(loop({ki: 0.05, torque: 2000, hz: 1 / 13, phase: 1.57, durationS: 40,
+            stops: pulses(6.5, 40)}), 0.5),
+          someMoved: cards(loop({ki: 0, disturbance: 400, durationS: 46, stops: fourHovers,
+            headspeed: t => (t > 14 && t < 22 ? 1800 * (1 + 0.08 * Math.sin(2 * Math.PI * 0.2 * t))
+              : 1800)}), 0.5)
+        });
+      })()`,
+      awaitPromise: true,
+      returnByValue: true
+    }, sessionId);
+    assert.equal(holdCopy.exceptionDetails, undefined,
+      `the hold copy check threw: ${JSON.stringify(holdCopy.exceptionDetails)}`);
+    const holds = JSON.parse(holdCopy.result.value);
+
+    for (const [name, road] of [['tiny', 'too small'], ['buried', 'noisy gyro']]) {
+      const plain = holds[name].plain.AXIS_DOES_NOT_ARREST;
+      assert.ok(plain, `${name}: ${holds[name].ids}`);
+      assert.doesNotMatch(plain, /instead of stopping where you put it/,
+        `the ${road} road must not read as a fault the engine itself does not claim: ${plain}`);
+      assert.match(plain, /nothing to change yet/i, plain);
+    }
+    assert.match(holds.tiny.plain.AXIS_DOES_NOT_ARREST, /healthy loop/, holds.tiny.plain.AXIS_DOES_NOT_ARREST);
+    assert.match(holds.buried.plain.AXIS_DOES_NOT_ARREST, /noisy/, holds.buried.plain.AXIS_DOES_NOT_ARREST);
+
+    for (const [name, id] of [['both', 'I_TERM_SIGNATURES_CONFLICT'],
+      ['slow', 'SLOW_WANDER_NOT_FROM_THE_I_TERM']]) {
+      assert.ok(!holds[name].ids.includes('I_TERM_WITHIN_TOLERANCE'), `${name}: ${holds[name].ids}`);
+      const plain = holds[name].plain[id];
+      assert.ok(plain, `${name}: ${holds[name].ids}`);
+      assert.match(plain, /not an all-clear/, plain);
+      assert.doesNotMatch(plain, /calls for an I change/, plain);
+    }
+    assert.match(holds.slow.plain.SLOW_WANDER_NOT_FROM_THE_I_TERM, /wandered slowly/,
+      holds.slow.plain.SLOW_WANDER_NOT_FROM_THE_I_TERM);
+    assert.match(holds.both.plain.I_TERM_SIGNATURES_CONFLICT, /linkage/,
+      holds.both.plain.I_TERM_SIGNATURES_CONFLICT);
+
+    assert.ok(!holds.tooFew.ids.includes('HEADSPEED_STEADY_ENOUGH'), `${holds.tooFew.ids}`);
+    const tooFewPlain = holds.tooFew.plain.HEADSPEED_TOO_FEW_SEGMENTS_TO_JUDGE;
+    assert.ok(tooFewPlain, `${holds.tooFew.ids}`);
+    assert.match(tooFewPlain, /cannot say whether your governor holds/, tooFewPlain);
+    assert.doesNotMatch(tooFewPlain, /held steady/, tooFewPlain);
+
+    // Round three. Each road to "not judged" says which measurement was missing,
+    // in the pilot's words as well as the engine's; none says "calls for".
+    for (const [name, code, words] of [
+      ['fast', 'OSCILLATION_ABOVE_I_TERM_BAND', /shook quickly .*hid anything slower/],
+      ['twoHolds', 'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR', /same side every time .*slow wander/]]) {
+      assert.ok(!holds[name].ids.includes('I_TERM_WITHIN_TOLERANCE'), `${name}: ${holds[name].ids}`);
+      assert.ok(!holds[name].ids.includes('I_TOO_LOW'), `${name}: ${holds[name].ids}`);
+      const plain = holds[name].plain.I_TERM_NOT_JUDGED;
+      assert.ok(plain, `${name}: ${holds[name].ids}`);
+      assert.ok(holds[name].codes.I_TERM_NOT_JUDGED.includes(code), `${name}: ${holds[name].codes.I_TERM_NOT_JUDGED}`);
+      assert.match(plain, words, plain);
+      assert.match(plain, /not an all-clear/, plain);
+      assert.doesNotMatch(plain, /measured, but not in a way/, `${name} fell back: ${plain}`);
+    }
+    assert.match(holds.twoHolds.plain.I_TERM_NOT_JUDGED, /at least 3 still holds/,
+      holds.twoHolds.plain.I_TERM_NOT_JUDGED);
+    // A slow torque on a healthy tail flown as short holds: never "Raise I", and
+    // when the error changed side the card says so.
+    assert.ok(!holds.sides.ids.includes('I_TOO_LOW'), `${holds.sides.ids}`);
+    const sidesPlain = holds.sides.plain.SLOW_WANDER_NOT_FROM_THE_I_TERM;
+    assert.ok(sidesPlain, `${holds.sides.ids}`);
+    assert.match(sidesPlain, /not an all-clear/, sidesPlain);
+    assert.ok(holds.sides.codes.SLOW_WANDER_NOT_FROM_THE_I_TERM
+      .includes('STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS'),
+    `the fixture must change side: ${holds.sides.codes.SLOW_WANDER_NOT_FROM_THE_I_TERM}`);
+    assert.match(sidesPlain, /one side in some holds and on the other side in others/, sidesPlain);
+    // The head speed moved in one hover of four: the copy is about holds, and true.
+    const someMovedPlain = holds.someMoved.plain.HEADSPEED_MOVED_IN_SOME_SEGMENTS;
+    assert.ok(someMovedPlain, `${holds.someMoved.ids}`);
+    assert.match(someMovedPlain, /only holds during which your head speed stayed steady/, someMovedPlain);
+    assert.doesNotMatch(someMovedPlain, /only from the ones where it held/, someMovedPlain);
 
     // 13. IMPORT PROGRESS, on the events MainActivity actually sends.
     //
@@ -3143,11 +3569,24 @@ test('a real flight is remembered, compared, and can be deleted', {
           offersForget: Boolean(document.querySelector('#since [data-forget-flight]'))
         };
 
-        // ...and the next flight of the same helicopter. The same log, so nothing
-        // was adjusted between them: the engine must say so rather than credit a
-        // movement to a change nobody made.
+        // ...and the same log opened again, with a DIFFERENT axis selected. A new
+        // decode has a new session, so nothing process-local can recognise the
+        // flight; only the stored numbers can. What this step does NOT cover:
+        // the reference log's detected window fits the memory budget on all
+        // three axes, so both opens analyse roll, pitch and yaw whichever axis
+        // is selected, and the different-axis-subset path is never reached
+        // here. That path is covered by the sweep in
+        // test/flight-history.test.mjs ("opened again with a different axis
+        // selected"). This step checks that a fresh real re-decode reproduces
+        // the stored numbers, and that the picker change does not break that.
+        const axisPicker = document.getElementById('axis');
+        axisPicker.value = 'yaw';
+        axisPicker.dispatchEvent(new Event('change'));
+        await new Promise(resolve => setTimeout(resolve, 300));
         const second = {settled: await openLog('SECOND-FLIGHT.BBL')};
         second.text = document.getElementById('since').textContent;
+        second.saveOffered = Boolean(document.getElementById('since-save'));
+        second.selectedAxis = axisPicker.value;
         second.overflowX = document.documentElement.scrollWidth
           - document.documentElement.clientWidth;
 
@@ -3226,8 +3665,18 @@ test('a real flight is remembered, compared, and can be deleted', {
       `re-opening one log must not be compared with itself: ${run.second.text.slice(0, 300)}`);
     assert.doesNotMatch(run.second.text, /That helped|made it worse/,
       'a verdict was claimed for a change nobody made');
-    assert.match(run.second.text, /first flight RotorLens has seen|Kept on this device/i,
-      `the same flight re-derived must read as already stored: ${run.second.text.slice(0, 300)}`);
+    // "Kept on this device" and nothing else. This used to also accept "first
+    // flight RotorLens has seen", which is what the screen says when the
+    // reopened flight is NOT recognised — so the assertion held whether or not
+    // a fresh decode of the same real log reproduced the stored numbers. Here
+    // it must: this is the one place a real re-decode is checked against them.
+    // The picker moved, but on this log every axis was analysed both times: the
+    // axis-subset path is pinned in test/flight-history.test.mjs, not here.
+    assert.equal(run.second.selectedAxis, 'yaw', 'the axis picker was not moved before reopening');
+    assert.match(run.second.text, /Kept on this device/i,
+      `the same flight opened again must read as already stored: ${run.second.text.slice(0, 300)}`);
+    assert.equal(run.second.saveOffered, false,
+      'the same flight opened again offered to be saved a second time');
     assert.equal(run.second.overflowX, 0, 'the panel must not scroll the page sideways at 384px');
 
     assert.equal(run.dragged.settled, true, 'moving the window must re-run the comparison');
@@ -3762,12 +4211,16 @@ test('what RotorLens has learned is on screen, and can be forgotten again', {
 // cannot see. Each assertion below is a way this one could look finished while
 // being dishonest:
 //
-//  1. ASKED AFTER THE APP HAS DONE SOMETHING, NOT AT FIRST RUN. A dialog on a
-//     blank page is a dialog people learn to tap through, and consent taught by
-//     reflex is not consent. It must not be on screen before a log is, and it
-//     must be on screen once a flight has actually been measured.
-//  2. OFF BY DEFAULT, AND ASKED ONCE. "Not now" is a choice that has to stick
-//     across a re-analysis, or the app is nagging.
+//  1. NEVER ASKED BY ITSELF. Until 2 October 2026 this pinned the opposite: the
+//     dialog had to appear once a real flight had been measured. The owner
+//     turned that automatic prompt off (AUTOMATIC_SHARING_PROMPT in ui/app.mjs)
+//     until the licence terms it asks for — a draft awaiting legal review — are
+//     formally reviewed. So it must not be on screen before a log, and it must
+//     STILL not be on screen once a real, admissible flight has been measured.
+//     The dialog is reached from the sharing panel's Share button, and every
+//     check on its wording and its buttons is made on that path.
+//  2. OFF BY DEFAULT, AND NOT ASKED AGAIN. "Not now" is a choice that has to
+//     stick across a re-analysis, or the app is nagging.
 //  3. NOTHING IS WRITTEN BEFORE AN ANSWER. The same rule the flight history
 //     already keeps: the file is empty until somebody presses something.
 //  4. THE PAYLOAD ON SCREEN IS THE REAL ONE. It is built by `shareableRecord`
@@ -3785,7 +4238,7 @@ test('what RotorLens has learned is on screen, and can be forgotten again', {
 //     the one screen where it would matter most.
 // ---------------------------------------------------------------------------
 
-test('sharing is asked once, shows what would leave, erases — and sends nothing', {
+test('sharing is never asked by itself, shows what would leave, erases — and sends nothing', {
   skip: chromePath
     ? (REAL_LOG ? false : 'set ROTORLENS_REAL_LOG to a .bbl path to run this')
     : 'no Chromium found; set ROTORLENS_BROWSER to a path'
@@ -3899,8 +4352,10 @@ test('sharing is asked once, shows what would leave, erases — and sends nothin
 
         for (let attempt = 0; attempt < 1800; attempt += 1) {
           if (!document.getElementById('since-panel').classList.contains('hidden')) {
-            // The dialog is raised at the very end of the same run that fills
-            // that panel, so give the tail of it a turn of the loop.
+            // The automatic prompt, when it existed, was raised at the very end
+            // of the same run that fills that panel. Give that tail a turn of
+            // the loop, so "not on screen" below means it did not come, rather
+            // than that it had not come YET.
             await new Promise(resolve => setTimeout(resolve, 200));
             return true;
           }
@@ -3953,7 +4408,23 @@ test('sharing is asked once, shows what would leave, erases — and sends nothin
             };
           });
 
-        // ---- the question ------------------------------------------------
+        // ---- not asked by itself ------------------------------------------
+        // A real flight has just been measured and found admissible (the
+        // before/after panel above is what the open waited for), the store is
+        // writable and nothing has been answered: every condition the old
+        // automatic prompt needed. It must still not be on screen.
+        const notAsked = {
+          shown: !$('consent').classList.contains('hidden'),
+          admissible: Boolean($('since-save')
+            || document.querySelector('#since [data-forget-flight]')),
+          mainInert: document.querySelector('main').inert,
+          panel: $('sharing').textContent.replace(/\\s+/g, ' ').trim(),
+          file: window.__shellSharing()
+        };
+
+        // ---- the question, from the panel's Share button -----------------
+        $('sharing-toggle').click();
+        await settle();
         const asked = {
           shown: !$('consent').classList.contains('hidden'),
           text: $('consent').textContent.replace(/\\s+/g, ' ').trim(),
@@ -4008,7 +4479,7 @@ test('sharing is asked once, shows what would leave, erases — and sends nothin
         await settle();
         const reconsider = {
           shown: !$('consent').classList.contains('hidden'),
-          text: $('consent').textContent.replace(/\s+/g, ' ').trim(),
+          text: $('consent').textContent.replace(/\\s+/g, ' ').trim(),
           file: window.__shellSharing(),
           fileBefore: fileBeforeReconsidering
         };
@@ -4036,33 +4507,11 @@ test('sharing is asked once, shows what would leave, erases — and sends nothin
           focus: document.activeElement?.id ?? null
         };
 
-        // ---- re-analyse: the question must not come back ------------------
-        //
-        // "Use the detected flight" rather than "Whole log", and the difference
-        // is the whole assertion. A hand-picked window is INADMISSIBLE — the
-        // engine refuses it with the same code a bench run gets — so the flight
-        // would produce no record, and the dialog is deliberately not raised
-        // when there is nothing to point at. Re-running with the detected window
-        // keeps the flight admissible, which leaves "it has already been asked"
-        // as the only thing standing between the pilot and a second dialog.
-        // That is what is under test; the admissible flag below proves it.
-        $('since-panel').classList.add('hidden');
-        $('window-detect').click();
-        let rerun = false;
-        for (let attempt = 0; attempt < 1800; attempt += 1) {
-          if (!$('since-panel').classList.contains('hidden')) {
-            await new Promise(resolve => setTimeout(resolve, 400));
-            rerun = true;
-            break;
-          }
-          await new Promise(resolve => setTimeout(resolve, 100));
-        }
-        const again = {
-          rerun,
-          consentShown: !$('consent').classList.contains('hidden'),
-          admissible: Boolean($('since-save')
-            || document.querySelector('#since [data-forget-flight]'))
-        };
+        // A re-analysis step used to stand here, checking the question did not
+        // come back after it had been answered. With the automatic prompt
+        // switched off it could only ever pass, and "not asked by itself" is
+        // already proven above over an admissible flight; it was removed rather
+        // than kept as a check that only looks like one.
 
         // ---- erase, behind the second tap --------------------------------
         const armed = {oneTap: null};
@@ -4085,8 +4534,8 @@ test('sharing is asked once, shows what would leave, erases — and sends nothin
         };
 
         return JSON.stringify({
-          asked, declined, off, preview, reconsider, reconsiderDeclined,
-          reconsiderAgain, on, again, armed, erased
+          notAsked, asked, declined, off, preview, reconsider, reconsiderDeclined,
+          reconsiderAgain, on, armed, erased
         });
       })()`,
       awaitPromise: true,
@@ -4108,7 +4557,7 @@ test('sharing is asked once, shows what would leave, erases — and sends nothin
         JSON.stringify(madeRequests)}`);
 
     // =====================================================================
-    // 1. asked after the app has done something, never at first run
+    // 1. never asked by itself — not at first run, and not after a flight
     // =====================================================================
     assert.equal(before.consentShown, false,
       'the consent dialog was on screen before a log had been opened. Asking before the app '
@@ -4116,8 +4565,25 @@ test('sharing is asked once, shows what would leave, erases — and sends nothin
     assert.equal(before.sharingFile, '',
       'a sharing file existed before anyone was asked anything; off by default must cost '
       + 'nothing on disk');
+    // The setup line first: the old prompt was only ever raised over an
+    // admissible flight, so "not shown" over an inadmissible one proves nothing.
+    assert.equal(run.notAsked.admissible, true,
+      'the real flight was not admissible, so the assertion below would hold for that reason '
+      + 'rather than because the automatic prompt is off');
+    assert.equal(run.notAsked.shown, false,
+      'the consent dialog appeared by itself after a real flight was measured. The owner turned '
+      + 'the automatic prompt off on 2 October 2026: its licence terms are an unreviewed draft');
+    assert.equal(run.notAsked.mainInert, false,
+      'the page was made inert behind a dialog nobody asked for');
+    assert.equal(run.notAsked.file, '',
+      'a sharing file was written although nobody pressed anything');
+    assert.match(run.notAsked.panel, /does not ask about sharing on its own/,
+      'the panel must not promise a question this build never asks');
+    assert.doesNotMatch(run.notAsked.panel, /will ask you once/,
+      'the panel still promises the automatic question');
+
     assert.equal(run.asked.shown, true,
-      'the consent dialog must appear once a real flight has actually been measured');
+      'the Share button on the sharing panel must open the complete consent dialog');
     assert.equal(run.asked.fileBefore, '',
       'nothing may be written while the question is still on screen and unanswered');
 
@@ -4180,18 +4646,6 @@ test('sharing is asked once, shows what would leave, erases — and sends nothin
       '"Not now" agreed to nothing, so there is no version of anything to record');
     assert.deepEqual(declinedFile.ids, {},
       'declining must not leave an identity behind');
-
-    assert.equal(run.again.rerun, true, 're-analysing the flight must actually re-run');
-    // Without this the assertion below cannot fail. The dialog is only ever
-    // raised over an admissible flight, so a re-run that produced an
-    // inadmissible one would report "not asked again" for the wrong reason and
-    // would have been a test agreeing with a bug it could not see.
-    assert.equal(run.again.admissible, true,
-      'the re-run must leave an admissible flight on screen, or the assertion below is '
-      + 'satisfied by the flight being refused rather than by the question having been asked');
-    assert.equal(run.again.consentShown, false,
-      'the consent dialog came back after being answered. It is asked ONCE; a dialog that '
-      + 'reappears is one people learn to tap through');
 
     // =====================================================================
     // The panel, in the state a pilot who declined is left in
@@ -4332,7 +4786,13 @@ test('sharing is asked once, shows what would leave, erases — and sends nothin
       'erasing the identity must switch sharing off; leaving it on would regenerate an '
       + 'identity on the next repaint, which is a control that undoes itself');
     assert.match(run.erased.panel, /Nothing about sharing is stored on this device/,
-      'and must say that nothing is left, including that the question will come back once');
+      'and must say that nothing is left');
+    // Since 2 October 2026 the question does NOT come back by itself, so the
+    // panel must not say it will.
+    assert.match(run.erased.panel, /does not ask about sharing on its own/,
+      'and must say what happens next, which is nothing unless the pilot asks');
+    assert.doesNotMatch(run.erased.panel, /will ask you once/,
+      'the panel promises an automatic question this build never asks');
 
     // =====================================================================
     // 6. a phone, not a desk

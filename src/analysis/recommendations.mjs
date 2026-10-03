@@ -94,8 +94,10 @@
 
 import {
   AXES,
+  CROSSINGS_PER_CYCLE,
   DIRECTIONS,
   EVIDENCE_LIMITS,
+  HOLD_READING_THRESHOLDS,
   buildDirectionalStopEvidence,
   buildHoldEvidence,
   interpretHoldEvidence,
@@ -376,6 +378,29 @@ export const AUTHORITY_LIMITS = Object.freeze({
    * from half the command) is the manoeuvre that separates them.
    */
   standingOffsetShareOfCommand: 0.35,
+
+  /**
+   * JUDGEMENT, and the floor under the ceiling above. Standing offset as a share
+   * of the commanded rate, in the SMALLER of the two directions, below which the
+   * offset cannot carry "raise P".
+   *
+   * ADDED 2 October 2026. REPRODUCED FAILURE: a healthy loop with a 25-40 ms lag
+   * and a 1% shortfall, stopped from 300-350 deg/s. Its tracking error is almost
+   * all offset (`offsetShare` 0.72-0.78), because there is so little error of
+   * any other kind, and 20 ms after centre it is still turning at about half the
+   * command, because that is what a lag does to a fast stop. Both P_TOO_LOW
+   * signatures, nothing wrong, and the engine said "Raise yaw P" with START HERE
+   * on it and all five gates passing. `offsetShare` is a share of the ERROR; the
+   * claim "it sat at a rate below the one asked for" is about the COMMAND, and
+   * only this number measures it. Raising tail P on a healthy tail risks a wag.
+   *
+   * Why 0.05: it is a twentieth of the rate asked for — about 15-17 deg/s on the
+   * stops above, far outside the 1% the reproduction carried — and one gain step
+   * from K = 19 (where 1/(1+K) is 0.05) moves it by under a percent of the
+   * command, so below it a P step cannot be expected to change anything a pilot
+   * can see. The audit proposed it; no real log has tested it.
+   */
+  standingOffsetShareOfCommandFloor: 0.05,
 
   /**
    * DERIVED, and the reason is arithmetic rather than empirical. An integrator
@@ -1226,16 +1251,30 @@ function rangeOf(values) {
  * `bandRmsDps` and `harmonicMatch` come straight from the spectrum analyser;
  * nothing is recomputed here. The persistence floor is what keeps a single
  * noisy window out of a sentence a pilot will read.
+ *
+ * An attention-eligible peak is admitted whatever its persistence ratio. The
+ * analyser only grants that status to a peak sustained across most of the
+ * range, and since 2 October 2026 a main-rotor tone at that level no longer
+ * blocks the airframe rung — so the tone-coincidence rule is what stands between
+ * it and a gain change, and it must be able to see it.
+ *
+ * `rotorCompared` is whether THIS peak was tested against a rotor speed: the
+ * comparison of the stretch it was measured in, when the window was measured in
+ * stretches, and of the whole result otherwise. A peak from a stretch whose head
+ * speed was steady was genuinely compared, whatever the stretch beside it did,
+ * and "matches no rotor order" is then a measurement rather than a guess.
  */
-function tonesOf(entry, toneLimits) {
+function tonesOf(entry, toneLimits, correlation) {
   const out = [];
   for (const peak of entry?.peaks ?? []) {
     if (!Number.isFinite(peak?.frequencyHz)) {
       continue;
     }
-    if ((peak?.persistenceRatio ?? 0) < toneLimits.persistenceRatioFloor) {
+    if (peak?.attentionEligible !== true
+        && (peak?.persistenceRatio ?? 0) < toneLimits.persistenceRatioFloor) {
       continue;
     }
+    const comparison = peak.chunkHarmonicCorrelation ?? correlation ?? null;
     out.push(frozen({
       axis: entry?.axis ?? null,
       frequencyHz: peak.frequencyHz,
@@ -1244,10 +1283,58 @@ function tonesOf(entry, toneLimits) {
       persistenceRatio: peak.persistenceRatio ?? null,
       attentionEligible: peak.attentionEligible === true,
       rotor: peak.harmonicMatch?.rotor ?? null,
-      order: peak.harmonicMatch?.order ?? null
+      order: peak.harmonicMatch?.order ?? null,
+      rotorCompared: peak.harmonicMatch ? true : comparison?.state === 'evaluated',
+      chunkRangeUs: Array.isArray(peak.chunkRangeUs) ? frozen([...peak.chunkRangeUs]) : null
     }));
   }
   return out;
+}
+
+/**
+ * One entry per tone, at its worst, however many stretches it was measured in.
+ *
+ * A window measured in stretches lists the same tone once per stretch. A tone
+ * matched to a rotor order is the same tone on the same axis at the same order;
+ * an unmatched one is the same tone when it sits within its own bandwidth, or
+ * 2.5% — the analyser's own matching tolerance — of another on that axis. The
+ * loudest copy speaks for it, carrying the stretch it was loudest in and how
+ * many stretches it was seen in.
+ */
+function distinctTones(tones) {
+  const kept = [];
+  for (const tone of tones) {
+    // Only copies from DIFFERENT stretches are one tone. Two peaks the analyser
+    // listed separately within one analysis stay two.
+    const stretch = Array.isArray(tone.chunkRangeUs) ? tone.chunkRangeUs[0] : null;
+    const same = stretch === null ? null : kept.find(entry => entry.axis === tone.axis
+      && !entry.stretches.includes(stretch)
+      && (tone.rotor !== null
+        ? entry.rotor === tone.rotor && entry.order === tone.order
+        : entry.rotor === null && Math.abs(entry.frequencyHz - tone.frequencyHz)
+          <= Math.max(entry.bandwidthHz ?? 0,
+            0.025 * Math.min(entry.frequencyHz, tone.frequencyHz))));
+    if (!same) {
+      kept.push({...tone, stretches: stretch === null ? [] : [stretch]});
+      continue;
+    }
+    const stretches = [...same.stretches, stretch];
+    if ((tone.bandRmsDps ?? -Infinity) > (same.bandRmsDps ?? -Infinity)) {
+      Object.assign(same, tone);
+    }
+    same.stretches = stretches;
+  }
+  return kept.map(({stretches, ...entry}) => frozen({...entry, stretchCount: stretches.length}));
+}
+
+/** " (worst in the stretch 150.0–300.0 s into the range)", or nothing. */
+function stretchNote(tone, rangeStartUs, worst = true) {
+  if (!Array.isArray(tone?.chunkRangeUs) || !Number.isFinite(rangeStartUs)) {
+    return '';
+  }
+  const from = round((tone.chunkRangeUs[0] - rangeStartUs) / 1e6, 1).toFixed(1);
+  const to = round((tone.chunkRangeUs[1] - rangeStartUs) / 1e6, 1).toFixed(1);
+  return ` (${worst ? 'worst in' : 'in'} the stretch ${from}–${to} s into the range)`;
 }
 
 /**
@@ -1413,7 +1500,7 @@ export function assessAirframe(mechanical, options = {}) {
        * mentioned. Carrying it here is what lets the finding layer say what was
        * actually seen instead of "a positive measurement of absence".
        */
-      tones: frozen(tonesOf(entry, toneLimits))
+      tones: frozen(tonesOf(entry, toneLimits, mechanical?.harmonicCorrelation ?? null))
     }));
   }
 
@@ -1464,17 +1551,41 @@ export function assessAirframe(mechanical, options = {}) {
     elevatedAxes: frozen(elevated),
     /** Measured, named, and below the attention level. Not a blocker. */
     subThresholdTones: frozen(subThresholdTones),
-    observations: frozen(subThresholdTones.length > 0
-      ? ['PERSISTENT_TONE_BELOW_ATTENTION_THRESHOLD'] : [])
+    /**
+     * Main-rotor 1/rev and 2/rev above the experimental attention level, when
+     * they are ALL that is above it. Not a blocker either, by owner decision of
+     * 2 October 2026; see `rotorOrderToneAssessment` in the gates module.
+     */
+    rotorOrderTones: upstream.measured?.rotorOrderTonesOnly === true
+      ? upstream.measured.rotorOrderTones : frozen([]),
+    /**
+     * The same tones, when they are all that is above the level but one of them
+     * is past the severity ceiling. A blocker, not an observation.
+     */
+    rotorOrderTonesLarge: upstream.measured?.rotorOrderTonesLarge ?? frozen([]),
+    rotorOrderToneCeilingDps: upstream.measured?.rotorOrderToneCeilingDps ?? null,
+    /** Why the rotor-order rule did not apply, when it was asked. */
+    rotorOrderRefusal: upstream.measured?.rotorOrderRefusal ?? null,
+    observations: frozen([
+      ...(upstream.observations ?? []),
+      ...(subThresholdTones.length > 0 ? ['PERSISTENT_TONE_BELOW_ATTENTION_THRESHOLD'] : [])
+    ])
   });
+}
+
+/** "once-per-rev", "twice-per-rev", "3 times-per-rev" */
+function perRev(order) {
+  if (order === 1) {
+    return 'once-per-rev';
+  }
+  return order === 2 ? 'twice-per-rev' : `${order} times-per-rev`;
 }
 
 /** "29.3 Hz on roll, the main rotor's once-per-rev, at 4.6 deg/s" */
 function describeTone(tone) {
   const where = tone.axis ? ` on ${tone.axis}` : '';
   const order = tone.rotor && Number.isFinite(tone.order)
-    ? `, which is the ${tone.rotor} rotor's ${tone.order === 1 ? 'once' : tone.order + ' times'}`
-      + '-per-rev'
+    ? `, which is the ${tone.rotor} rotor's ${perRev(tone.order)}`
     : '';
   const size = Number.isFinite(tone.bandRmsDps) ? `, at ${round(tone.bandRmsDps, 1)} deg/s` : '';
   return `${round(tone.frequencyHz, 1)} Hz${where}${order}${size}`;
@@ -1578,22 +1689,46 @@ export function assessHeadspeed(records, options = {}) {
 
   // How many steady segments the head speed cost this flight, summed across the
   // axes the caller measured. This IS at hold scale, so the 5% limit applies.
-  const rejections = options.holdRejections ?? {};
-  let headspeedRejected = 0;
-  let totalRejected = 0;
-  for (const counts of Object.values(rejections)) {
-    for (const [code, count] of Object.entries(counts ?? {})) {
-      totalRejected += count;
-      if (code === 'HOLD_HEADSPEED_UNSTABLE' || code === 'HOLD_HEADSPEED_INVALID') {
-        headspeedRejected += count;
-      }
-    }
-  }
-  const headspeedCostShare = totalRejected === 0 ? null : headspeedRejected / totalRejected;
-  if (headspeedRejected > 0 && headspeedCostShare >= 0.5) {
-    // Most of what this flight lost, it lost to the rotor speed moving during
-    // otherwise steady flight. That is the governor, at the scale the 5% limit
-    // was derived for, and it is a finding rather than a discarded reason code.
+  //
+  // CORRECTED 2 October 2026, in three ways, after one NaN from an RPM sensor
+  // blocked every gain on every axis and told the pilot his governor wandered:
+  //
+  //   1. The share is over every segment the engine EVALUATED — the holds it
+  //      measured as well as the ones it refused. It used to be over the
+  //      refusals alone, so three good holds and one refused read 1/1, "most".
+  //   2. Only HOLD_HEADSPEED_UNSTABLE is the head speed moving. HOLD_HEADSPEED_
+  //      INVALID is a reading that was missing or impossible — a sensor that lost
+  //      its signal, a logging dropout — and says nothing about the governor. It
+  //      is counted and reported on its own, never as movement.
+  //   3. One segment is not "most" of anything. At least `minimumHolds` must have
+  //      been evaluated: the same count the I term needs before it is read.
+  //
+  // CORRECTED AGAIN the same day, after review, in two more ways:
+  //
+  //   4. A segment is a PHYSICAL stretch of steady flight, counted once. The app
+  //      analyses roll, pitch and yaw over the same records, and a still hover is
+  //      a hold on all three, so one hover with the head speed moving read "3 of
+  //      the 3 steady segments" — the minimum above defeated in the app's own
+  //      shape, and the same flight read differently when the app had memory for
+  //      only one axis. Given `holdWindows`, the windows of every axis are merged
+  //      where they overlap and each merged stretch is one segment.
+  //   5. Only a segment whose head speed was actually READ counts towards the
+  //      share and the minimum. `measureHold` checks the sample gap, the window
+  //      and the other axes' input before it ever looks at the head speed, so a
+  //      segment refused for off-axis input says nothing about the governor and
+  //      used to be counted as if it had held.
+  const segments = countHeadspeedSegments(options);
+  const headspeedMoved = segments.moved;
+  const headspeedReadingLost = segments.readingLost;
+  const totalRejected = segments.unused;
+  const totalAccepted = segments.accepted;
+  const evaluated = segments.read;
+  const headspeedCostShare = evaluated === 0 ? null : headspeedMoved / evaluated;
+  if (headspeedMoved > 0 && evaluated >= limits.minimumHolds && headspeedCostShare >= 0.5) {
+    // At least half of the steady segments this flight had, it lost to the
+    // rotor speed moving during otherwise steady flight. That is the governor,
+    // at the scale the 5% limit was derived for, and it is a finding rather
+    // than a discarded reason code.
     codes.push('HEADSPEED_COST_THIS_FLIGHT_ITS_HOLDS');
   }
 
@@ -1615,11 +1750,129 @@ export function assessHeadspeed(records, options = {}) {
         + 'Includes the spool-up when the recording starts before the rotor does, and is '
         + 'published rather than gated on for exactly that reason; '
         + 'afterSpoolUpSpreadRatio is the same figure with the arrival cut off.',
-      holdsRejectedForHeadspeed: headspeedRejected,
+      // Every count below is of steady SEGMENTS — physical stretches of steady
+      // flight, once each however many axes saw them — when the caller passed
+      // `holdWindows`, as buildRecommendations does. See `segmentCounting`.
+      /**
+       * Segments LOST to the head speed moving: HOLD_HEADSPEED_UNSTABLE on some
+       * axis, and no hold measured anywhere in the segment. The share is over these.
+       */
+      holdsRejectedForHeadspeed: headspeedMoved,
+      /**
+       * Segments in which the head speed moved across one axis's hold while
+       * another axis measured a hold over a stretch where it held. Not in the
+       * count above, and not in the share. Null when the windows were not given.
+       */
+      holdsMovedWithAHoldUsedInside: segments.movedWithAHoldUsed,
+      /** Segments in which the reading was missing or impossible (HOLD_HEADSPEED_INVALID). */
+      holdsRejectedForHeadspeedReading: headspeedReadingLost,
+      /** Segments whose head speed was examined and that no axis measured. */
       holdsRejectedTotal: totalRejected,
-      headspeedShareOfRejections: round(headspeedCostShare, 4)
+      /** Segments that at least one axis measured. */
+      holdsAccepted: totalAccepted,
+      /** Segments whose head speed was READ: the share and the minimum are over these. */
+      holdsEvaluated: evaluated,
+      minimumHoldsEvaluated: limits.minimumHolds,
+      headspeedShareOfEvaluatedHolds: round(headspeedCostShare, 4),
+      segmentCounting: segments.counting
     })
   });
+}
+
+/**
+ * Hold refusals that were reached only after the head speed had been read
+ * across the window, in `measureHold`'s order. Anything refused earlier — too
+ * short, a sample gap, the other axes moving — never had its head speed looked
+ * at, and says nothing about the governor.
+ */
+const HEAD_SPEED_READ_OUTCOMES = Object.freeze(new Set([
+  'accepted', 'HOLD_HEADSPEED_UNSTABLE', 'HOLD_BATTERY_UNSTABLE'
+]));
+const HEAD_SPEED_EXAMINED_OUTCOMES = Object.freeze(new Set([
+  ...HEAD_SPEED_READ_OUTCOMES, 'HOLD_HEADSPEED_INVALID'
+]));
+
+/**
+ * Steady segments for the governor rung, counted once each.
+ *
+ * With `holdWindows` — `{axis, startTimeUs, endTimeUs, outcome}`, outcome being
+ * 'accepted' or the refusal code — every window whose head speed was examined is
+ * merged with any other it overlaps, on any axis, and each merged stretch is one
+ * segment: it MOVED if the head speed moved across any window in it, its reading
+ * was LOST if any window in it had an impossible sample, and it was READ if some
+ * window in it read the head speed all the way through. A window refused before
+ * the head speed was examined (off-axis input, a sample gap) is left out of the
+ * merge, so it can neither glue two hovers into one nor count as a hover held.
+ *
+ * Without windows — the older call shape, counts per axis — the axes cannot be
+ * matched up, so each category is the LARGEST any one axis saw: a lower bound on
+ * the physical count, which can only make the two-segment minimum harder to
+ * meet, never easier.
+ */
+function countHeadspeedSegments(options) {
+  if (Array.isArray(options.holdWindows)) {
+    const windows = options.holdWindows
+      .filter(window => HEAD_SPEED_EXAMINED_OUTCOMES.has(window?.outcome)
+        && Number.isFinite(window.startTimeUs) && Number.isFinite(window.endTimeUs))
+      .sort((left, right) => left.startTimeUs - right.startTimeUs);
+    const merged = [];
+    for (const window of windows) {
+      const last = merged[merged.length - 1];
+      if (last && window.startTimeUs <= last.endTimeUs) {
+        last.endTimeUs = Math.max(last.endTimeUs, window.endTimeUs);
+        last.outcomes.add(window.outcome);
+      } else {
+        merged.push({
+          startTimeUs: window.startTimeUs,
+          endTimeUs: window.endTimeUs,
+          outcomes: new Set([window.outcome])
+        });
+      }
+    }
+    const count = test => merged.filter(segment => test(segment.outcomes)).length;
+    return {
+      counting: 'physical',
+      // LOST to head speed: it moved, and no axis measured a hold anywhere in the
+      // segment (review of 3 October 2026). This is the count the governor share
+      // is taken over. A segment in which one axis was refused for head speed
+      // while another measured a hold at a steady head speed was not lost — the
+      // hold was used — and counting it here once blocked every gain on a flight
+      // of two such hovers, "2 of the 2", while both had given a measurement.
+      moved: count(outcomes => outcomes.has('HOLD_HEADSPEED_UNSTABLE')
+        && !outcomes.has('accepted')),
+      // A segment can be both (round three): one axis's hold moved with the head
+      // speed and was refused, another axis's hold inside the same stretch held
+      // its head speed all the way through and was measured. Reported on its
+      // own, never in the share.
+      movedWithAHoldUsed: count(outcomes => outcomes.has('HOLD_HEADSPEED_UNSTABLE')
+        && outcomes.has('accepted')),
+      readingLost: count(outcomes => outcomes.has('HOLD_HEADSPEED_INVALID')),
+      accepted: count(outcomes => outcomes.has('accepted')),
+      unused: count(outcomes => !outcomes.has('accepted')),
+      read: count(outcomes => [...outcomes].some(outcome => HEAD_SPEED_READ_OUTCOMES.has(outcome)))
+    };
+  }
+
+  const largest = {moved: 0, readingLost: 0, accepted: 0, unused: 0, read: 0};
+  const axes = new Set([
+    ...Object.keys(options.holdRejections ?? {}),
+    ...Object.keys(options.acceptedHolds ?? {})
+  ]);
+  const positive = value => (Number.isFinite(value) && value > 0 ? value : 0);
+  for (const axis of axes) {
+    const refused = options.holdRejections?.[axis] ?? {};
+    const moved = positive(refused.HOLD_HEADSPEED_UNSTABLE);
+    const lost = positive(refused.HOLD_HEADSPEED_INVALID);
+    const battery = positive(refused.HOLD_BATTERY_UNSTABLE);
+    const accepted = positive(options.acceptedHolds?.[axis]);
+    largest.moved = Math.max(largest.moved, moved);
+    largest.readingLost = Math.max(largest.readingLost, lost);
+    largest.accepted = Math.max(largest.accepted, accepted);
+    largest.unused = Math.max(largest.unused, moved + lost + battery);
+    largest.read = Math.max(largest.read, accepted + moved + battery);
+  }
+  // Counts per axis cannot be matched up, so whether a segment was both is unknown.
+  return {counting: 'largest-axis', ...largest, movedWithAHoldUsed: null};
 }
 
 /* ------------------------------------------------------------ the hold assessment */
@@ -1677,7 +1930,14 @@ export function assessHoldIndication(records, axis, options = {}) {
       // aircraft, but because one of them was too blunt to look. With it, the
       // grid still catches the case the gate exists for: the reference log's
       // pitch verdict, which flips between `hold` and `decrease` across filter
-      // lengths that can ALL see its 2.59 Hz crossing rate.
+      // lengths that can ALL see its 2.59-a-second crossing rate.
+      //
+      // The corner is a FREQUENCY and the crossing rate counts half-cycles, so
+      // the rate is halved before the two are compared (2 October 2026). Before
+      // that, a 0.8 Hz hunt — 1.6 crossings a second — was abstained on by the
+      // 300 ms filter, whose corner is 1.48 Hz and which sees it plainly; and
+      // the reference pitch's 2.59 crossings, a 1.3 Hz oscillation, was abstained
+      // on at 222 and 300 ms. Not re-measured on the reference log since.
       //
       // Applied ONLY when the shipped reading was "the I term is causing an
       // oscillation", because that is the only reading whose evidence IS the
@@ -1690,7 +1950,7 @@ export function assessHoldIndication(records, axis, options = {}) {
       const observableTopHz = 0.443 / (huntingSmoothingUs / 1_000_000);
       if (shipped.indication === 'decrease'
           && Number.isFinite(observedCrossingRateHz)
-          && observedCrossingRateHz > observableTopHz) {
+          && observedCrossingRateHz / CROSSINGS_PER_CYCLE > observableTopHz) {
         abstained += 1;
         continue;
       }
@@ -2164,6 +2424,11 @@ export function buildRecommendations(input = {}) {
   /* -------- hold evidence first, because the governor rung reads its refusals */
   const holds = {};
   const holdRejections = {};
+  // The holds that WERE measured, so the governor rung can judge what share of
+  // the flight's steady segments the head speed cost — not what share of its
+  // refusals.
+  const acceptedHolds = {};
+  const holdWindows = [];
   if (!options.skipHolds) {
     for (const axis of AXES) {
       if (!axes[axis]) {
@@ -2173,6 +2438,16 @@ export function buildRecommendations(input = {}) {
         axes[axis].records ?? anyRecords, axis, options.holdOptions
       );
       holdRejections[axis] = holds[axis].evidence.rejectedHoldCounts;
+      acceptedHolds[axis] = holds[axis].evidence.holds?.length ?? 0;
+      // Where each of them was, so one hover seen by three axes is one segment.
+      for (const window of holds[axis].evidence.holds ?? []) {
+        holdWindows.push({axis, startTimeUs: window.startTimeUs, endTimeUs: window.endTimeUs,
+          outcome: 'accepted'});
+      }
+      for (const window of holds[axis].evidence.rejectedHolds ?? []) {
+        holdWindows.push({axis, startTimeUs: window.startTimeUs, endTimeUs: window.endTimeUs,
+          outcome: window.reason});
+      }
     }
   }
 
@@ -2192,7 +2467,8 @@ export function buildRecommendations(input = {}) {
   findings.push(...airframeFindings(airframe, mechanical));
 
   /* -------- rung: headspeed */
-  const headspeed = assessHeadspeed(anyRecords, {...options, holdRejections});
+  const headspeed = assessHeadspeed(anyRecords,
+    {...options, holdRejections, acceptedHolds, holdWindows});
   findings.push(...headspeedFindings(headspeed));
 
   /* -------- per axis */
@@ -2275,6 +2551,405 @@ export function buildRecommendations(input = {}) {
 
 /* ------------------------------------------------------------ rung: airframe */
 
+/**
+ * Why a vibration check could not measure, in the order a pilot can act on it.
+ *
+ * The first code present wins. Codes that mean "this stretch was too long" come
+ * last: the whole-window analysis splits a long flight, so on the app's own path
+ * they should not occur, and if one does it is the least informative reason.
+ */
+const NOT_MEASURED_REASONS = Object.freeze([
+  {
+    codes: ['GYRO_FIELDS_MISSING'],
+    phrase: 'the log carries no gyro column for at least one axis',
+    confirm: 'Turn gyro logging on in the Blackbox field set — gyroRAW or gyroUnfilt — and '
+      + 'fly the same manoeuvres again.'
+  },
+  {
+    codes: ['SAMPLE_RATE_UNAVAILABLE'],
+    phrase: 'its sample rate could not be established, or is under the 50 samples a second '
+      + 'a vibration measurement needs',
+    confirm: 'Log at a higher Blackbox rate — a vibration measurement wants hundreds of '
+      + 'samples a second — and fly the same manoeuvres again.'
+  },
+  {
+    codes: ['SAMPLE_RATE_LIMIT_EXCEEDED'],
+    phrase: 'its sample rate is above the 8 kHz the analysis accepts',
+    confirm: 'Log at a Blackbox rate of 8 kHz or less and fly the same manoeuvres again.'
+  },
+  {
+    codes: ['NON_MONOTONIC_TIMESTAMPS'],
+    phrase: 'its timestamps go backwards',
+    confirm: 'A log whose clock runs backwards cannot be transformed. Fly again and measure '
+      + 'the new log.'
+  },
+  {
+    codes: ['TIMING_GAPS_EXCESSIVE'],
+    phrase: 'the log has gaps in its sampling too large to measure across, which is usually '
+      + 'the logging storage falling behind',
+    confirm: 'Fly again with a lower Blackbox logging rate, or faster logging storage, and '
+      + 'measure that log.'
+  },
+  {
+    codes: ['INSUFFICIENT_TIMESTAMPED_SAMPLES'],
+    phrase: 'it is too short, with too few samples to measure',
+    confirm: 'Measure a longer stretch of steady flight — tens of seconds, not a moment.'
+  },
+  {
+    codes: [
+      'INSUFFICIENT_CONTIGUOUS_GYRO_DATA', 'VALID_WINDOW_COVERAGE_INSUFFICIENT',
+      'FINITE_GYRO_SAMPLE_COVERAGE_INSUFFICIENT', 'FINITE_GYRO_TIME_SPAN_COVERAGE_INSUFFICIENT',
+      'SELECTED_TIMESTAMP_SPAN_COVERAGE_INSUFFICIENT', 'GYRO_COVERAGE_INSUFFICIENT'
+    ],
+    phrase: 'too little of it carries continuous gyro data',
+    confirm: 'Measure a stretch of flight where the gyro is logged without dropouts.'
+  },
+  {
+    codes: [
+      'SELECTION_SAMPLE_LIMIT_EXCEEDED', 'SELECTION_DURATION_LIMIT_EXCEEDED',
+      'RESAMPLED_SAMPLE_LIMIT_EXCEEDED'
+    ],
+    phrase: 'a stretch of it is longer than one vibration analysis accepts',
+    confirm: 'Measure a shorter stretch of the flight.'
+  }
+]);
+
+function notMeasuredBecause(reasonCodes) {
+  const known = NOT_MEASURED_REASONS.flatMap(entry => entry.codes);
+  const codes = (reasonCodes ?? []).filter(code => known.includes(code));
+  const entry = NOT_MEASURED_REASONS.find(candidate =>
+    candidate.codes.some(code => codes.includes(code)));
+  return entry
+    ? {phrase: entry.phrase, confirm: entry.confirm, codes}
+    : {
+      phrase: 'it did not produce a measurement on every axis',
+      confirm: 'Measure a stretch of steady flight with unfiltered gyro logged throughout.',
+      codes
+    };
+}
+
+/** Why the rotor was not compared, worded from the measured reason. */
+const ROTOR_NOT_COMPARED_WORDING = Object.freeze({
+  NOT_EVALUATED: {
+    why: 'the vibration check could not measure this range, so it never got as far as '
+      + 'reading the rotor speed',
+    detail: 'This follows from the measurement that failed above; it is not a second fault. '
+      + 'Once the vibration check can measure the range, the rotor comparison runs with it.',
+    confirm: 'Nothing separate to fly for this: it clears when the vibration check can measure '
+      + 'the range.'
+  },
+  FIELD_MISSING: {
+    why: 'this log does not record head speed',
+    detail: 'Matching a tone to a rotor order needs the speed the rotor turned at, and without '
+      + 'a head-speed column there is nothing to match against.',
+    confirm: 'Add head speed to the Blackbox field set, make sure the RPM sensor reads, and '
+      + 'fly again.'
+  },
+  NO_VALID_RPM_IN_RANGE: {
+    why: 'there is no usable rotor speed in the head-speed column across it',
+    detail: 'The column is in the log, but every reading in this range is zero or impossible — '
+      + 'the rotor was not turning, or the RPM sensor was not reading.',
+    confirm: 'Check that the RPM sensor reads in flight, and measure a range where the rotor is '
+      + 'up to speed.'
+  },
+  INSUFFICIENT_COVERAGE: {
+    why: 'head speed was recorded for too little of it',
+    detail: 'Most of the range has to carry a usable head-speed reading before a tone can be '
+      + 'matched to a rotor order, and this one did not.',
+    confirm: 'Measure a range where head speed is logged throughout, and check the RPM sensor '
+      + 'if it drops out.'
+  },
+  RPM_OUT_OF_RANGE: {
+    why: 'the head-speed readings across it are outside what the comparison accepts',
+    detail: 'A median head speed under 100 rpm or over 50,000 rpm is not a rotor turning at '
+      + 'flight speed.',
+    confirm: 'Check how the RPM sensor is set up, and fly again.'
+  },
+  RPM_UNSTABLE_IN_SELECTION: {
+    why: 'the head speed moved too much across it',
+    detail: 'The head speed has to be steady across the range before a peak can be matched to '
+      + 'a rotor order, and on this range it was not — usually because the spool-up is inside '
+      + 'the selection.',
+    confirm: 'Select a range after the spool-up and before the descent, where the head speed '
+      + 'is steady, and run the vibration check on that.'
+  },
+  default: {
+    why: 'no head speed across it was usable for the comparison',
+    detail: 'Without a usable rotor speed, no tone can be matched to a rotor order.',
+    confirm: 'Measure a range where head speed is logged and steady.'
+  }
+});
+
+/**
+ * The same reasons, said about the part of a window that was NOT compared, when
+ * other stretches of it were. The reason is the combined one the analyser
+ * publishes, which names the measured cause before "not read".
+ */
+const ROTOR_NOT_COMPARED_REST = Object.freeze({
+  NOT_EVALUATED: 'the vibration check could not measure it, so its rotor speed was never read',
+  FIELD_MISSING: 'no head speed was recorded',
+  NO_VALID_RPM_IN_RANGE: 'there is no usable rotor speed in the head-speed column',
+  INSUFFICIENT_COVERAGE: 'head speed was recorded for too little of it',
+  RPM_OUT_OF_RANGE: 'the head-speed readings are outside what the comparison accepts',
+  RPM_UNSTABLE_IN_SELECTION: 'the head speed moved too much',
+  default: 'no head speed was usable for the comparison'
+});
+
+/**
+ * Why the rest of the advice can be read over a range whose rotor-order tones
+ * all ARE the main rotor's, but the rule still did not apply — worded from the
+ * refusal the gate measured rather than from a list of possibilities.
+ */
+const ROTOR_ORDER_REFUSAL_WORDING = Object.freeze({
+  STRETCH_NOT_MEASURED: 'part of the range could not be measured',
+  ROTOR_NOT_COMPARED: 'the rotor speed could not be compared against the vibration across all '
+    + 'of the range',
+  REASON_CODE_OUTSIDE_ALLOW_LIST: 'the vibration check flagged something else about the range '
+    + 'as well',
+  AXIS_NOT_MEASURED_ON_UNFILTERED_GYRO: 'not every axis was measured on unfiltered gyro',
+  ATTENTION_PEAK_LIST_INCOMPLETE: 'the spectrum held attention-level peaks too close together '
+    + 'to list separately, so not every one of them could be checked against the rotor',
+  TONE_SIZE_NOT_MEASURED: 'the size of one of the tones was not measured',
+  ATTENTION_THRESHOLD_UNKNOWN: 'the attention level it was judged against did not come with '
+    + 'the result'
+});
+
+/** What makes measured vibration "unexplained", from the tones that carried it. */
+function unexplainedBecause(attentionTones, airframe) {
+  const parts = [];
+  // Per tone, not per range: in a window measured in stretches a tone from a
+  // stretch whose head speed was steady WAS compared, whatever the next one did.
+  if (attentionTones.some(tone => tone.rotor === null && tone.rotorCompared)) {
+    parts.push('a tone that matches no rotor order');
+  }
+  if (attentionTones.some(tone => tone.rotor === null && !tone.rotorCompared)) {
+    parts.push('a tone that could not be compared against the rotor at all');
+  }
+  if (attentionTones.some(tone => tone.rotor === 'tail')) {
+    parts.push('a tone on the tail rotor');
+  }
+  if (attentionTones.some(tone => tone.rotor === 'main' && tone.order > 2)) {
+    parts.push('a higher order of the main rotor than once or twice per rev');
+  }
+  if (parts.length > 0) {
+    return `Above the attention level it carries ${parts.join(', and ')}.`;
+  }
+  if (attentionTones.length > 0) {
+    const why = ROTOR_ORDER_REFUSAL_WORDING[airframe.rotorOrderRefusal]
+      ?? 'the rest of the check did not hold';
+    return 'What it measured lines up with the main rotor\'s once- or twice-per-rev, but '
+      + `${why}, so "only the rotor" is not established.`;
+  }
+  return 'The vibration check reported attention-level vibration it did not attribute to the main '
+    + 'rotor\'s once- or twice-per-rev.';
+}
+
+/**
+ * The strongest tone, judged — as the ceiling is — on its size WHILE PRESENT,
+ * and that size over the published level. Round 3 of the 2 October 2026 review:
+ * the flight average a tone present part of the time is pulled down by its quiet
+ * stretches, so a card about a tone "above the level" could state "0.6 times" it.
+ * The size while present is at least the level by construction, so the ratio
+ * here never reads under one.
+ */
+function toneAgainstLevel(airframe, tones) {
+  const sorted = [...tones].sort((left, right) =>
+    (right.aboveLevelBandRmsDps ?? 0) - (left.aboveLevelBandRmsDps ?? 0));
+  const strongest = sorted[0];
+  const threshold = airframe.attentionThresholdDps;
+  const ratio = Number.isFinite(threshold) && threshold > 0
+    && Number.isFinite(strongest.aboveLevelBandRmsDps)
+    ? round(strongest.aboveLevelBandRmsDps / threshold, 1) : null;
+  return {sorted, strongest, ratio};
+}
+
+/** "13.6 deg/s on roll at 1800 rpm", the tone's size while present. */
+function toneSize(tone) {
+  return `${round(tone.aboveLevelBandRmsDps, 1)} deg/s on ${tone.axis}`
+    + (Number.isFinite(tone.headspeedRpm) ? ` at ${tone.headspeedRpm} rpm` : '');
+}
+
+/** What a tone's share and average are OF: the range, or the stretch it was worst in. */
+function toneScope(tone) {
+  if (!Array.isArray(tone.chunkRangeUs)) {
+    return 'the range';
+  }
+  return (tone.chunkRangesUs ?? []).length > 1
+    ? 'the stretch it was worst in' : 'the stretch it was measured in';
+}
+
+/**
+ * "it was above it for 32% of the range, and averaged 14.9 deg/s over all of it"
+ * — how long the strongest tone was there, and the flight average its size while
+ * present is NOT, stated beside it so neither is mistaken for the other.
+ */
+function tonePresence(tone, aboveIt) {
+  const share = Number.isFinite(tone.aboveLevelShare)
+    ? Math.round(tone.aboveLevelShare * 100) : null;
+  const average = Number.isFinite(tone.bandRmsDps) ? round(tone.bandRmsDps, 1) : null;
+  if (share === null || average === null) {
+    return '';
+  }
+  return `; it was above ${aboveIt} for ${share}% of ${toneScope(tone)}, and averaged ${average} `
+    + 'deg/s over all of it';
+}
+
+/** One basis row per distinct tone, its size while present, naming the stretch it was worst in. */
+function rotorToneBasis(tones, rangeStartUs, suffix = '') {
+  return tones.slice(0, 6).map(tone => basisEntry(
+    `${tone.axis}: main rotor ${perRev(tone.order)}, band RMS while above the attention level`
+      + suffix + stretchNote(tone, rangeStartUs, (tone.chunkRangesUs ?? []).length > 1),
+    round(tone.aboveLevelBandRmsDps, 3), 'deg/s',
+    `RMS over the analysis windows in which the spectrum peak at ${round(tone.frequencyHz, 1)} Hz `
+    + `reached the attention level; matched to main-rotor order ${tone.order}`
+    + `${Number.isFinite(tone.headspeedRpm) ? ` at ${tone.headspeedRpm} rpm` : ''}`
+  ));
+}
+
+/** The strongest tone's share of the range above the level, and its average over all of it. */
+function strongestToneBasis(tone) {
+  const scope = toneScope(tone) === 'the range' ? 'the range' : 'its stretch';
+  return [
+    basisEntry(`strongest tone, share of ${scope} above the attention level`,
+      Number.isFinite(tone.aboveLevelShare) ? Math.round(tone.aboveLevelShare * 100) : null, '%',
+      'analysis windows in which its band reached the attention level'),
+    basisEntry(`strongest tone, band RMS averaged over all of ${scope}`,
+      Number.isFinite(tone.bandRmsDps) ? round(tone.bandRmsDps, 3) : null, 'deg/s',
+      'Welch average over every analysis window, the windows it was absent from included')
+  ];
+}
+
+/**
+ * Main-rotor 1/rev and 2/rev above the experimental level, said as a measurement.
+ *
+ * OWNER DECISION, 2 October 2026. The 8 deg/s level is calibrated on synthetic
+ * signals and is crossed on 32 of 33 real flights, mostly by exactly these tones.
+ * So when they are all that crosses it, this rung reports them — axis, order,
+ * size, head speed, and the threshold with its basis — at low confidence, and
+ * does not hold the rest of the advice back on their account. It is an
+ * observation, never a blocker and never the first thing to act on.
+ *
+ * Emitted ONLY when the airframe rung is otherwise permitted. Beside another
+ * airframe blocker, "this does not hold the rest back" would be false, so the
+ * tones go into that blocker's basis instead. And it states the size and the
+ * ratio as numbers: an earlier plain-English line called every such tone "a
+ * little above" the level, whatever it measured.
+ */
+function rotorOrderToneFinding(airframe, basis) {
+  const {sorted: tones, strongest, ratio} = toneAgainstLevel(airframe, airframe.rotorOrderTones);
+  const others = tones.length - 1;
+  const orders = [...new Set(tones.map(tone => tone.order))].sort();
+  const threshold = Number.isFinite(airframe.attentionThresholdDps)
+    ? `${airframe.attentionThresholdDps} deg/s` : 'attention';
+  const rangeStartUs = airframe.upstream.measured?.rangeStartTimeUs ?? null;
+  return makeFinding({
+    id: 'AIRFRAME_ROTOR_ORDER_TONE',
+    rung: 'airframe',
+    kind: 'observation',
+    confidence: 'low',
+    // Its size WHILE PRESENT, that over the level, and how long it was present
+    // for beside its flight average — never the average alone, which for a tone
+    // present part of the time reads under the level it was above.
+    headline: `The main rotor's ${perRev(strongest.order)} measured ${toneSize(strongest)} `
+      + `while it was above an experimental ${threshold} level`
+      + (ratio !== null ? `, ${ratio} times that level` : '')
+      + tonePresence(strongest, 'it')
+      + (others > 0
+        ? `; ${others} more main-rotor ${others === 1 ? 'tone is' : 'tones are'} listed below`
+        : '')
+      + '.',
+    reasoning: 'This is a measurement, not a verdict. Everything above the attention level on '
+      + 'this flight is the main rotor\'s own once- or twice-per-rev, measured on unfiltered '
+      + 'gyro and matched against the logged head speed. The '
+      + `${threshold} level is experimental: it was calibrated on synthetic signals and `
+      + 'has not yet been validated on a known out-of-track aircraft, and on real flights '
+      + 'tones like this one cross it more often than not. So, up to '
+      + `${Number.isFinite(airframe.rotorOrderToneCeilingDps)
+        ? `${airframe.rotorOrderToneCeilingDps} deg/s while present, three times that level,`
+        : 'three times that level while present,'}`
+      + ' such a tone is reported here rather than holding back the rest of the analysis; '
+      + 'past that it would block. Where an oscillation on one axis sits '
+      + 'on top of one of these tones, that axis is refused on its own card rather than '
+      + 'blamed on a gain.',
+    basis: [
+      ...rotorToneBasis(tones, rangeStartUs),
+      basisEntry('strongest tone against the experimental level', ratio, 'times',
+        'its band RMS while above the attention level, over the attention threshold'),
+      ...strongestToneBasis(strongest),
+      basisEntry('head speed the strongest tone was matched against', strongest.headspeedRpm,
+        'rpm', 'logged head speed, through the spectrum analyser\'s rotor-order match'),
+      basisEntry('severity ceiling for a main-rotor tone', airframe.rotorOrderToneCeilingDps,
+        'deg/s', 'three times the attention threshold (recommendation-gates.mjs); a safety '
+        + 'backstop, not a calibration'),
+      ...basis
+    ],
+    confirm: 'Blade tracking or balance is the usual cause of a once- or twice-per-rev tone, '
+      + 'so checking both is where to start. Fly the same flight after the blades are '
+      + 'tracked and balanced: if this tone drops, it was the blades.',
+    codes: [
+      'MAIN_ROTOR_ORDER_TONE_ABOVE_EXPERIMENTAL_THRESHOLD',
+      ...orders.map(order => `MAIN_ROTOR_ORDER_${order}`)
+    ]
+  });
+}
+
+/**
+ * Main-rotor 1/rev or 2/rev past the severity ceiling: a blocker, said as its size.
+ *
+ * Decided 2 October 2026 as a safety refinement of the owner's rotor-order rule.
+ * The rule exists because an 8 deg/s level calibrated on synthetic signals was
+ * refusing nearly every real flight over tones of 10 to 17 deg/s. It was never
+ * meant to wave through a 40 deg/s once-per-rev, which is the size of a head
+ * badly out of track or balance. So past three times the level the tone blocks
+ * every gain again — as the rotor's own measured tone, not as "unexplained".
+ */
+function rotorOrderToneLargeFinding(airframe, basis) {
+  const {sorted: tones, strongest, ratio} = toneAgainstLevel(airframe, airframe.rotorOrderTonesLarge);
+  const orders = [...new Set(tones.map(tone => tone.order))].sort();
+  const threshold = Number.isFinite(airframe.attentionThresholdDps)
+    ? `${airframe.attentionThresholdDps} deg/s` : 'attention';
+  const ceiling = airframe.rotorOrderToneCeilingDps;
+  const rangeStartUs = airframe.upstream.measured?.rangeStartTimeUs ?? null;
+  return makeFinding({
+    id: 'AIRFRAME_ROTOR_ORDER_TONE_LARGE',
+    rung: 'airframe',
+    kind: 'blocker',
+    adjust: 'airframe',
+    confidence: 'medium',
+    headline: `The main rotor's ${perRev(strongest.order)} measured ${toneSize(strongest)} `
+      + `while it was above the experimental ${threshold} level — ${ratio} times that level, `
+      + `past the ${ceiling} deg/s up to which a main-rotor tone is only reported`
+      + tonePresence(strongest, 'the level') + '.',
+    reasoning: 'This is the main rotor\'s own tone, measured on unfiltered gyro and matched '
+      + 'against the logged head speed, and at this size it is what a head out of track or '
+      + 'out of balance produces. It sits in the gyro trace under everything a gain would be '
+      + 'judged on, and a gain moved to chase it leaves the aircraft exactly as it was — so no '
+      + 'gain is read over it. The size is the tone\'s size while it was there, not its '
+      + 'average over the whole flight, which the stretches it was absent from pull down. The '
+      + 'ceiling is a safety backstop, three times an attention level that was calibrated on '
+      + 'synthetic signals, not a validated limit.',
+    basis: [
+      ...rotorToneBasis(tones, rangeStartUs),
+      basisEntry('strongest tone against the experimental level', ratio, 'times',
+        'its band RMS while above the attention level, over the attention threshold'),
+      ...strongestToneBasis(strongest),
+      basisEntry('severity ceiling for a main-rotor tone', ceiling, 'deg/s',
+        'three times the attention threshold (recommendation-gates.mjs); a safety backstop, '
+        + 'not a calibration'),
+      basisEntry('head speed the strongest tone was matched against', strongest.headspeedRpm,
+        'rpm', 'logged head speed, through the spectrum analyser\'s rotor-order match'),
+      ...basis
+    ],
+    confirm: 'Sort the tracking and balance before tuning: track and balance the blades, then '
+      + 'fly the same flight again and compare this number. If it drops, it was the blades; if '
+      + 'it does not, look at the head, the dampers and the bearings next.',
+    codes: [
+      'MAIN_ROTOR_ORDER_TONE_LARGE',
+      ...orders.map(order => `MAIN_ROTOR_ORDER_${order}`)
+    ]
+  });
+}
+
 function airframeFindings(airframe, mechanical) {
   const out = [];
   const basis = [];
@@ -2301,6 +2976,35 @@ function airframeFindings(airframe, mechanical) {
     ));
   }
 
+  // Owner decision, 2 October 2026: when everything above the experimental
+  // threshold is the main rotor's own once- or twice-per-rev, it is reported as
+  // a measurement and does not hold the gains back on that account. When nothing
+  // else blocks the airframe it stands in for AIRFRAME_CLEAR, which would be
+  // false with a tone above the threshold.
+  //
+  // When something ELSE blocks it, that card's "does not hold the rest back"
+  // would be false, so the card is not shown — and the tones it would have named
+  // go into the basis every airframe blocker below carries, so the measurement is
+  // still on screen beside what does block.
+  const rotorRangeStartUs = airframe.upstream.measured?.rangeStartTimeUs ?? null;
+  const rotorToneRows = [];
+  if ((airframe.rotorOrderTones ?? []).length > 0) {
+    if (airframe.status === 'permitted') {
+      out.push(rotorOrderToneFinding(airframe, basis));
+      return out;
+    }
+    rotorToneRows.push(...rotorToneBasis(toneAgainstLevel(airframe, airframe.rotorOrderTones).sorted,
+      rotorRangeStartUs, ' (a main-rotor tone; not what blocks here)'));
+    basis.push(...rotorToneRows);
+  }
+
+  // Past the severity ceiling the same tones block, and say so first: they are
+  // the specific, measured thing to sort before anything else on this rung.
+  if ((airframe.rotorOrderTonesLarge ?? []).length > 0
+      && airframe.upstream.codes.includes('MAIN_ROTOR_ORDER_TONE_LARGE')) {
+    out.push(rotorOrderToneLargeFinding(airframe, basis));
+  }
+
   // A tone that was measured, named and found small is not silence, and the old
   // wording below claimed silence. The distinction matters most exactly where it
   // was wrong: `mechanical.reasonCodes` reading
@@ -2308,7 +3012,8 @@ function airframeFindings(airframe, mechanical) {
   // told "no persistent tone reached the attention level ... that is a positive
   // measurement of absence".
   if (airframe.status === 'permitted' && airframe.subThresholdTones.length > 0) {
-    const tones = airframe.subThresholdTones;
+    // One per tone, not one per stretch it was measured in.
+    const tones = distinctTones(airframe.subThresholdTones);
     const rotorTones = tones.filter(tone => tone.rotor !== null);
     out.push(makeFinding({
       id: 'AIRFRAME_TONE_BELOW_ATTENTION',
@@ -2333,7 +3038,8 @@ function airframeFindings(airframe, mechanical) {
       basis: [
         ...basis,
         ...tones.slice(0, 6).map(tone => basisEntry(
-          `persistent tone below the attention level: ${describeTone(tone)}`,
+          `persistent tone below the attention level: ${describeTone(tone)}`
+            + stretchNote(tone, rotorRangeStartUs, tone.stretchCount > 1),
           round(tone.bandRmsDps, 3), 'deg/s',
           `spectrum peak, present in ${Math.round((tone.persistenceRatio ?? 0) * 100)}% of the `
           + 'analysed windows'
@@ -2425,63 +3131,196 @@ function airframeFindings(airframe, mechanical) {
     return out;
   }
 
-  if (airframe.codes.includes('BROADBAND_NOT_MEASURED')) {
-    out.push(makeFinding({
-      id: 'AIRFRAME_BROADBAND_NOT_MEASURED',
-      rung: 'airframe',
-      kind: 'blocker',
-      confidence: 'none',
-      headline: 'The vibration floor could not be measured on every axis, so the airframe '
-        + 'has not been ruled out.',
-      reasoning: 'A clear verdict is a positive measurement of absence. Where no floor was '
-        + 'produced, there is no measurement — and silence must not read the same as a '
-        + 'clean bill of health.',
-      basis,
-      confirm: 'Select a range with a steady head speed and enough samples, and run the '
-        + 'vibration check again over that.',
-      codes: ['BROADBAND_NOT_MEASURED']
-    }));
-  }
-
+  // MEASURED vibration, and only measured vibration. Until 2 October 2026 this
+  // fired whenever the upstream gate was not `permitted`, which includes every
+  // result that could not be measured at all — so a 40 Hz log was told "could
+  // not be read" and, on the next card, that it was shaking. The gate now only
+  // raises MECHANICAL_EVIDENCE_GATE_BLOCKED for `attention`, and the status is
+  // checked here as well so the two can never drift apart again.
   const upstreamCodes = airframe.upstream.codes;
-  if (upstreamCodes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED')) {
+  const measuredStatus = airframe.upstream.measured?.mechanicalStatus ?? null;
+  if (upstreamCodes.includes('MECHANICAL_EVIDENCE_GATE_BLOCKED') && measuredStatus === 'attention') {
+    const attentionTones = airframe.axes.flatMap(entry =>
+      entry.tones.filter(tone => tone.attentionEligible));
+    // Every tone seen IS a main-rotor 1/rev or 2/rev, and the rotor-order rule
+    // still refused: something else about the result — a stretch that could not
+    // be measured, a filtered axis — means "only the rotor" was not established.
+    // Said as exactly that, rather than as a tone the rotor does not explain.
+    const rotorOrderNotEstablished = attentionTones.length > 0 && attentionTones.every(tone =>
+      tone.rotor === 'main' && (tone.order === 1 || tone.order === 2));
+    // "The rotor does not explain it" needs a tone that was COMPARED and is not
+    // main 1/rev or 2/rev. Judged per tone: in a window measured in stretches, a
+    // tone from a stretch whose head speed was steady was genuinely compared,
+    // whatever the next stretch did. Where no such tone exists and something was
+    // not compared, it is not known either way, and must not be said.
+    const positivelyUnexplained = attentionTones.some(tone => tone.rotor === 'tail'
+      || (tone.rotor === 'main' && tone.order > 2)
+      || (tone.rotor === null && tone.rotorCompared === true));
+    const notCompared = attentionTones.length > 0
+      ? !positivelyUnexplained
+      : airframe.upstream.measured?.harmonicCorrelationState !== 'evaluated';
+    let cause = 'NOT_EXPLAINED_BY_MAIN_ROTOR_ORDER';
+    if (rotorOrderNotEstablished) {
+      cause = 'ROTOR_ORDER_NOT_ESTABLISHED';
+    } else if (notCompared) {
+      cause = 'VIBRATION_NOT_COMPARED_WITH_ROTOR';
+    }
+    const headlines = {
+      ROTOR_ORDER_NOT_ESTABLISHED: 'The vibration check measured vibration on this range above '
+        + 'the experimental attention level, and could not establish that it is only the main '
+        + 'rotor\'s once- or twice-per-rev.',
+      VIBRATION_NOT_COMPARED_WITH_ROTOR: 'The vibration check measured vibration on this range '
+        + 'above the experimental attention level, and it could not be compared against the '
+        + 'rotor speed to see whether the main rotor accounts for it.',
+      NOT_EXPLAINED_BY_MAIN_ROTOR_ORDER: 'The vibration check measured vibration on this range '
+        + 'that the main rotor\'s once- and twice-per-rev do not explain.'
+    };
     out.push(makeFinding({
       id: 'AIRFRAME_VIBRATION_PRESENT',
       rung: 'airframe',
       kind: 'blocker',
       adjust: 'airframe',
       confidence: 'medium',
-      headline: 'The vibration check did not come back clear on this range.',
-      reasoning: 'A tracking fault, a worn damper or a dry bearing all look like a badly '
-        + 'tuned D term in the gyro trace, and moving a gain to chase one leaves the '
-        + 'aircraft exactly as it was.',
-      basis,
+      headline: headlines[cause],
+      reasoning: `${unexplainedBecause(attentionTones, airframe)} `
+        + 'A tracking fault, a worn damper or a dry bearing all look like a badly tuned D term '
+        + 'in the gyro trace, and moving a gain to chase one leaves the aircraft exactly as it '
+        + 'was. The level it crossed is experimental — calibrated on synthetic signals, not on '
+        + 'a known faulty aircraft — and is listed below beside the measurement, so the margin '
+        + 'can be judged rather than taken on trust.',
+      basis: [
+        // One row per tone, however many stretches it was measured in.
+        ...distinctTones(attentionTones).slice(0, 6).map(tone => basisEntry(
+          `persistent tone above the attention level: ${describeTone(tone)}`
+            + stretchNote(tone, rotorRangeStartUs, tone.stretchCount > 1),
+          round(tone.bandRmsDps, 3), 'deg/s',
+          `spectrum peak, present in ${Math.round((tone.persistenceRatio ?? 0) * 100)}% of the `
+          + 'analysed windows'
+        )),
+        ...basis
+      ],
       confirm: 'Sort the airframe, then fly the same manoeuvres again and compare this '
         + 'number rather than the gains.',
-      codes: ['MECHANICAL_EVIDENCE_GATE_BLOCKED']
+      // Where every tone IS the rotor's, which condition of the rule did not hold,
+      // so the plain copy can say that one rather than guess.
+      codes: ['MECHANICAL_EVIDENCE_GATE_BLOCKED', cause,
+        ...(cause === 'ROTOR_ORDER_NOT_ESTABLISHED' && airframe.rotorOrderRefusal
+          ? [airframe.rotorOrderRefusal] : [])]
     }));
   }
-  if (upstreamCodes.includes('ROTOR_CORRELATION_UNAVAILABLE')
-      || upstreamCodes.includes('ROTOR_CORRELATION_NOT_ATTEMPTED')) {
+
+  // NOT MEASURED, and why. One card, naming the reason the vibration check gave,
+  // because "too short", "logging dropouts" and "sample rate too low" send a pilot
+  // to three different places.
+  if (airframe.codes.includes('BROADBAND_NOT_MEASURED')
+      || upstreamCodes.includes('MECHANICAL_EVIDENCE_NOT_MEASURED')) {
+    const why = notMeasuredBecause(reasonCodes);
+    const partly = Array.isArray(mechanical?.chunks)
+      && mechanical.chunks.some(chunk => chunk?.status !== 'insufficient');
+    out.push(makeFinding({
+      id: 'AIRFRAME_BROADBAND_NOT_MEASURED',
+      rung: 'airframe',
+      kind: 'blocker',
+      confidence: 'none',
+      headline: `The vibration check could not measure ${partly ? 'part of ' : ''}this range — `
+        + `${why.phrase} — so the airframe has not been ruled out.`,
+      reasoning: 'A clear verdict is a positive measurement of absence. Where nothing was '
+        + 'measured there is no verdict either way: this is not a finding that the aircraft '
+        + 'vibrates, and it is not a clean bill of health.',
+      basis: [
+        basisEntry('why the vibration check could not measure',
+          why.codes.length > 0 ? why.codes.join(', ') : 'no reason code was given', null,
+          'mechanical-spectrum.mjs reason codes'),
+        ...basis
+      ],
+      confirm: why.confirm,
+      // The cue the plain copy reads to say "part of" too, rather than parsing
+      // the headline.
+      codes: ['BROADBAND_NOT_MEASURED', ...why.codes, ...(partly ? ['VIBRATION_PARTLY_MEASURED'] : [])]
+    }));
+  }
+
+  if (upstreamCodes.includes('ROTOR_CORRELATION_PARTIAL')) {
+    // Compared over SOME of the window. "Never compared" would be false about
+    // the stretches that were — whose tones the cards beside this one name by
+    // rotor order — so this says part, and why the rest was not.
+    const reason = airframe.upstream.measured.headspeedReasonCode ?? null;
+    const rest = ROTOR_NOT_COMPARED_REST[reason] ?? ROTOR_NOT_COMPARED_REST.default;
+    const words = ROTOR_NOT_COMPARED_WORDING[reason] ?? ROTOR_NOT_COMPARED_WORDING.default;
+    // Counted in the stretches the vibration check could MEASURE. Round-2 review:
+    // this said "1 of the 2 stretches it was measured in" of a window whose second
+    // stretch was never measured, and then said so itself.
+    const compared = airframe.upstream.measured.rotorComparedStretchCount;
+    const measured = airframe.upstream.measured.measuredStretchCount;
+    const of = airframe.upstream.measured.stretchCount;
     out.push(makeFinding({
       id: 'AIRFRAME_ROTOR_NOT_COMPARED',
       rung: 'airframe',
       kind: 'blocker',
       confidence: 'none',
-      headline: 'The vibration was never compared against the rotor on this range.',
+      headline: 'The vibration was compared against the rotor over only part of this range'
+        + (Number.isFinite(compared) && Number.isFinite(measured) && Number.isFinite(of)
+          ? ` (${compared} of the ${measured} measured ${measured === 1 ? 'stretch' : 'stretches'}`
+            + `, of ${of} in all)`
+          : '')
+        + `: across the rest, ${rest}.`,
+      reasoning: 'Over the stretches where the head speed could be used, each tone was tested '
+        + 'against the rotor\'s own orders, and what that found is on the cards beside this one. '
+        + 'Over the rest nothing was compared, so the airframe is not ruled out across the '
+        + 'whole range: "no rotor problem found" is a statement only about what was compared.',
+      basis: [
+        basisEntry('stretches compared against the rotor', compared, 'count',
+          'mechanical-spectrum.mjs, per stretch'),
+        basisEntry('stretches the vibration check could measure', measured, 'count',
+          'mechanical-spectrum.mjs, per stretch'),
+        basisEntry('stretches the range was split into', of, 'count',
+          'mechanical-spectrum.mjs, per stretch'),
+        basisEntry('head-speed relative spread over the analysed range',
+          round(airframe.upstream.measured.headspeedRelativeSpread, 4), 'ratio',
+          'mechanical-spectrum.mjs rotor-speed evidence, bounded across the stretches'),
+        basisEntry('why the rest could not be compared against',
+          reason ?? 'no reason code was given', null,
+          'mechanical-spectrum.mjs rotor-speed evidence'),
+        ...basis
+      ],
+      confirm: reason === 'NOT_EVALUATED'
+        ? 'Nothing separate to fly for this: it clears when the vibration check can measure '
+          + 'the whole range.'
+        : words.confirm,
+      codes: ['ROTOR_CORRELATION_PARTIAL', ...(reason ? [reason] : [])]
+    }));
+  } else if (upstreamCodes.includes('ROTOR_CORRELATION_UNAVAILABLE')
+      || upstreamCodes.includes('ROTOR_CORRELATION_NOT_ATTEMPTED')) {
+    // Worded from the reason the rotor speed could not be used, not from a guess.
+    // It used to say the head speed "moved too much" whatever had happened, on
+    // logs with no head-speed column and on results that never read it.
+    const notAttempted = upstreamCodes.includes('ROTOR_CORRELATION_NOT_ATTEMPTED');
+    const reason = notAttempted
+      ? 'NOT_EVALUATED'
+      : (airframe.upstream.measured.headspeedReasonCode ?? null);
+    const words = ROTOR_NOT_COMPARED_WORDING[reason] ?? ROTOR_NOT_COMPARED_WORDING.default;
+    out.push(makeFinding({
+      id: 'AIRFRAME_ROTOR_NOT_COMPARED',
+      rung: 'airframe',
+      kind: 'blocker',
+      confidence: 'none',
+      headline: `The vibration was never compared against the rotor on this range: ${words.why}.`,
       reasoning: '"No rotor problem found" and "the rotor was never checked" are opposite '
-        + 'facts, and only the first is a statement about the aircraft. The head speed has '
-        + 'to be steady across the range before a peak can be matched to a rotor order, and '
-        + 'on this range it was not — usually because the spool-up is inside the selection.',
+        + `facts, and only the first is a statement about the aircraft. ${words.detail}`,
       basis: [
         basisEntry('head-speed relative spread over the analysed range',
           round(airframe.upstream.measured.headspeedRelativeSpread, 4), 'ratio',
           'mechanical-spectrum.mjs rotor-speed evidence'),
+        basisEntry('why the head speed could not be compared against',
+          reason ?? 'no reason code was given', null,
+          'mechanical-spectrum.mjs rotor-speed evidence'),
         ...basis
       ],
-      confirm: 'Select a range after the spool-up and before the descent, where the head '
-        + 'speed is steady, and run the vibration check on that.',
-      codes: ['ROTOR_CORRELATION_UNAVAILABLE']
+      confirm: words.confirm,
+      codes: [
+        notAttempted ? 'ROTOR_CORRELATION_NOT_ATTEMPTED' : 'ROTOR_CORRELATION_UNAVAILABLE',
+        ...(reason ? [reason] : [])
+      ]
     }));
   }
   if (upstreamCodes.includes('MECHANICAL_ANALYSIS_ABSENT')) {
@@ -2514,7 +3353,8 @@ function airframeFindings(airframe, mechanical) {
         basisEntry('analysed range end', airframe.upstream.measured.rangeEndTimeUs, 'us',
           'mechanical analysis range'),
         basisEntry('stop events in the log', airframe.upstream.measured.eventCount, 'count',
-          'stop detection')
+          'stop detection'),
+        ...rotorToneRows
       ],
       confirm: 'Run the vibration check over a range that contains the stops.',
       codes: ['MECHANICAL_RANGE_EXCLUDES_EVENTS']
@@ -2536,7 +3376,8 @@ function airframeFindings(airframe, mechanical) {
         basisEntry('analysed range end', airframe.upstream.measured.rangeEndTimeUs, 'us',
           'mechanical analysis range'),
         basisEntry('hold boundaries in the log', airframe.upstream.measured.holdBoundaryCount,
-          'count', 'hold evidence')
+          'count', 'hold evidence'),
+        ...rotorToneRows
       ],
       confirm: 'Run the vibration check over a range that contains every hold used for advice.',
       codes: ['MECHANICAL_RANGE_EXCLUDES_HOLDS']
@@ -2561,13 +3402,58 @@ function headspeedFindings(headspeed) {
       + 'rotor does would fail any whole-flight limit'),
     basisEntry('whole-range span including the spool-up', measured.wholeRangeSpanRatio,
       'ratio', 'records[].headspeed, every sample'),
-    basisEntry('steady segments thrown away because the head speed moved',
-      measured.holdsRejectedForHeadspeed, 'count', 'measureHold refusals'),
-    basisEntry('steady segments thrown away in total', measured.holdsRejectedTotal, 'count',
-      'measureHold refusals'),
+    // Segments are stretches of steady flight, each counted once however many
+    // axes were analysed through it (see countHeadspeedSegments).
+    basisEntry('steady segments whose head speed was read all the way through',
+      measured.holdsEvaluated, 'count',
+      'measureHold, each stretch counted once across the axes'),
+    basisEntry('of those, segments lost to the head speed moving, with no hold measured in them',
+      measured.holdsRejectedForHeadspeed, 'count',
+      'measureHold refusals, HOLD_HEADSPEED_UNSTABLE, where no axis measured a hold'),
+    // Not lost, and not in the share (review of 3 October 2026): the head speed
+    // moved across one axis's hold, and another axis's hold in the same segment
+    // held it and was used.
+    basisEntry('of those, segments where the head speed moved across one axis\'s hold while '
+      + 'another axis measured a hold over a stretch where it held',
+    measured.holdsMovedWithAHoldUsedInside ?? null, 'count',
+    'each stretch counted once across the axes; not counted as lost'),
+    basisEntry('steady segments in which the head-speed reading was missing or impossible',
+      measured.holdsRejectedForHeadspeedReading, 'count',
+      'measureHold refusals, HOLD_HEADSPEED_INVALID — the sensor or the logging, not the governor'),
+    basisEntry('steady segments measured on at least one axis', measured.holdsAccepted, 'count',
+      'buildHoldEvidence'),
+    basisEntry('share of the read segments lost to the head speed moving',
+      measured.headspeedShareOfEvaluatedHolds, 'share',
+      'lost over read; at least half, over at least '
+      + `${measured.minimumHoldsEvaluated ?? '—'} segments, blocks`),
     basisEntry('limit applied to a five-second hold', measured.holdWindowLimit, 'ratio',
       'EVIDENCE_LIMITS.maximumHeadspeedVariationRatio')
   ];
+
+  // A reading that dropped out is reported as what it is, beside whatever the
+  // rung concluded, and never folded into "the head speed moved".
+  // Built after the rung's own finding, so it is listed after it.
+  const readingLost = measured.holdsRejectedForHeadspeedReading ?? 0;
+  const withDropout = finding => (readingLost > 0 ? [finding, makeFinding({
+    id: 'HEADSPEED_READING_DROPPED_OUT',
+    rung: 'headspeed',
+    kind: 'observation',
+    confidence: 'medium',
+    headline: `The head-speed reading was missing or impossible during ${readingLost} steady `
+      + `segment${readingLost === 1 ? '' : 's'} of this flight, so no hold was measured `
+      + 'across the gap.',
+    reasoning: 'A steady segment is only measured where the head speed is known all the way '
+      + 'through it, because a tune is only valid at the head speed it was taken at. '
+      + `${readingLost === 1 ? 'This one was' : 'These were'} refused because the reading `
+      + 'itself was missing or outside anything a rotor in flight '
+      + 'turns at — an RPM sensor losing its signal, or the logging dropping a sample — not '
+      + 'because the head speed moved. It says nothing about the governor.',
+    basis,
+    confirm: 'Check the RPM sensor\'s wiring and signal, and that nothing else in the log is '
+      + 'missing samples, then fly again. The count of segments lost to the reading should go '
+      + 'to zero.',
+    codes: ['HOLD_HEADSPEED_INVALID']
+  })] : [finding]);
 
   if (headspeed.codes.includes('HEADSPEED_NOT_LOGGED')
       || headspeed.codes.includes('HEADSPEED_NEVER_SPUN_UP')) {
@@ -2588,29 +3474,135 @@ function headspeedFindings(headspeed) {
     })];
   }
 
+  // `moved` is the segments LOST to the head speed — it moved, and no axis
+  // measured a hold anywhere in them — and is the count every verdict below is
+  // taken on. `mixed` is the segments where it moved across one axis's hold
+  // while another axis measured a hold in the same stretch at a steady head
+  // speed: said, truthfully, and never counted as lost (review of 3 October
+  // 2026, after two such hovers read "2 of the 2" and blocked every gain).
+  const moved = measured.holdsRejectedForHeadspeed ?? 0;
+  const mixed = measured.holdsMovedWithAHoldUsedInside ?? 0;
+  const read = measured.holdsEvaluated ?? 0;
+  const needed = measured.minimumHoldsEvaluated ?? EVIDENCE_LIMITS.minimumHolds;
+  const holdSeconds = round(EVIDENCE_LIMITS.minimumHoldDurationUs / 1e6, 1);
+  const mixedNote = mixed > 0
+    ? ` In ${mixed === 1 ? 'one other segment' : `${mixed} other segments`} the head speed moved `
+      + 'across one axis\'s hold while another axis measured a hold over a stretch where it '
+      + `had held; ${mixed === 1 ? 'that hold was' : 'those holds were'} used, the part where it `
+      + `moved was not, and ${mixed === 1 ? 'that segment is' : 'those segments are'} not counted `
+      + 'as lost.'
+    : '';
+
   if (headspeed.codes.includes('HEADSPEED_COST_THIS_FLIGHT_ITS_HOLDS')) {
-    return [makeFinding({
+    return withDropout(makeFinding({
       id: 'HEADSPEED_MOVED_DURING_STEADY_FLIGHT',
       rung: 'headspeed',
       kind: 'blocker',
       adjust: 'governor',
       confidence: 'medium',
+      // The share it measured, not a word for it: "most" was once printed over
+      // one refused segment and three good ones.
       headline: 'The head speed was still moving during the steady parts of this flight, '
-        + 'and that is what cost it most of its measurable segments.',
+        + `and that is what cost it ${moved} of the `
+        + `${read} steady segments whose head speed could be read.`,
       reasoning: 'Aerodynamic damping, servo authority and the whole rate loop\'s effective '
         + 'gain all move with rotor speed, so a tune taken while the head speed is wandering '
         + 'is wrong at every other collective setting. This is not the spool-up: these are '
         + 'segments of otherwise steady flight in which the rotor speed moved by more than '
-        + 'the amount that puts governor activity into a measurement of the tune.',
+        + 'the amount that puts governor activity into a measurement of the tune, and no hold '
+        + 'was measured in any of them.' + mixedNote,
       basis,
       confirm: 'Get the head speed holding first — let the governor settle, and watch that '
         + 'it holds through collective changes — then fly the tuning manoeuvres again. The '
         + 'count of segments lost to head speed should go to zero.',
       codes: [...headspeed.codes]
-    })];
+    }));
   }
 
-  return [makeFinding({
+  // THE HEAD SPEED MOVED, BUT NOT ENOUGH OF THE FLIGHT WAS READ TO JUDGE THE
+  // GOVERNOR (2 October 2026, round two of the review). Below the minimum the
+  // rung does not block — one segment is not "most" of anything — and it used to
+  // fall through to "the head speed held well enough", over a flight whose only
+  // measurement said it had not. The count is the finding, and so is what to fly.
+  if (moved > 0 && read < needed) {
+    return withDropout(makeFinding({
+      id: 'HEADSPEED_TOO_FEW_SEGMENTS_TO_JUDGE',
+      rung: 'headspeed',
+      kind: 'next-flight',
+      confidence: 'none',
+      headline: `The head speed moved during ${moved} of the ${read} steady `
+        + `segment${read === 1 ? '' : 's'} whose head speed could be read, with no hold measured `
+        + `in ${moved === 1 ? 'it' : 'them'} — too few to judge the governor from.`,
+      reasoning: 'A tune is only valid at the head speed it was taken at, so a steady segment '
+        + 'in which the rotor speed moved by more than the limit is not measured. Whether that '
+        + 'is the governor or one gust it caught needs more than one look: the governor is '
+        + `judged over ${needed} or more steady segments, and this flight had ${read} whose `
+        + 'head speed could be read.' + mixedNote + ' This is not an all-clear on the head '
+        + 'speed, and it does not hold back the rest of the advice.',
+      basis,
+      confirm: `Fly ${needed} or more still hovers, each held for ${holdSeconds} s or more with `
+        + 'the sticks centred and the governor settled, and watch the head-speed trace across '
+        + 'them. If it moves in most of them, the governor is the place to start.',
+      codes: [...headspeed.codes, 'HEADSPEED_MOVED_TOO_FEW_SEGMENTS_TO_JUDGE']
+    }));
+  }
+
+  // Enough segments, and fewer than half of them lost to the head speed: not
+  // the governor at the scale the limit was derived for, and not "steady" either.
+  //
+  // Worded per HOLD since round three: "every hold used held its head speed all
+  // the way through" is true of every flight, because `measureHold` refuses any
+  // hold that did not. Since 3 October 2026 the count is of segments LOST — no
+  // hold measured in them — and a segment where another axis measured a hold is
+  // said separately, in `mixedNote`, rather than counted here and then excused.
+  if (moved > 0) {
+    return withDropout(makeFinding({
+      id: 'HEADSPEED_MOVED_IN_SOME_SEGMENTS',
+      rung: 'headspeed',
+      kind: 'observation',
+      confidence: 'low',
+      headline: `The head speed moved during ${moved} of the ${read} steady segments whose `
+        + `head speed could be read, with no hold measured in ${moved === 1 ? 'it' : 'them'}. `
+        + 'Every hold that was used held its head speed all the way through.',
+      reasoning: 'A hold in which the rotor speed moved by more than the limit is not measured, '
+        + 'because a tune is only valid at the head speed it was taken at. Fewer than half of '
+        + 'the segments read were lost to it, which is not the governor wandering at the scale '
+        + 'the limit was derived for — but it did move, and that is said rather than called '
+        + 'steady.' + mixedNote,
+      basis,
+      confirm: null,
+      codes: [...headspeed.codes, 'HEADSPEED_MOVED_IN_A_MINORITY_OF_SEGMENTS']
+    }));
+  }
+
+  // THE HEAD SPEED MOVED ONLY WHERE ANOTHER AXIS STILL MEASURED A HOLD (review of
+  // 3 October 2026). No segment was lost to it, so nothing here counts against
+  // the governor or holds back the advice; but it did move, and a card reading
+  // "held well enough" would be false of the hold it cost one axis.
+  if (mixed > 0) {
+    return withDropout(makeFinding({
+      id: 'HEADSPEED_MOVED_WHERE_A_HOLD_WAS_STILL_MEASURED',
+      rung: 'headspeed',
+      kind: 'observation',
+      confidence: 'low',
+      headline: `The head speed moved during ${mixed} of the ${read} steady segments whose head `
+        + `speed could be read, but in ${mixed === 1 ? 'it' : 'each of them'} another axis still `
+        + 'measured a hold over a stretch where it held, so none was lost to it. Every hold that '
+        + 'was used held its head speed all the way through.',
+      reasoning: 'A hold in which the rotor speed moved by more than the limit is not measured, '
+        + 'because a tune is only valid at the head speed it was taken at, so one axis lost its '
+        + `hold in ${mixed === 1 ? 'that segment' : 'those segments'}. Another axis measured a `
+        + 'hold over the part where the head speed held, and that hold was used. The governor is '
+        + 'judged on segments lost to head speed with no hold measured in them, and there were '
+        + 'none, so this does not hold back the advice — but the head speed did move, and that '
+        + 'is said rather than called steady.',
+      basis,
+      confirm: null,
+      codes: [...headspeed.codes, 'HEADSPEED_MOVED_ONLY_WHERE_A_HOLD_WAS_MEASURED']
+    }));
+  }
+
+  return withDropout(makeFinding({
     id: 'HEADSPEED_STEADY_ENOUGH',
     rung: 'headspeed',
     kind: 'observation',
@@ -2624,7 +3616,7 @@ function headspeedFindings(headspeed) {
     basis,
     confirm: null,
     codes: [...headspeed.codes]
-  })];
+  }));
 }
 
 /* --------------------------------------------------------------- rung: per axis */
@@ -3025,8 +4017,17 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
     headline: `${axis} oscillates at the same frequency as something the airframe is already `
       + `doing — ${describeTone(tone)} — so a gain change here would be a guess.`,
     reasoning: 'The spectrum on this axis carries a persistent tone at that frequency, and it '
-      + `lines up with the ${tone.rotor} rotor's own turning speed. It did not reach the level `
-      + 'worth chasing on its own, which is why nothing above calls it a fault. But a control '
+      + `lines up with the ${tone.rotor} rotor's own turning speed. `
+      + (tone.attentionEligible
+        // Since 2 October 2026 a main-rotor 1/rev or 2/rev above the experimental
+        // level is reported on the airframe rung instead of blocking it, so this
+        // rule now meets tones above the level too, and must not say otherwise.
+        // Where it is listed depends on what else the airframe rung found: its
+        // own observation card, or the basis of whatever blocks there.
+        ? 'It is above the experimental attention level, and the airframe rung above lists '
+          + 'it with its measured size. But a control '
+        : 'It did not reach the level worth chasing on its own, which is why nothing above '
+          + 'calls it a fault. But a control ')
       + 'loop does not get to choose to oscillate at exactly the speed the rotor turns at, so '
       + 'this coincidence is worth something: it says a mechanical explanation is on the table '
       + 'and this flight cannot rule it out. Lowering a gain to quieten a rotor order does not '
@@ -3102,6 +4103,25 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
     const closeableByAGainStep = worstShortfallShare !== null
       && worstShortfallShare < AUTHORITY_LIMITS.standingOffsetShareOfCommand;
 
+    // AND HOW LITTLE (2 October 2026). The ceiling above stops "raise P" being
+    // aimed at a stop; nothing stopped it being aimed at a HEALTHY loop, whose
+    // tiny shortfall is a clean offset precisely because there is so little error
+    // of any kind. The claim is "it sat below the rate asked for", in both
+    // directions, so the SMALLER side has to carry it. See
+    // AUTHORITY_LIMITS.standingOffsetShareOfCommandFloor.
+    const smallestShortfallShare = shortfallShares.some(share => share === null)
+      ? null
+      : Math.min(...shortfallShares);
+    const shortfallLargeEnough = smallestShortfallShare !== null
+      && smallestShortfallShare >= AUTHORITY_LIMITS.standingOffsetShareOfCommandFloor;
+    // And it has to be a MEASUREMENT: an offset no larger than the axis's own gyro
+    // noise floor leaves nothing attributable to the loop, by the same quadrature
+    // rule every other metric in this module is read through.
+    const offsetsAboveNoise = DIRECTIONS.map(direction =>
+      separableFromNoiseFloor(perDirection[direction].meanSignedOffsetDps, noiseFloorDps));
+    const offsetSeparable = offsetsAboveNoise.every(value => Number.isFinite(value) && value > 0);
+    const offsetEarnsP = shortfallLargeEnough && offsetSeparable;
+
     const basis = [
       ...ringingBasis,
       basisEntry('tracking error carried by a standing offset, one way',
@@ -3117,10 +4137,19 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
         'standing offset over commanded rate, per direction'),
       basisEntry('the most a gain step can be expected to close',
         AUTHORITY_LIMITS.standingOffsetShareOfCommand, 'share',
-        'AUTHORITY_LIMITS.standingOffsetShareOfCommand')
+        'AUTHORITY_LIMITS.standingOffsetShareOfCommand'),
+      basisEntry('the smallest shortfall, as a share of the rate being asked for',
+        smallestShortfallShare === null ? null : round(smallestShortfallShare, 3), 'share',
+        'standing offset over commanded rate, the smaller direction'),
+      basisEntry('the least shortfall that can be read as too little P',
+        AUTHORITY_LIMITS.standingOffsetShareOfCommandFloor, 'share',
+        'AUTHORITY_LIMITS.standingOffsetShareOfCommandFloor'),
+      basisEntry('standing offset left above the gyro noise floor, the smaller direction',
+        offsetSeparable ? round(Math.min(...offsetsAboveNoise), 2) : null, 'deg/s',
+        'separableFromNoiseFloor(offset, summarizeAxis.gyroHighFrequencyRmsDps)')
     ];
 
-    if (offsetDominant && closeableByAGainStep) {
+    if (offsetDominant && closeableByAGainStep && offsetEarnsP) {
       out.push(makeFinding({
         id: 'P_TOO_LOW',
         rung: 'gain-P',
@@ -3147,48 +4176,158 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
       return out;
     }
 
-    // Two different roads reach this finding and a pilot needs to know which.
+    // Three different roads reach this finding and a pilot needs to know which.
     // Either the tracking error was not a clean standing offset (the original
-    // case), or it was — and it was so LARGE a share of the commanded rate that
+    // case); or it was, and it was so LARGE a share of the commanded rate that
     // no gain step could close it, which is what a control run at its travel
-    // limit looks like from inside a log.
-    const outOfAuthority = offsetDominant && !closeableByAGainStep;
+    // limit looks like from inside a log; or it was, and it was so SMALL — or so
+    // buried in the gyro's own noise — that it is not a shortfall a P step can be
+    // expected to move, which is what a healthy loop with a little lag looks like
+    // after a big, fast stop.
+    // Only a MEASURED shortfall can be too large: with no direction's command
+    // measured, this used to print "0% of what was being asked for" as too large.
+    const outOfAuthority = offsetDominant && worstShortfallShare !== null && !closeableByAGainStep;
+    // A FOURTH ROAD (review of 3 October 2026). Where one direction's commanded
+    // rate was missing or zero, its shortfall as a share of the command is not
+    // known, and the smaller side — the one that has to carry the claim — is not
+    // known either. That is a missing measurement, not a small shortfall: it used
+    // to take the too-small road and print "only null% below the rate asked for".
+    const shortfallMeasured = shortfallShares.every(share => share !== null);
+    const shortfallNotMeasured = offsetDominant && !outOfAuthority && !shortfallMeasured;
+    const tooSmallForP = offsetDominant && closeableByAGainStep && shortfallMeasured
+      && !offsetEarnsP;
+    const smallestPercent = smallestShortfallShare === null
+      ? null : round(smallestShortfallShare * 100, 1);
+
+    let headline = `${axis} was still turning the way it had been pushed after the stick `
+      + 'reached centre, and this log does not say why.';
+    let reasoning = 'A failure to arrest is not ringing, and reading it as ringing would '
+      + 'lower the very gain that is supposed to stop the aircraft. But the tracking error '
+      + 'during the hold is not a clean standing offset either, so too little P is only '
+      + 'one of the candidates.';
+    let candidates = [
+      'too little P on this axis',
+      'a mechanical drag or bind on the control run',
+      'the servo or the swashplate hitting a travel or rate limit'
+    ];
+    let confirm = 'Fly the same stop from a smaller command — about half the rate — twice each '
+      + 'way. If the aircraft arrests properly from the smaller one, something is running '
+      + 'out of travel or rate at the larger one and no gain will fix that. If it fails to '
+      + 'arrest from both, the loop is the place to look.';
+    const codes = ['RESIDUAL_RATE_IN_COMMAND_DIRECTION'];
+
+    if (outOfAuthority) {
+      headline = `${axis} did not reach the rate it was asked for and did not arrest, and the `
+        + 'gap is too large for a gain to be the whole story.';
+      reasoning = 'The aircraft sat at a rate well below the commanded one and stayed there, '
+        + 'which on its own looks like too little P. But the missing rate is '
+        + `${Math.round((worstShortfallShare ?? 0) * 100)}% of what was being asked for, and `
+        + 'a loop that far from following is not one gain step away from following. A '
+        + 'control run at its travel limit — a servo horn on the wrong hole, a linkage set '
+        + 'short, a swashplate on its stop — produces exactly this: a clean standing '
+        + 'shortfall that does not move when the gain does. Raising P into a stop winds the '
+        + 'loop harder against something that is not going to give, and leaves the aircraft '
+        + 'badly over-gained the moment the mechanical fault is fixed.';
+    } else if (shortfallNotMeasured) {
+      codes.push('COMMANDED_RATE_NOT_MEASURED');
+      const missing = DIRECTIONS.filter((direction, index) => shortfallShares[index] === null)
+        .length;
+      headline = `${axis} was still turning the way it had been pushed after the stick reached `
+        + 'centre, but the rate it was asked for could not be measured in '
+        + `${missing === DIRECTIONS.length ? 'either direction' : 'one direction'}, so how far `
+        + 'short of it the aircraft sat is not known.';
+      reasoning = 'While the command was held the aircraft sat at a steady rate below the one '
+        + 'asked for, which on its own looks like too little P. Whether a P step could close '
+        + 'that gap depends on how large it is against the rate being asked for, and in '
+        + `${missing === DIRECTIONS.length ? 'both directions' : 'one direction'} the commanded `
+        + 'rate was not measured — it was missing or zero over the held part of the stops. That '
+        + 'is a missing measurement, not a small shortfall and not a large one, so this flight '
+        + 'does not read it as too little P.';
+    } else if (tooSmallForP) {
+      // Two different reasons, said differently (round two of the review). A
+      // shortfall under the floor is tiny, and "it followed the stick too
+      // closely" is true of it. A shortfall over the floor that the noise
+      // swallows is NOT tiny — 8-9% of the command on the reproduction — and
+      // those words were false about it.
+      const tooSmall = !shortfallLargeEnough;
+      const buried = !offsetSeparable;
+      if (tooSmall) {
+        codes.push('STANDING_OFFSET_TOO_SMALL_FOR_P');
+      }
+      if (buried) {
+        codes.push('STANDING_OFFSET_WITHIN_NOISE_FLOOR');
+      }
+      // The offset is an AVERAGE over the held part of each stop; the floor is the
+      // gyro's sample-to-sample high-frequency spread. They are not the same kind
+      // of number, and averaging shrinks noise, so the comparison refuses more
+      // than it has to. It is kept because silence is cheaper than a wrong "Raise
+      // P", and the sentence says what was compared rather than overstating it.
+      const noiseNote = 'The gyro\'s own high-frequency noise on this axis is '
+        + `${round(noiseFloorDps, 1)} deg/s from one sample to the next, and in at least one `
+        + 'direction the shortfall, averaged over the held part of each stop, is no larger '
+        + 'than that. Averaging shrinks noise, so that is a cautious comparison and the '
+        + 'shortfall may well be real — but this engine reads a shortfall as too little P '
+        + 'only where it stands above the noise itself.';
+      const lagNote = 'The rate still turning just after centre grows with the size and speed '
+        + 'of the stop: any loop with a little lag in it leaves rate behind after a big, fast '
+        + 'stop, whatever its P. So this flight does not show P is too low, and it does not rule '
+        + 'it out either.';
+      if (tooSmall) {
+        headline = `${axis} was still turning the way it had been pushed after the stick `
+          + 'reached centre, but it followed the stick too closely while it was held for that '
+          + 'to say P is too low.';
+        reasoning = `In at least one direction the aircraft sat only ${smallestPercent}% below `
+          + 'the rate asked for while the command was held. That reads as a clean standing '
+          + 'offset — most of the tracking error — only because there was so little error of '
+          + 'any kind, and a shortfall that small is not one a P step can be expected to move. '
+          + (buried ? `${noiseNote} ` : '')
+          + lagNote;
+        candidates = [
+          'nothing wrong: the ordinary lag of the loop after a large, fast stop',
+          'too little P on this axis',
+          'a mechanical drag or bind on the control run',
+          'the servo or the swashplate hitting a travel or rate limit'
+        ];
+        confirm = 'Fly the same stop from about half the rate, twice each way. If the rate still '
+          + 'turning just after centre roughly halves with it, it is scaling with the size of '
+          + 'the stop — the loop\'s own lag — and is not a fault on its own. If the aircraft '
+          + 'arrests cleanly from the smaller stop but not from the larger, something is running '
+          + 'out of travel or rate at the larger one, and no gain will fix that.';
+      } else {
+        headline = `${axis} was still turning the way it had been pushed after the stick `
+          + `reached centre, and sat ${smallestPercent}% or more below the rate asked for while `
+          + 'it was held — but no further below it than this axis\'s gyro noise, so this flight '
+          + 'does not read that as too little P.';
+        reasoning = 'While the command was held the aircraft sat '
+          + `${round(perDirection.positive.meanSignedOffsetDps, 1)} and `
+          + `${round(perDirection.negative.meanSignedOffsetDps, 1)} deg/s below it, at least `
+          + `${smallestPercent}% of the rate asked for — a shortfall large enough to be too `
+          + `little P. ${noiseNote} Deal with the noise first — it is usually vibration reaching `
+          + 'the gyro — and a shortfall that is still there on a quieter gyro can be read.';
+        candidates = [
+          'too little P on this axis',
+          'a mechanical drag or bind on the control run',
+          'the servo or the swashplate hitting a travel or rate limit',
+          'nothing wrong: noise on the gyro making the shortfall look larger than it is'
+        ];
+        confirm = 'Find what is making the gyro noisy on this axis — the vibration check says '
+          + 'where to look — then fly the same stops twice each way. If the shortfall is still '
+          + 'there on a quieter gyro, it is read as what it is.';
+      }
+    }
+
     out.push(makeFinding({
       id: 'AXIS_DOES_NOT_ARREST',
       rung: 'gain-P',
       axis,
       kind: 'next-flight',
       confidence: 'low',
-      headline: outOfAuthority
-        ? `${axis} did not reach the rate it was asked for and did not arrest, and the gap `
-          + 'is too large for a gain to be the whole story.'
-        : `${axis} was still turning the way it had been pushed after the stick `
-          + 'reached centre, and this log does not say why.',
-      reasoning: outOfAuthority
-        ? 'The aircraft sat at a rate well below the commanded one and stayed there, which on '
-          + 'its own looks like too little P. But the missing rate is '
-          + `${Math.round((worstShortfallShare ?? 0) * 100)}% of what was being asked for, and `
-          + 'a loop that far from following is not one gain step away from following. A '
-          + 'control run at its travel limit — a servo horn on the wrong hole, a linkage set '
-          + 'short, a swashplate on its stop — produces exactly this: a clean standing '
-          + 'shortfall that does not move when the gain does. Raising P into a stop winds the '
-          + 'loop harder against something that is not going to give, and leaves the aircraft '
-          + 'badly over-gained the moment the mechanical fault is fixed.'
-        : 'A failure to arrest is not ringing, and reading it as ringing would '
-          + 'lower the very gain that is supposed to stop the aircraft. But the tracking error '
-          + 'during the hold is not a clean standing offset either, so too little P is only '
-          + 'one of the candidates.',
+      headline,
+      reasoning,
       basis,
-      candidates: [
-        'too little P on this axis',
-        'a mechanical drag or bind on the control run',
-        'the servo or the swashplate hitting a travel or rate limit'
-      ],
-      confirm: 'Fly the same stop from a smaller command — about half the rate — twice each '
-        + 'way. If the aircraft arrests properly from the smaller one, something is running '
-        + 'out of travel or rate at the larger one and no gain will fix that. If it fails to '
-        + 'arrest from both, the loop is the place to look.',
-      codes: ['RESIDUAL_RATE_IN_COMMAND_DIRECTION']
+      candidates,
+      confirm,
+      codes
     }));
     return out;
   }
@@ -3435,6 +4574,190 @@ function shapeFindings({axis, shapeConclusion, perDirection, noiseFloorDps, swee
 
 /* ---------------------------------------------------------- hold-driven findings */
 
+/**
+ * Codes that each say the I-term question was not answered with "nothing to
+ * change": a sign of too little or too much I, a refusal to read one, or holds
+ * that could not be judged at all. Any one of them rules out the all-clear.
+ */
+const I_TERM_ALL_CLEAR_EXCLUDED = Object.freeze(new Set([
+  'STEADY_STATE_ERROR_PRESENT',
+  'STEADY_STATE_ERROR_DRIFTING',
+  'LOW_FREQUENCY_HUNTING',
+  'CONFLICTING_HOLD_SIGNATURES',
+  'SLOW_MOVEMENT_BELOW_I_TERM_BAND',
+  'STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT',
+  'I_TERM_DOES_NOT_OSCILLATE_WITH_THE_ERROR',
+  'I_TERM_TOO_SMALL_A_SHARE_OF_THE_OUTPUT',
+  'I_TERM_NOT_LOGGED',
+  'HOLD_KIND_MISMATCH',
+  'HOLD_VERDICT_FLIPS_ACROSS_SWEEP',
+  'HOLD_SWEEP_COULD_NOT_OBSERVE_THE_OSCILLATION',
+  'STANDING_ERROR_WITH_WOUND_UP_I_TERM',
+  'STANDING_ERROR_WITH_A_PINNED_I_TERM',
+  'INSUFFICIENT_HOLD_SEGMENTS',
+  'EVIDENCE_KIND_MISMATCH',
+  'EVIDENCE_INCONCLUSIVE',
+  // Round three. A fast oscillation dominates the crossing count, so nothing
+  // slower was measured under it; a slow ripple no larger than the noise was not
+  // told from it; and a standing error not read for want of holds, or because it
+  // changed side or stood in some holds and not others, is not "none".
+  'OSCILLATION_ABOVE_I_TERM_BAND',
+  'SLOW_RIPPLE_NOT_CLEAR_OF_NOISE',
+  'STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD',
+  'STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS',
+  'STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION',
+  'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR'
+]));
+
+/**
+ * Whether hold codes earn I_TERM_WITHIN_TOLERANCE: a POSITIVE measurement of an
+ * error that neither stood nor wandered (HOLD_EVIDENCE_WITHIN_TOLERANCE), and
+ * not one code that says otherwise. Added 2 October 2026, after three separate
+ * refusals were found falling through to the all-clear; an all-clear reached by
+ * elimination is how each of them got there.
+ */
+export function earnsITermAllClear(codes) {
+  const list = Array.isArray(codes) ? codes : [];
+  return list.includes('HOLD_EVIDENCE_WITHIN_TOLERANCE')
+    && !list.some(code => I_TERM_ALL_CLEAR_EXCLUDED.has(code));
+}
+
+/**
+ * I_TERM_NOT_JUDGED, worded from what was missing (round three of the review).
+ *
+ * The card used to say only that the holds were "not measured in a way that
+ * answers the I-term question". Each road that now reaches it is a specific
+ * measurement that could not be made, and the pilot is told which, and what to
+ * fly to make it: a fast oscillation that hid the band under it; a slow ripple
+ * no larger than the noise; a standing error seen in too few holds, or one that
+ * followed the stick from turn to turn.
+ */
+function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, bandLow, bandHigh,
+  oscillationHz, errorList, onEachSide}) {
+  const codes = hold.codes;
+  const has = code => codes.includes(code);
+  const holdCount = hold.holdCount;
+  const needed = EVIDENCE_LIMITS.minimumHoldsForStandingError;
+  const seconds = round(EVIDENCE_LIMITS.minimumHoldDurationUs / 1e6, 1);
+  const noise = round(summary?.meanErrorNoiseRmsDps, 1);
+  const inBand = oscillationHz >= bandLow && oscillationHz <= bandHigh;
+  // Three ways, never two: a movement above the band is not "slower than" it.
+  const where = inBand
+    ? `inside the ${bandLow}-${bandHigh} Hz band an integrator can cause`
+    : oscillationHz > bandHigh
+      ? `faster than the ${bandLow}-${bandHigh} Hz band an integrator can cause`
+      : `slower than the ${bandLow}-${bandHigh} Hz band an integrator can cause`;
+  const movementNamed = has('OSCILLATION_ABOVE_I_TERM_BAND') || has('SLOW_RIPPLE_NOT_CLEAR_OF_NOISE');
+
+  const sentences = [];
+  const candidates = [];
+  let headline = `The ${axis} holds were measured, but not in a way that answers the I-term `
+    + 'question either way.';
+  let confirm = holdManoeuvre(axis).steps.join(' ');
+
+  if (has('OSCILLATION_ABOVE_I_TERM_BAND')) {
+    headline = `${axis} shook faster than an integrator works during the holds, and that hid `
+      + 'anything slower, so the I term was not judged.';
+    sentences.push(`The error's slow part swung ${ripple} deg/s RMS ${rate} — faster than the `
+      + `${bandLow}-${bandHigh} Hz band an integrator can cause. Movement that fast is the fast `
+      + 'loop, the frame or the tail, not the integrator, and it dominates this measurement: a '
+      + 'standing error averages out from under it, but a hunt or a slow wander underneath it '
+      + 'could not be seen.');
+    candidates.push('too much P or D, or a frame or tail resonance, shaking the axis',
+      'under it, an I term that is right, too small or too large — this flight cannot say');
+    confirm = 'Settle what is shaking first — the stop and vibration findings on this flight say '
+      + `whether it is the airframe, P or D — then fly ${needed} or more still holds of `
+      + `${seconds} s or more again.`;
+  } else if (has('SLOW_RIPPLE_NOT_CLEAR_OF_NOISE')) {
+    headline = `${axis} moved slowly during the holds, but no more than its own gyro noise, so `
+      + 'the I term was not judged.';
+    sentences.push(`The error's slow part swung ${ripple} deg/s RMS ${rate} — ${where} — but no `
+      + `more than the ${noise} deg/s RMS of faster noise around it, so it could not be told `
+      + 'from that noise: a hunt was neither read nor ruled out.');
+    candidates.push(...(inBand ? ['too much I term, hunting under the noise'] : []),
+      'the governor, the drive or the wind moving the aircraft',
+      'vibration or noise reaching the gyro');
+    confirm = 'Check the gyro mounting and the vibration findings on this flight, then fly '
+      + `${needed} or more still holds of ${seconds} s or more in calm air.`;
+  }
+
+  if (has('STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT')
+      || has('STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD')) {
+    sentences.push(`The holds also sat ${meanError} deg/s off the commanded rate on average, but `
+      + 'in some of them the error moved as much as it averaged, so that average was not read '
+      + 'as a standing error.');
+    candidates.push('too little I term, hidden under the movement');
+    if (!candidates.some(entry => /governor/.test(entry))) {
+      candidates.push('the governor, the drive or the wind moving the aircraft');
+    }
+  } else if (has('STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION')) {
+    headline = `The ${axis} error changed side with the direction of each turn, so the I term `
+      + 'was not judged from these turns.';
+    sentences.push(`In every turn the error sat ${meanError} deg/s or so on the same side `
+      + `relative to the turn (${errorList} deg/s, hold by hold). A loop that lags behind every `
+      + 'turn does that — and so does a slow wander that happens to keep step with the turns, '
+      + 'and these holds cannot tell the two apart.');
+    candidates.push('too little I term on this axis',
+      'a slow wander in step with the turns — the governor, the drive or the wind');
+    confirm = `Fly ${needed} or more steady turns all in one direction, each held for ${seconds} `
+      + 's or more, or the same number of still hovers.';
+  } else if (has('STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS')) {
+    // Reached only when the movement inside the holds was NOT below the band
+    // (review of 3 October 2026); below it, this is SLOW_WANDER_NOT_FROM_THE_I_TERM.
+    if (!movementNamed) {
+      headline = `The ${axis} error sat off the commanded rate on one side in some holds and on `
+        + 'the other side in others, so the I term was not judged from these holds.';
+      sentences.push(`Within each hold the error's slow part swung ${ripple} deg/s RMS ${rate} — `
+        + `${where} — by no more than the ${HOLD_READING_THRESHOLDS.huntingRippleDps} deg/s that `
+        + 'would be read as a hunt.');
+    }
+    sentences.push(`Hold by hold, the error sat off the commanded rate on one side in `
+      + `${onEachSide?.[0] ?? 0} and on the other in ${onEachSide?.[1] ?? 0} (${errorList} deg/s). `
+      + 'A standing error the I term should close keeps to one side every time the aircraft is '
+      + 'held, so these averages were not read as one; what moved them from hold to hold this '
+      + 'flight cannot say.');
+    candidates.push('too little I term on this axis, under whatever moved the averages',
+      'something moving the aircraft between holds — the governor, the drive or the wind');
+    confirm = `Fly ${needed} or more still holds of ${seconds} s or more on this axis in calm air, `
+      + 'with the other two axes quiet, and watch the head-speed trace across them.';
+  } else if (has('TOO_FEW_HOLDS_FOR_A_STANDING_ERROR')) {
+    headline = `The ${axis} holds sat off the commanded rate on the same side each time, but `
+      + `${holdCount} holds are too few to call that a standing error.`;
+    sentences.push(`Across the ${holdCount} holds the error averaged ${meanError} deg/s, on the `
+      + `same side in every one (${errorList} deg/s). That is what too little I looks like, and `
+      + 'also what part of a slow wander looks like. A standing error the I term should close '
+      + 'stays on one side however many times the aircraft is held; a wander does not, and it '
+      + `takes ${needed} holds or more to tell them apart.`);
+    candidates.push('too little I term on this axis',
+      'part of a slow wander — the governor, the drive or the wind — caught on the same side '
+        + 'each time');
+    confirm = `Fly ${needed} or more still holds of ${seconds} s or more on this axis, with the `
+      + 'other two axes quiet. The pilot guide asks for five.';
+  }
+
+  return {
+    id: 'I_TERM_NOT_JUDGED',
+    rung: 'evidence',
+    axis,
+    kind: 'next-flight',
+    confidence: 'none',
+    headline,
+    reasoning: (sentences.length > 0
+      ? sentences.join(' ')
+      : 'What the holds showed is listed below, with the reason codes the measurement '
+        + 'returned. None of it is a reading of the I term, and none of it is a sign that the '
+        + 'I term is right.')
+      + ' This is not an all-clear on the I term.',
+    basis: [...basis,
+      basisEntry('fast noise in the error, which the I-term filter removed', noise, 'deg/s',
+        'measureHold'),
+      basisEntry('average error in each hold', errorList, 'deg/s', 'measureHold, signed')],
+    ...(candidates.length > 0 ? {candidates} : {}),
+    confirm,
+    codes: [...codes]
+  };
+}
+
 function holdFindings({axis, hold, airframe}) {
   const out = [];
   const summary = hold.evidence.summary;
@@ -3445,8 +4768,10 @@ function holdFindings({axis, hold, airframe}) {
       summary?.meanAbsoluteSteadyStateErrorDps ?? null, 'deg/s', 'measureHold'),
     basisEntry('slow ripple in the error', summary?.meanErrorRippleRmsDps ?? null, 'deg/s',
       'measureHold, error smoothed to the I-term band'),
+    // A count of crossings per second, two per cycle — not the oscillation's
+    // frequency, which is half of it. Shown raw, and labelled as what it is.
     basisEntry('how often the error crossed zero', summary?.meanErrorCrossingRateHz ?? null,
-      'Hz', 'measureHold'),
+      'per second', 'measureHold — two crossings per cycle'),
     basisEntry('I-term size', summary?.meanITermRms ?? null, null, 'measureHold'),
     basisEntry('I-term drift', summary?.meanITermDriftPerSecond ?? null, 'per second',
       'measureHold'),
@@ -3537,7 +4862,95 @@ function holdFindings({axis, hold, airframe}) {
     return out;
   }
 
+  // HOLDS OF TWO KINDS, NEITHER JUDGED (2 October 2026). A hold at zero rate and
+  // a hold at a steady rate test the I term in different regimes, and
+  // `interpretHoldEvidence` rightly refuses to read them pooled: it returns
+  // `hold` with HOLD_KIND_MISMATCH and judges nothing. That refusal used to fall
+  // through to I_TERM_WITHIN_TOLERANCE — "nothing in the holds calls for an
+  // I-term change" — on exactly the flights ordinary pilots fly, hovers and
+  // steady turns. On an aircraft with NO integrator against a standing torque,
+  // either kind alone earns "raise I"; mixed, it was told all was well. Nothing
+  // was judged, so nothing is cleared: the pilot is told what to fly instead.
+  // Reading each kind on its own is a later stage, deliberately not built here.
+  if (hold.codes.includes('HOLD_KIND_MISMATCH')) {
+    const holds = hold.evidence.holds ?? [];
+    const zeroRate = holds.filter(entry => entry.holdKind === 'zero');
+    const steadyRate = holds.filter(entry => entry.holdKind === 'sustained');
+    const meanErrorOf = entries => (entries.length === 0 ? null : round(weightedMean(
+      entries.map(entry => entry.absoluteSteadyStateErrorDps),
+      entries.map(entry => entry.measuredDurationUs)
+    ), 2));
+    const needed = hold.minimumHolds ?? EVIDENCE_LIMITS.minimumHolds;
+    const seconds = round(EVIDENCE_LIMITS.minimumHoldDurationUs / 1e6, 1);
+    const offAxis = EVIDENCE_LIMITS.offAxisCommandLimitDps;
+    const rateKind = {yaw: 'pirouettes or turns', pitch: 'turns', roll: 'rolls'}[axis]
+      ?? 'manoeuvres';
+    const still = axis === 'yaw'
+      ? 'still hovers, or straight flight, holding a heading with the pedals centred'
+      : `still hovers, or level flight, with the ${axis} stick centred`;
+    const turning = {
+      yaw: 'steady pirouettes or turns at a constant rate',
+      pitch: 'steady turns or loops held at a constant pitch rate',
+      roll: 'continuous rolls held at a constant roll rate'
+    }[axis] ?? `steady ${axis} rates`;
+
+    out.push(makeFinding({
+      id: 'I_TERM_HOLDS_MIXED',
+      rung: 'evidence',
+      axis,
+      kind: 'next-flight',
+      confidence: 'low',
+      headline: `The steady ${axis} segments in this flight were a mix of holds at zero rate `
+        + `(hovering or flying straight) and holds at a steady rate (${rateKind}), so the I `
+        + 'term was not judged from either.',
+      reasoning: 'A hold at zero rate and a hold at a steady rate test the I term in two '
+        + 'different regimes — holding still against torque and trim, and holding a rate '
+        + 'against a changing load — and averaging them together describes neither. This '
+        + `flight had ${zeroRate.length} of the first and ${steadyRate.length} of the second, `
+        + 'and the two are not yet read separately, so nothing about the I term was judged '
+        + 'here. This is not an all-clear: the I term may be right, too small or too large, '
+        + 'and this flight cannot say which.',
+      basis: [
+        ...basis,
+        basisEntry('holds at zero rate (hovering or flying straight)', zeroRate.length, 'count',
+          'buildHoldEvidence, holdKind zero'),
+        basisEntry('holds at a steady rate (turning)', steadyRate.length, 'count',
+          'buildHoldEvidence, holdKind sustained'),
+        basisEntry('steady-state error, mean over the zero-rate holds', meanErrorOf(zeroRate),
+          'deg/s', 'measureHold, weighted by measured duration'),
+        basisEntry('steady-state error, mean over the steady-rate holds', meanErrorOf(steadyRate),
+          'deg/s', 'measureHold, weighted by measured duration'),
+        basisEntry('a hold counts as zero rate when its command is under',
+          EVIDENCE_LIMITS.zeroHoldThresholdDps, 'deg/s', 'EVIDENCE_LIMITS.zeroHoldThresholdDps')
+      ],
+      candidates: [
+        'the I term is right for this aircraft',
+        'too little I term on this axis',
+        'too much I term on this axis'
+      ],
+      confirm: `Fly ${needed} or more steady ${axis} segments of ONE kind, each held for `
+        + `${seconds} s or more with the other two axes under ${offAxis}°/s: either ${still}, `
+        + `or ${turning}. Keep any steady stretch of the other kind shorter than ${seconds} s `
+        + 'in that flight, or outside the window you select — the two kinds are not yet read '
+        + 'separately, so a mix is not judged at all.',
+      codes: [...hold.codes]
+    }));
+    return out;
+  }
+
   if (!hold.sweepStable) {
+    // The candidates are the readings the sweep actually produced (2 October
+    // 2026, round two). They were written in as "slightly high" and "fine" for
+    // the one flip this card was built for, and an aircraft with NO integrator
+    // whose reading flipped between "raise I" and a refusal was offered both.
+    const readings = hold.sweepIndicationsSeen.length > 0
+      ? hold.sweepIndicationsSeen : [hold.shippedIndication];
+    const candidates = [
+      ...(readings.includes('increase') ? ['the I term is slightly low'] : []),
+      ...(readings.includes('decrease') ? ['the I term is slightly high'] : []),
+      ...(readings.includes('hold')
+        ? ['the I term is fine, or something outside it is moving the aircraft'] : [])
+    ];
     out.push(makeFinding({
       id: 'I_TERM_VERDICT_UNSTABLE',
       rung: 'evidence',
@@ -3546,17 +4959,17 @@ function holdFindings({axis, hold, airframe}) {
       confidence: 'none',
       headline: `The ${axis} I-term reading changes depending on how the error is filtered, `
         + 'so it is not a result yet.',
-      reasoning: 'The same holds read one way at one smoothing length and the opposite way '
-        + 'at another, across lengths that are all equally defensible. A verdict that moves '
-        + 'with an internal setting is that setting being read aloud, not a measurement of '
-        + 'the aircraft.',
+      reasoning: 'The same holds read one way at one smoothing length or ripple threshold and '
+        + 'another way at another, across settings that are all equally defensible. A verdict '
+        + 'that moves with an internal setting is that setting being read aloud, not a '
+        + 'measurement of the aircraft.',
       basis: [
         ...basis,
         basisEntry('readings seen across the sweep', hold.sweepIndicationsSeen.join(', '),
           null, 'HOLD_SWEEP'),
         basisEntry('sweep points', hold.sweepRunCount, 'count', 'HOLD_SWEEP')
       ],
-      candidates: ['the I term is slightly high', 'the I term is fine'],
+      candidates,
       confirm: 'Fly two or three more long, still holds on this axis — hands off the other '
         + 'two — and the reading will settle one way or the other.',
       codes: [...hold.codes]
@@ -3668,11 +5081,14 @@ function holdFindings({axis, hold, airframe}) {
       confidence: hold.confidence,
       headline: `Raise ${axis} I.`,
       reasoning: 'During the steady holds the aircraft sat off the commanded rate and stayed '
-        + 'there, and the I term — the one whose job is exactly that error — is small and is '
-        + 'not winding up against it. That is an integrator that is not doing enough, and it '
-        + 'is specifically NOT the pattern a binding linkage makes, which is the same error '
-        + 'with the I term wound large and still growing.',
-      basis,
+        + `there — on the same side in every one of the ${hold.holdCount} holds, which a slow `
+        + 'wander does not do — and the I term, the one whose job is exactly that error, is '
+        + 'small and is not winding up against it. That is an integrator that is not doing '
+        + 'enough, and it is specifically NOT the pattern a binding linkage makes, which is the '
+        + 'same error with the I term wound large and still growing.',
+      basis: [...basis, basisEntry('average error in each hold',
+        (hold.evidence.holds ?? []).map(entry => round(entry.steadyStateErrorDps, 1)).join(', '),
+        'deg/s', 'measureHold, signed')],
       confirm: `Raise ${axis} I one step, change nothing else, and fly two long still holds `
         + 'again. The standing error should close up. If the aircraft starts wandering slowly '
         + 'either side of the target instead, you have gone one step too far.',
@@ -3681,6 +5097,176 @@ function holdFindings({axis, hold, airframe}) {
     return out;
   }
 
+  // EVERY 'HOLD' BELOW IS A REFUSAL UNTIL PROVED A RESULT (2 October 2026,
+  // round two of the review). Three refusals used to fall through to the
+  // all-clear, each with "the aircraft neither sat off the commanded rate nor
+  // wandered slowly either side of it" over a trace that had done one or both:
+  // both signatures at once, an in-band wobble the I term does not move with,
+  // and — once the band was in the right units — every wander below it. Each is
+  // now named, with what to fly; and the all-clear is reached only through
+  // `earnsITermAllClear`, which asks for the positive measurement.
+  const crossings = summary?.meanErrorCrossingRateHz;
+  const [bandLow, bandHigh] = hold.evidence.measurement?.huntingBandHz
+    ?? EVIDENCE_LIMITS.huntingBandHz;
+  const ripple = round(summary?.meanErrorRippleRmsDps, 1);
+  const meanError = round(summary?.meanAbsoluteSteadyStateErrorDps, 1);
+  const rate = Number.isFinite(crossings) && crossings > 0
+    ? `at about ${round(crossings / CROSSINGS_PER_CYCLE, 2)} Hz (crossing its own average `
+      + `${round(crossings, 2)} times a second)`
+    : 'without once crossing its own average inside a hold';
+  const wanderCandidates = [
+    'the governor hunting, so main-rotor torque is modulating at that rate',
+    'a slipping or worn tail belt, or a drive that is not steady',
+    'wind, or the aircraft flying through its own wake',
+    axis === 'yaw' ? 'the tail running out of authority and re-catching'
+      : 'a control run with a slack or springy spot in it'
+  ];
+  const calmHold = 'Fly the same still hold in calm air, and look at the head-speed trace '
+    + 'across it at the same time. If the wander tracks head speed, it is the governor or the '
+    + 'drive, not a gain. If it is there in calm air with a rock-steady head speed, come back '
+    + 'to the I term.';
+
+  if (hold.codes.includes('CONFLICTING_HOLD_SIGNATURES')) {
+    out.push(makeFinding({
+      id: 'I_TERM_SIGNATURES_CONFLICT',
+      rung: 'gain-I',
+      axis,
+      kind: 'next-flight',
+      confidence: 'low',
+      headline: `${axis} both sat off the commanded rate and wobbled either side of it during `
+        + 'the holds, so the I term was not judged.',
+      reasoning: 'Too little I leaves the aircraft sitting off the target; too much I makes it '
+        + 'swing slowly either side of it. These holds showed both at once: an average error '
+        + `of ${meanError} deg/s, and a slow part swinging ${ripple} deg/s RMS ${rate}, inside `
+        + `the ${bandLow}-${bandHigh} Hz band an integrator can cause. One gain cannot be too `
+        + 'small and too large on the same flight, so something outside the I term is usually '
+        + 'moving the aircraft, and changing I either way would chase it. This is not an '
+        + 'all-clear: the I term was not judged.',
+      basis,
+      candidates: [
+        'a binding or stiff linkage on this control, or a servo near the end of its travel',
+        axis === 'yaw' ? 'the tail running out of authority'
+          : 'the head or swashplate running out of authority on this axis',
+        'the governor hunting, so main-rotor torque is moving',
+        'wind or turbulence during the holds'
+      ],
+      confirm: 'First, with the motor disconnected, move this control through its full travel '
+        + 'by hand and feel for a tight spot. Then fly two long, still holds in calm air and '
+        + 'watch the head-speed trace across them. If the wobble tracks head speed, it is the '
+        + 'governor; if it is gone in calm air, it was the wind; if both remain on a free '
+        + 'linkage and a steady head speed, the holds from that flight will read the I term.',
+      codes: [...hold.codes]
+    }));
+    return out;
+  }
+
+  if (hold.codes.includes('I_TERM_DOES_NOT_OSCILLATE_WITH_THE_ERROR')) {
+    out.push(makeFinding({
+      id: 'SLOW_WANDER_NOT_FROM_THE_I_TERM',
+      rung: 'gain-I',
+      axis,
+      kind: 'next-flight',
+      confidence: 'low',
+      headline: `${axis} wobbles during a hold at a rate an integrator could cause, but the I `
+        + 'term does not move with it, so the I term is not the cause.',
+      reasoning: `The error's slow part swung ${ripple} deg/s RMS ${rate}, inside the `
+        + `${bandLow}-${bandHigh} Hz band an integrator can cause. But an integrator that is `
+        + 'carrying an oscillation swings with it, crossing its own average at the same rate, '
+        + 'and this I term does not move with the error: whatever is moving the aircraft, the '
+        + 'integrator is not carrying it, and an I-term change would not settle it.',
+      basis,
+      candidates: wanderCandidates,
+      confirm: calmHold,
+      codes: [...hold.codes]
+    }));
+    return out;
+  }
+
+  // WHERE THE MOVEMENT WAS, and what each hold's own average did (round three).
+  // The wording below used to call every refused standing error "slower than the
+  // band", including in-band wobbles refused only because they were no larger
+  // than the noise. It now says which side of the band the movement was on, and
+  // an in-band or faster one is not called a wander at all: it goes to
+  // I_TERM_NOT_JUDGED, which does not claim to know what moved the aircraft.
+  const oscillationHz = Number.isFinite(crossings) ? crossings / CROSSINGS_PER_CYCLE : 0;
+  const belowBand = oscillationHz < bandLow;
+  const heldErrors = (hold.evidence.holds ?? []).map(entry => entry.steadyStateErrorDps);
+  const onEachSide = [heldErrors.filter(value => value > 0).length,
+    heldErrors.filter(value => value < 0).length];
+  const errorList = heldErrors.map(value => round(value, 1)).join(', ');
+  const standingRefusals = ['STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT',
+    'STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD', 'STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS',
+    'STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION', 'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR'];
+  const hidden = standingRefusals.some(code => hold.codes.includes(code));
+  const changedSide = hold.codes.includes('STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS');
+  const notClear = hold.codes.includes('STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT')
+    || hold.codes.includes('STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD');
+  const sideSentence = ` Hold by hold, the error sat off the commanded rate on one side in `
+    + `${onEachSide[0]} and on the other in ${onEachSide[1]} (${errorList} deg/s). A standing `
+    + 'error the I term should close keeps to one side every time the aircraft is held; one '
+    + 'that changes side from hold to hold is moving more slowly than the holds themselves.';
+
+  // Only a movement BELOW the band is a slow wander. An error that changed side
+  // between holds while its movement inside them was in the band (or above it)
+  // used to come here too, whatever its frequency, and was called "slower than
+  // an integrator makes an aircraft hunt" (review of 3 October 2026). It goes to
+  // I_TERM_NOT_JUDGED, which says where the movement was.
+  if (hold.codes.includes('SLOW_MOVEMENT_BELOW_I_TERM_BAND')
+      || ((changedSide || notClear) && belowBand)) {
+    const movement = belowBand
+      ? `The error's slow part swung ${ripple} deg/s RMS ${rate} — slower than the `
+        + `${bandLow}-${bandHigh} Hz band an integrator can cause, so the wander is not the I `
+        + 'term\'s doing. Movement that slow is the governor, the drive, the wind or the pilot.'
+      : `Within each hold the error's slow part swung ${ripple} deg/s RMS ${rate}.`;
+    out.push(makeFinding({
+      id: 'SLOW_WANDER_NOT_FROM_THE_I_TERM',
+      rung: 'gain-I',
+      axis,
+      kind: 'next-flight',
+      confidence: 'low',
+      headline: `${axis} wandered slowly during the holds, slower than an integrator makes an `
+        + 'aircraft hunt, so the I term was not judged from them.',
+      reasoning: movement
+        + (changedSide ? sideSentence : '')
+        + (notClear
+          ? ` The holds also sat ${meanError} deg/s off the commanded rate on average, but a `
+            + 'wander that slow leaves part of a cycle in every hold\'s average, and here it is '
+            + 'as large as that average — so this flight cannot say whether any of it is a '
+            + 'standing error the I term should have closed.'
+          : '')
+        + ' This is not an all-clear on the I term.',
+      basis: [...basis,
+        basisEntry('average error in each hold', errorList, 'deg/s', 'measureHold, signed')],
+      candidates: hidden
+        ? [...wanderCandidates, 'too little I term, hidden under the wander']
+        : wanderCandidates,
+      confirm: calmHold,
+      codes: [...hold.codes]
+    }));
+    return out;
+  }
+
+  // Nothing above caught it, and the holds still do not carry a positive
+  // measurement of nothing wrong. Never an all-clear by default — and since
+  // round three, the card says which measurement was missing.
+  if (!earnsITermAllClear(hold.codes)) {
+    out.push(makeFinding(iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError,
+      bandLow, bandHigh, oscillationHz, errorList, onEachSide})));
+    return out;
+  }
+
+  // Positively measured: the mean under the standing-error threshold and the slow
+  // part under the movement threshold, which a slow movement at any frequency the
+  // band admits would have crossed. Since round three a fast oscillation never
+  // reaches here — it hides whatever moved more slowly under it.
+  const reasoning = 'Across the measured holds the aircraft neither sat off the commanded rate '
+    + 'nor wandered slowly either side of it: the average error was '
+    + `${meanError} deg/s, under the ${HOLD_READING_THRESHOLDS.errorDps} deg/s that would be read `
+    + `as a standing error, and its slow part moved ${ripple} deg/s RMS, under the `
+    + `${HOLD_READING_THRESHOLDS.huntingRippleDps} deg/s that would have been read as movement. `
+    + 'A confident negative is worth as much as a change here: it is what stops a pilot moving '
+    + 'a gain that was never the problem.';
+
   out.push(makeFinding({
     id: 'I_TERM_WITHIN_TOLERANCE',
     rung: 'gain-I',
@@ -3688,9 +5274,7 @@ function holdFindings({axis, hold, airframe}) {
     kind: 'observation',
     confidence: hold.confidence === 'none' ? 'low' : hold.confidence,
     headline: `Nothing in the ${axis} holds calls for an I-term change.`,
-    reasoning: 'Across the measured holds the aircraft neither sat off the commanded rate '
-      + 'nor wandered slowly either side of it. A confident negative is worth as much as a '
-      + 'change here: it is what stops a pilot moving a gain that was never the problem.',
+    reasoning,
     basis,
     confirm: null,
     codes: [...hold.codes]

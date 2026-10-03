@@ -604,11 +604,22 @@ function windowDurationSeconds(window) {
  *   headspeedMedianRpm}, pitch: …, yaw: …}`
  * @param {number}  [input.ordinal] normally assigned by `addFlightRecord`
  */
-// Same-flight identity is deliberately process-local. It distinguishes two
-// decoded sessions that happen to round to the same summaries without storing a
-// timestamp, raw-log hash, or other persistent flight identifier. Re-analysis
-// of the same decoded session retains the token; export/import intentionally
-// does not.
+// The decoded-session token is deliberately process-local: nothing persistent
+// — no timestamp, no raw-log hash, no other flight identifier — is stored to
+// recognise a flight. Re-analysis of the same decoded session retains the token;
+// export/import intentionally does not. It is the PROOF of sameness, and it is
+// what still recognises a saved flight when re-analysis in this session moves
+// its numbers.
+//
+// It is not the only way a flight is recognised, and this comment used to say
+// it distinguished sessions that round to the same summaries. Since 2 October
+// 2026, `selectBaseline` and the sensitivity model also treat a record whose
+// every number both records measured agrees — header, window and window length
+// to the millisecond included — as the same flight: already stored for the
+// Save/Forget decision, and one piece of evidence however often it was saved.
+// That is an INFERENCE, reported as `matchedBy: 'content'`, made because the
+// token is gone after a reopen or restart and the inflation it caused was
+// measured. See `sameStoredFlight`.
 const SESSION_SOURCE_TOKENS = new WeakMap();
 const RECORD_SOURCE_TOKENS = new WeakMap();
 
@@ -885,12 +896,20 @@ export function findRecords(history, aircraftKey) {
 }
 
 /**
- * Whether two records describe the SAME flight, analysed twice.
+ * Whether two records describe the SAME flight, analysed twice — as PROVEN by
+ * the decoded session both were built from.
  *
- * Rounded summaries are not an identity: two distinct flights can produce the
- * same stored values. Records built from the same decoded session instead carry
- * one process-local token. It survives storage and re-analysis in this process,
- * but is never serialised, so no timestamp or raw-log fingerprint is retained.
+ * Records built from the same decoded session carry one process-local token. It
+ * survives storage and re-analysis in this process, but is never serialised, so
+ * no timestamp or raw-log fingerprint is retained. This answers only from that
+ * token: two records from different decodes are never "the same" here, whatever
+ * their numbers say.
+ *
+ * What it does NOT decide on its own is whether a candidate is already stored.
+ * The token is gone after a reopen or a restart, so `selectBaseline` also
+ * accepts a stored record whose every number both records measured agrees —
+ * an inference, reported as `matchedBy: 'content'`, not a proof. See
+ * `sameStoredFlight` for why that trade was made and what it costs.
  *
  * WHY THIS EXISTS. Reproduced on a handset: save a flight, switch the window to
  * "Whole log", switch back to the detected one. The window change rebuilds the
@@ -919,29 +938,272 @@ export function isSameFlight(left, right) {
 }
 
 /**
+ * What the history keeps about a flight, split into the parts two saves of it
+ * can be compared on — or null when there is too little to compare.
+ *
+ * `identity` is the header and the window: aircraft, window basis, window
+ * length to the millisecond `windowDurationSeconds` stores, firmware, rate
+ * curve and every gain. Each axis then has three PARTS, compared separately
+ * because the viewer does not always measure all of them:
+ *
+ *   - `summary`: head speed and both noise figures. The viewer computes these
+ *     for every usable axis BEFORE its memory budget is checked.
+ *   - `hold` and `stop`: computed only for the axes the budget let it analyse,
+ *     starting with the axis selected in the Axis panel. On a flight over about
+ *     120k records per axis — two minutes at 1 kHz — that is one or two axes,
+ *     and which ones depends on a picker that is back on roll after a restart.
+ *
+ * A part is `present` when it holds anything other than the shape an
+ * unanalysed axis gets, and `measured` when it holds a finite figure. Counts
+ * are not figures.
+ *
+ * Built only from exported fields, so it gives the same answer before and after
+ * a restart. That is what keeps `buildSensitivityModel` a function of the
+ * history alone rather than of whatever this process happens to remember.
+ */
+function flightContent(record) {
+  if (record?.kind !== FLIGHT_RECORD_KIND || typeof record.aircraftKey !== 'string') {
+    return null;
+  }
+  const {gains, axes} = projectMeasurements(record);
+  const finite = value => Number.isFinite(value);
+
+  const parts = {};
+  for (const axis of AXES) {
+    const projected = axes[axis];
+    const summaryFigures = [
+      projected.headspeedMedianRpm,
+      projected.noise.filteredHighFrequencyRmsDps,
+      projected.noise.unfilteredHighFrequencyRmsDps
+    ];
+    const holdFigured = HOLD_SUMMARY_FIELDS
+      .some(field => !field.endsWith('Count') && finite(projected.hold[field]));
+    const stopFigured = DIRECTIONS.some(direction =>
+      STOP_DIRECTION_FIELDS.some(field => finite(projected.stop[direction][field])));
+
+    parts[axis] = {
+      summary: summaryFigures.some(finite)
+        ? {text: JSON.stringify(summaryFigures), measured: true}
+        : null,
+      // An unanalysed axis gets status 'not-measured' and every field null.
+      // An analysed axis with no holds still says so — a count of zero, or a
+      // status — and two saves of one flight must agree on that too.
+      hold: holdFigured || projected.hold.status !== 'not-measured'
+          || HOLD_SUMMARY_FIELDS.some(field => projected.hold[field] !== null)
+        ? {text: JSON.stringify(projected.hold), measured: holdFigured}
+        : null,
+      stop: stopFigured || projected.stop.status !== 'not-measured'
+          || DIRECTIONS.some(direction => projected.stop[direction].eventCount !== 0)
+        ? {text: JSON.stringify(projected.stop), measured: stopFigured}
+        : null
+    };
+  }
+
+  return {
+    identity: JSON.stringify([
+      record.aircraftKey,
+      typeof record.windowBasis === 'string' ? record.windowBasis : null,
+      round(record.durationSeconds, 3),
+      normalizeText(record.firmwareRevision),
+      normalizeText(record.ratesFingerprint),
+      gains
+    ]),
+    parts
+  };
+}
+
+const FLIGHT_PARTS = Object.freeze(['summary', 'hold', 'stop']);
+
+/**
+ * Whether two records are one flight saved twice, as far as anything the
+ * history keeps can tell. Takes `flightContent` results.
+ *
+ * WHY THIS EXISTS BESIDE `isSameFlight`. The token is lost when the file is
+ * opened again (a new decode makes new session objects) and when the app
+ * restarts. The candidate then matched nothing, Save was offered, and a second
+ * record of the same flight was stored. Measured: six flights saved twice
+ * became twelve "flights" and 66 null pairs, which tightened the yaw floor to
+ * half the corpus figure and unlocked the own-aircraft condition for quoting a
+ * magnitude; three yaw I flights saved twice became six points and a `usable`
+ * direction. No new flying had happened.
+ *
+ * THE RULE. The identity must be equal, every part BOTH records carry must be
+ * equal, and at least one part both carry must hold a measured figure. A part
+ * only one record carries is not evidence either way: it is what a different
+ * axis selection, or the memory budget, left unanalysed on the other open. An
+ * earlier version compared every axis whole, and a flight saved with yaw
+ * selected and reopened with roll selected was then a different flight — Save
+ * came back and the flight became its own baseline.
+ *
+ * WHAT THIS TRADES, stated rather than hidden. It is an INFERENCE, not an
+ * identity: `selectBaseline` reports it as `matchedBy: 'content'`, and the
+ * Save/Forget decision and the model both act on it. Two genuinely different
+ * flights would have to share the header, the gains, the window basis and the
+ * window length to the millisecond, AND every head-speed and noise figure on
+ * every axis at stored precision, AND every hold and stop figure on any axis
+ * both measured. One flight saved twice does that by construction. Requiring a
+ * shared measured figure keeps the header and the window length alone — one
+ * coincidence away from two real flights — from ever being enough.
+ */
+function sameStoredFlight(left, right) {
+  if (left === null || right === null || left.identity !== right.identity) {
+    return false;
+  }
+  let sharedFigure = false;
+  for (const axis of AXES) {
+    for (const part of FLIGHT_PARTS) {
+      const mine = left.parts[axis][part];
+      const theirs = right.parts[axis][part];
+      if (mine === null || theirs === null) {
+        continue;
+      }
+      if (mine.text !== theirs.text) {
+        return false;
+      }
+      sharedFigure = sharedFigure || mine.measured;
+    }
+  }
+  return sharedFigure;
+}
+
+/**
+ * Every record's flight: which records are saves of one flight.
+ *
+ * `records` must be oldest first, as `findRecords` returns them. A record joins
+ * the earliest flight whose EVERY save so far is the same flight as it, so the
+ * first save of a flight is always `saves[0]` and a record that contradicts any
+ * save of a flight is never folded into it. A record with too little to compare
+ * is always a flight of its own.
+ *
+ * @returns {Map<object, {saves: {record: object, content: object|null}[]}>}
+ */
+function flightsOf(records) {
+  const flights = [];
+  const flightOf = new Map();
+  for (const record of records) {
+    const content = flightContent(record);
+    let home = content === null
+      ? null
+      : flights.find(flight =>
+        flight.saves.every(save => sameStoredFlight(save.content, content))) ?? null;
+    if (home === null) {
+      home = {saves: []};
+      flights.push(home);
+    }
+    home.saves.push({record, content});
+    flightOf.set(record, home);
+  }
+  return flightOf;
+}
+
+/**
+ * The records that are a LATER save of a flight an earlier record already
+ * holds. `records` oldest first; see `flightsOf`.
+ */
+function laterCopies(records) {
+  const flightOf = flightsOf(records);
+  return new Set(records.filter(record => flightOf.get(record).saves[0].record !== record));
+}
+
+/**
  * The flight to compare a candidate against, and whether it is already stored.
  *
  * Kept beside the record shape rather than in the viewer, so the rule that a
  * flight is never its own baseline can be tested without a browser.
  *
- * @returns {{baseline: object|null, storedAs: string|null}} `baseline` is the
- *   most recent DIFFERENT flight, or null. `storedAs` is the recordId this
- *   candidate is already saved under, or null.
+ * EVERY STORED FLIGHT IS SEARCHED, not only the newest. Measured: save session
+ * 1 (yaw I 100) and session 2 (yaw I 140) of one dump, then pick session 1
+ * again. Asking only whether the newest record was the candidate made session 2
+ * the baseline, the candidate's null ordinal skipped the order check, and the
+ * panel reported yaw I going from 140 to 100 — every direction reversed — and
+ * offered Save again. A candidate is only ever compared with a flight it
+ * followed.
+ *
+ * A stored flight matches when any save of it carries the candidate's
+ * process-local token (`isSameFlight`: proof), or, when that token is gone,
+ * when every save of it is the same flight as the candidate by
+ * `sameStoredFlight` (inference). The EARLIEST flight that matches wins, and it
+ * is named by its FIRST save, because that save's place in the list is when it
+ * was flown.
+ *
+ * A later save of a flight is never a baseline. Its place in the list records
+ * when it was saved again, not when it was flown.
+ *
+ * @returns {{baseline: object|null, storedAs: string|null,
+ *   matchedBy: 'session'|'content'|null, sameFlightIds: string[]}} `baseline`
+ *   is the most recent DIFFERENT flight before this one, or null. `storedAs` is
+ *   the recordId of this flight's first save, or null. `matchedBy` says how it
+ *   was recognised: `content` means every number both records measured agrees,
+ *   which is the same flight as far as anything kept can tell, not proof of it.
+ *   `sameFlightIds` is every save of it, first first — what Forget must take.
  */
 export function selectBaseline(history, candidate) {
   const kept = findRecords(history, candidate?.aircraftKey ?? null);
   if (kept.length === 0) {
-    return Object.freeze({baseline: null, storedAs: null});
-  }
-
-  const last = kept[kept.length - 1];
-  if (isSameFlight(last, candidate)) {
     return Object.freeze({
-      baseline: kept.length > 1 ? kept[kept.length - 2] : null,
-      storedAs: last.recordId ?? null
+      baseline: null, storedAs: null, matchedBy: null, sameFlightIds: Object.freeze([])
     });
   }
-  return Object.freeze({baseline: last, storedAs: null});
+
+  const flightOf = flightsOf(kept);
+  const isFirstSave = record => flightOf.get(record).saves[0].record === record;
+  const flightBefore = position => {
+    for (let index = position - 1; index >= 0; index -= 1) {
+      if (isFirstSave(kept[index])) {
+        return kept[index];
+      }
+    }
+    return null;
+  };
+
+  const candidateContent = flightContent(candidate);
+  for (let index = 0; index < kept.length; index += 1) {
+    const stored = kept[index];
+    if (!isFirstSave(stored)) {
+      // Searched through its first save, below, with every other save of it.
+      continue;
+    }
+    const {saves} = flightOf.get(stored);
+    let matchedBy = null;
+    if (saves.some(save => isSameFlight(save.record, candidate))) {
+      matchedBy = 'session';
+    } else if (candidateContent !== null
+        && saves.every(save => sameStoredFlight(save.content, candidateContent))) {
+      matchedBy = 'content';
+    }
+    if (matchedBy !== null) {
+      return Object.freeze({
+        baseline: flightBefore(index),
+        storedAs: stored.recordId ?? null,
+        matchedBy,
+        sameFlightIds: Object.freeze(saves.map(save => save.record.recordId))
+      });
+    }
+  }
+  return Object.freeze({
+    baseline: flightBefore(kept.length),
+    storedAs: null,
+    matchedBy: null,
+    sameFlightIds: Object.freeze([])
+  });
+}
+
+/**
+ * Which stored records are a later save of an earlier one, for the history
+ * screen: `{laterRecordId: firstSaveRecordId}`. Empty for a history that holds
+ * every flight once, which is every history this version writes.
+ */
+export function resavedCopies(history, aircraftKey) {
+  const kept = findRecords(history, aircraftKey);
+  const flightOf = flightsOf(kept);
+  const copies = {};
+  for (const record of kept) {
+    const first = flightOf.get(record).saves[0].record;
+    if (first !== record) {
+      copies[record.recordId] = first.recordId;
+    }
+  }
+  return Object.freeze(copies);
 }
 
 /**
@@ -956,6 +1218,36 @@ export function forgetFlight(history, recordId) {
   return Object.freeze({
     ...history,
     records: Object.freeze(history.records.filter(record => record.recordId !== recordId))
+  });
+}
+
+/**
+ * Forgets one FLIGHT: the record named and every other save of the same flight.
+ *
+ * What the pilot's Forget does. `forgetFlight` removes exactly one record, and
+ * in a history that already holds a flight saved twice that left the other save
+ * standing in for it — at the place it was saved again rather than where it was
+ * flown, so the flight after it became its baseline and the comparison ran
+ * backwards. Measured on [A, B, A again]: forgetting A by its first save left
+ * the copy, and reopening A then reported yaw I going from 140 to 100.
+ *
+ * Which records are saves of one flight is `sameStoredFlight`'s inference, the
+ * same one the model and `selectBaseline` act on. An id that is not stored
+ * changes nothing.
+ */
+export function forgetSavesOfFlight(history, recordId) {
+  if (!isHistory(history)) {
+    return createHistory();
+  }
+  const named = history.records.find(record => record.recordId === recordId);
+  if (named === undefined) {
+    return forgetFlight(history, recordId);
+  }
+  const {saves} = flightsOf(findRecords(history, named.aircraftKey)).get(named);
+  const forgotten = new Set(saves.map(save => save.record));
+  return Object.freeze({
+    ...history,
+    records: Object.freeze(history.records.filter(record => !forgotten.has(record)))
   });
 }
 
@@ -2833,6 +3125,11 @@ function allGainsFingerprint(record) {
  * overlapping pairs inflates the count without manufacturing significance. It
  * still inflates the count, which is why tightening is gated on distinct flights
  * as well as on pairs.
+ *
+ * `records` holds ONE RECORD PER FLIGHT: `buildSensitivityModel` removes the
+ * later copies of a flight saved twice before calling this. A copy paired with
+ * its original is a delta of exactly zero and a second "flight", and both the
+ * pair gate and the flight gate counted it — see `sameStoredFlight`.
  */
 function learnAxisFloor(records, axis) {
   const corpusDps = SENSITIVITY_FLOOR_DPS[axis] ?? SENSITIVITY_FLOOR_DPS.pooled;
@@ -3288,8 +3585,13 @@ function buildMagnitude({axis, term, fit, floor, points}) {
  * verdict, a verdict outranks patience, and patience outranks silence — because
  * the failure mode this whole feature has to avoid is a model that keeps quiet
  * for the wrong reason and lets the pilot read it as the right one.
+ *
+ * `copies` are the later saves of a flight already in `records`. They are never
+ * a point — one flight is one point, however often it was saved — and each is
+ * counted under DUPLICATE_OF_STORED_FLIGHT so the exclusions still add up to
+ * every stored record.
  */
-function evaluateTerm({records, axis, term, termIndex, floor, latest}) {
+function evaluateTerm({records, copies, axis, term, termIndex, floor, latest}) {
   const codes = [];
   const groups = [];
   const pointById = new Map();
@@ -3298,6 +3600,9 @@ function evaluateTerm({records, axis, term, termIndex, floor, latest}) {
   // 1. Candidate groups: everything else held constant.
   const candidates = new Map();
   for (const record of records) {
+    if (copies.has(record)) {
+      continue;
+    }
     const fingerprint = otherGainsFingerprint(record, axis, termIndex);
     if (fingerprint === null
         || normalizeText(record?.firmwareRevision) === null
@@ -3411,6 +3716,13 @@ function evaluateTerm({records, axis, term, termIndex, floor, latest}) {
     exclusions[code] = (exclusions[code] ?? 0) + 1;
   };
   for (const record of records) {
+    // First, because it is the more basic reason: whatever the flight itself
+    // was refused or admitted for has already been counted once, against the
+    // first save of it.
+    if (copies.has(record)) {
+      bump('DUPLICATE_OF_STORED_FLIGHT');
+      continue;
+    }
     const band = bandOf.get(record.recordId);
     const fingerprint = otherGainsFingerprint(record, axis, termIndex);
     const firmware = normalizeText(record?.firmwareRevision);
@@ -3463,7 +3775,8 @@ function evaluateTerm({records, axis, term, termIndex, floor, latest}) {
   const points = chosen === null
     ? Object.freeze([])
     : Object.freeze([...chosen.points, ...records
-      .filter(record => bandOf.get(record.recordId) !== chosen
+      .filter(record => !copies.has(record)
+        && bandOf.get(record.recordId) !== chosen
         && otherGainsFingerprint(record, axis, termIndex) !== null
         && record.firmwareRevision === chosen.firmwareRevision
         && record.ratesFingerprint === chosen.ratesFingerprint
@@ -3664,17 +3977,33 @@ function evaluateTerm({records, axis, term, termIndex, floor, latest}) {
 export function buildSensitivityModel(history, aircraftKey) {
   const records = findRecords(history, aircraftKey ?? null);
 
+  // ONE FLIGHT IS ONE PIECE OF EVIDENCE, however many times it was saved. A
+  // history can already hold copies — saved again after a restart, before the
+  // viewer could recognise them — and every copy used to be a second flight to
+  // the floor and a second point to the fit. They stay listed and counted in
+  // `flightCount`; they are simply not evidence twice. See `sameStoredFlight`.
+  //
+  // A copy is left out WHOLE, including any axis its original did not analyse.
+  // That loses evidence rather than doubling it: the copy's place in the list
+  // is when it was saved again, and putting its numbers at the original's place
+  // would be a record nobody stored.
+  const copies = laterCopies(records);
+  const flights = records.filter(record => !copies.has(record));
+
   const floors = {};
   for (const axis of AXES) {
-    floors[axis] = learnAxisFloor(records, axis);
+    floors[axis] = learnAxisFloor(flights, axis);
   }
 
-  const latest = records.length === 0 ? null : records[records.length - 1];
+  // The newest FLIGHT, not the newest save: a copy's place in the list says when
+  // it was saved again, not which configuration is being flown now.
+  const latest = flights.length === 0 ? null : flights[flights.length - 1];
   const terms = [];
   for (const axis of AXES) {
     for (let termIndex = 0; termIndex < GAIN_TERMS.length; termIndex += 1) {
       terms.push(evaluateTerm({
         records,
+        copies,
         axis,
         term: GAIN_TERMS[termIndex],
         termIndex,

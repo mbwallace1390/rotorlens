@@ -60,6 +60,10 @@ import {
   selectBaseline,
   shareableRecord
 } from '../src/analysis/flight-history.mjs';
+// By namespace as well, for `forgetSavesOfFlight`: a named import of an export
+// that is missing fails the whole file at link time, which would hide which
+// test the missing function actually breaks.
+import * as historyModule from '../src/analysis/flight-history.mjs';
 import {
   DIRECTIONAL_EVIDENCE_KIND,
   EVIDENCE_LIMITS,
@@ -200,7 +204,11 @@ function record({
   stopTrackingRmsDps = 30,
   ordinal = 0,
   seconds = 120,
-  windowBasis = null
+  windowBasis = null,
+  // The axes the viewer's memory budget let it analyse. Head speed and noise are
+  // measured for every axis whatever this says, because `summarizeAxis` runs
+  // before the budget is checked; hold and stop evidence exist only for these.
+  analysed = ['roll', 'pitch', 'yaw']
 } = {}) {
   const base = sourceSession ?? session({headers});
   if (craftName !== undefined) {
@@ -220,16 +228,17 @@ function record({
   const axes = {};
   const resolvedZeroHoldCount = zeroHoldCount ?? holdCount;
   for (const axis of ['roll', 'pitch', 'yaw']) {
+    const wasAnalysed = analysed.includes(axis);
     axes[axis] = {
       headspeedMedianRpm,
-      holdEvidence: holdEvidence({
+      holdEvidence: wasAnalysed ? holdEvidence({
         axis,
         holdCount,
         zeroHoldCount: resolvedZeroHoldCount,
         meanAbsoluteSteadyStateErrorDps: errorDps,
         meanErrorRippleRmsDps: rippleRmsDps
-      }),
-      stopEvidence: stopEvidence({axis, trackingRmsDps: stopTrackingRmsDps}),
+      }) : null,
+      stopEvidence: wasAnalysed ? stopEvidence({axis, trackingRmsDps: stopTrackingRmsDps}) : null,
       noise: {filteredHighFrequencyRmsDps: 1.2, unfilteredHighFrequencyRmsDps: 3.4}
     };
   }
@@ -1535,6 +1544,619 @@ test('isSameFlight uses the decoded session, not colliding rounded summaries', (
   assert.equal(isSameFlight(flight, null), false);
 });
 
+/** A session of the one aircraft the baseline tests below are about. */
+function m4maxSession(yawPID) {
+  return session({headers: {'Craft name': 'M4Max', 'Board information': 'NEXUS', yawPID}});
+}
+
+test('re-selecting an EARLIER saved flight finds it, and never compares it with a later one', () => {
+  // MEASURED FAILURE. `selectBaseline` only asked whether the NEWEST stored
+  // record was the candidate. In a multi-session dump: save session 1 (yaw I
+  // 100), save session 2 (yaw I 140), then pick session 1 again. The newest
+  // record was session 2, so session 2 became the baseline; the candidate's
+  // null ordinal skipped the order check, and the panel said yaw I went from
+  // 140 to 100 — the chronology reversed, and every outcome with it — and then
+  // offered Save, which stored a duplicate.
+  const sessions = ['315,100,29,3,1', '315,140,29,3,1', '315,180,29,3,1'].map(m4maxSession);
+  let history = createHistory();
+  for (const [index, source] of sessions.entries()) {
+    history = addFlightRecord(history, record({sourceSession: source, seconds: 60 + index * 10}));
+  }
+  const stored = findRecords(history, history.records[0].aircraftKey);
+  assert.equal(stored.length, 3);
+
+  // The first flight, picked again: it is stored, and nothing came before it.
+  const first = selectBaseline(history, record({sourceSession: sessions[0], seconds: 60}));
+  assert.equal(first.storedAs, stored[0].recordId,
+    'an earlier saved flight was not recognised as stored, so Save would be offered again');
+  assert.equal(first.baseline, null,
+    'the first flight was compared against a flight flown AFTER it');
+
+  // The middle one: stored, and compared with the flight before it — never the
+  // one after it. Built with no ordinal, exactly as the viewer builds a
+  // candidate, so the comparison below takes the same path the panel does.
+  const middleCandidate = record({sourceSession: sessions[1], seconds: 70, ordinal: null});
+  const middle = selectBaseline(history, middleCandidate);
+  assert.equal(middle.storedAs, stored[1].recordId);
+  assert.equal(middle.baseline?.recordId, stored[0].recordId);
+
+  // Driven through the comparison the viewer runs on that pair, it reads
+  // forwards: 100 then 140, which is the order they were flown in.
+  const comparison = compareFlightRecords(middle.baseline, middleCandidate);
+  assert.deepEqual(
+    comparison.gainChanges.map(change => [change.axis, change.term, change.from, change.to]),
+    [['yaw', 'I', 100, 140]],
+    'the gain change was reported backwards'
+  );
+
+  // And the newest one still behaves as it always did.
+  const last = selectBaseline(history, record({sourceSession: sessions[2], seconds: 80}));
+  assert.equal(last.storedAs, stored[2].recordId);
+  assert.equal(last.baseline?.recordId, stored[1].recordId);
+});
+
+test('the same flight opened again — from a new decode, or after a restart — is recognised '
+  + 'by its stored numbers, and a flight differing in one of them is not', () => {
+  // MEASURED FAILURE. Same-flight identity is a process-local token, lost when
+  // the file is opened again (a new decode makes new session objects) and when
+  // the app restarts. The candidate then matched nothing, Save was offered, and
+  // a second record with identical numbers was stored — which the noise floor
+  // and the sensitivity fit then counted as independent evidence.
+  const flights = [
+    {yawPID: '315,100,29,3,1', seconds: 61.25, errorDps: 0.0812},
+    {yawPID: '315,140,29,3,1', seconds: 74.5, errorDps: 0.0633},
+    {yawPID: '315,180,29,3,1', seconds: 88.75, errorDps: 0.0541}
+  ];
+  // A FRESH session object every call: what decoding the same bytes again gives.
+  const decode = ({yawPID, seconds, errorDps}) =>
+    record({sourceSession: m4maxSession(yawPID), seconds, errorDps});
+
+  let history = createHistory();
+  for (const flight of flights) {
+    history = addFlightRecord(history, decode(flight));
+  }
+  const restarted = importHistory(exportHistory(history)).history;
+  const stored = findRecords(restarted, history.records[0].aircraftKey);
+
+  for (const [label, kept] of [['opened again', history], ['after a restart', restarted]]) {
+    const again = selectBaseline(kept, decode(flights[1]));
+    assert.equal(again.storedAs, stored[1].recordId,
+      `${label}: a flight already kept was offered to be saved again`);
+    assert.equal(again.matchedBy, 'content', label);
+    assert.equal(again.baseline?.recordId, stored[0].recordId,
+      `${label}: the baseline must be the flight before it, not the newest one`);
+
+    const firstAgain = selectBaseline(kept, decode(flights[0]));
+    assert.equal(firstAgain.storedAs, stored[0].recordId, label);
+    assert.equal(firstAgain.baseline, null, label);
+  }
+
+  // A different flight is not swallowed. One hold number apart after rounding,
+  // or one millisecond longer, and it is new — compared with the newest stored.
+  for (const [label, changed] of [
+    ['one hold number differs', {...flights[1], errorDps: flights[1].errorDps + 0.0002}],
+    ['one millisecond longer', {...flights[1], seconds: flights[1].seconds + 0.002}]
+  ]) {
+    const fresh = selectBaseline(restarted, decode(changed));
+    assert.equal(fresh.storedAs, null, `${label}: a new flight was reported as already kept`);
+    assert.equal(fresh.matchedBy, null, label);
+    assert.equal(fresh.baseline?.recordId, stored[2].recordId, label);
+  }
+
+  // A record that measured nothing has no numbers to agree on: the window's
+  // length and the header alone are not enough to call two flights one.
+  const bare = source => buildFlightRecord({session: source, window: airborneWindow(90)});
+  const unmeasured = addFlightRecord(createHistory(), bare(m4maxSession('315,100,29,3,1')));
+  assert.equal(selectBaseline(unmeasured, bare(m4maxSession('315,100,29,3,1'))).storedAs, null);
+});
+
+test('a copy already in the history is never a baseline, because its place in the list is '
+  + 'when it was saved again, not when it was flown', () => {
+  // Histories written before copies were recognised can already hold them: A,
+  // B, then A saved again after a restart. The next new flight followed B. A
+  // baseline taken from the copy's position would compare it against A — a
+  // flight it did not follow — with B's change silently folded in.
+  const flights = [
+    {yawPID: '315,100,29,3,1', seconds: 61.25, errorDps: 0.0812},
+    {yawPID: '315,140,29,3,1', seconds: 74.5, errorDps: 0.0633},
+    {yawPID: '315,180,29,3,1', seconds: 88.75, errorDps: 0.0541}
+  ];
+  const decode = ({yawPID, seconds, errorDps}) =>
+    record({sourceSession: m4maxSession(yawPID), seconds, errorDps, ordinal: null});
+
+  let history = createHistory();
+  for (const flight of [flights[0], flights[1], flights[0]]) {
+    history = addFlightRecord(history, decode(flight));
+  }
+  const stored = findRecords(history, history.records[0].aircraftKey);
+  assert.equal(stored.length, 3, 'the fixture must hold the copy, as an old history would');
+
+  const next = decode(flights[2]);
+  const chosen = selectBaseline(history, next);
+  assert.equal(chosen.storedAs, null);
+  assert.equal(chosen.baseline?.recordId, stored[1].recordId,
+    'a new flight was compared with a re-saved copy of an older one');
+  assert.deepEqual(
+    compareFlightRecords(chosen.baseline, next).gainChanges
+      .map(change => [change.axis, change.term, change.from, change.to]),
+    [['yaw', 'I', 140, 180]]
+  );
+
+  // And the flight that was copied is recognised by its FIRST save.
+  const again = selectBaseline(history, decode(flights[0]));
+  assert.equal(again.storedAs, stored[0].recordId);
+  assert.equal(again.baseline, null);
+});
+
+/**
+ * Every non-empty set of axes. A superset of what the viewer's memory budget
+ * ever leaves analysed — all three, the selected axis and the next one, or the
+ * selected axis alone — so a sweep over it covers every open the app can make.
+ */
+const AXIS_SUBSETS = Object.freeze([
+  ['roll'], ['pitch'], ['yaw'],
+  ['roll', 'pitch'], ['roll', 'yaw'], ['pitch', 'yaw'],
+  ['roll', 'pitch', 'yaw']
+]);
+
+/**
+ * A flight's measurable numbers, drawn at random at the precision the record
+ * stores them: one head speed (it is one rotor), and per axis its own noise,
+ * hold error, ripple and stop tracking. `seconds` is to the millisecond, as
+ * `windowDurationSeconds` keeps it.
+ */
+function randomViewerFlight(random) {
+  const to = (value, places) => Math.round(value * 10 ** places) / 10 ** places;
+  const headspeed = to(1500 + random() * 1500, 1);
+  const axes = {};
+  for (const axis of ['roll', 'pitch', 'yaw']) {
+    axes[axis] = {
+      headspeed,
+      filtered: to(0.2 + random() * 4, 4),
+      unfiltered: to(1 + random() * 9, 4),
+      error: to(0.01 + random() * 0.6, 4),
+      ripple: to(0.05 + random() * 0.8, 4),
+      tracking: to(5 + random() * 50, 4)
+    };
+  }
+  return {
+    yawPID: `315,${[80, 100, 120, 140, 180][Math.floor(random() * 5)]},29,3,1`,
+    seconds: to(30 + random() * 400, 3),
+    axes
+  };
+}
+
+/** `flight` with one number moved by `by`. */
+function nudged(flight, axis, field, by) {
+  return {
+    ...flight,
+    axes: {...flight.axes, [axis]: {...flight.axes[axis], [field]: flight.axes[axis][field] + by}}
+  };
+}
+
+/**
+ * The record the viewer builds for `flight` when its memory budget let it
+ * analyse `analysed` (ui/app.mjs, `collectRecommendationMaterial`): head speed
+ * and noise on EVERY axis, because `summarizeAxis` runs before the budget is
+ * checked, and hold and stop evidence only on the analysed ones.
+ *
+ * A fresh session object on every call unless one is passed — which is what
+ * decoding the same file again, or restarting the app, gives.
+ */
+function viewerRecord(flight, analysed, {sourceSession = null, headers = {}, basis = null} = {}) {
+  const source = sourceSession ?? session({headers: {
+    'Craft name': 'M4Max', 'Board information': 'NEXUS', yawPID: flight.yawPID, ...headers
+  }});
+  const axes = {};
+  for (const axis of ['roll', 'pitch', 'yaw']) {
+    const numbers = flight.axes[axis];
+    const wasAnalysed = analysed.includes(axis);
+    axes[axis] = {
+      headspeedMedianRpm: numbers.headspeed,
+      noise: {
+        filteredHighFrequencyRmsDps: numbers.filtered,
+        unfilteredHighFrequencyRmsDps: numbers.unfiltered
+      },
+      holdEvidence: wasAnalysed
+        ? holdEvidence({
+          axis,
+          meanAbsoluteSteadyStateErrorDps: numbers.error,
+          meanErrorRippleRmsDps: numbers.ripple
+        })
+        : null,
+      stopEvidence: wasAnalysed ? stopEvidence({axis, trackingRmsDps: numbers.tracking}) : null
+    };
+  }
+  const window = airborneWindow(flight.seconds);
+  if (basis !== null) {
+    window.basis = basis;
+  }
+  return buildFlightRecord({session: source, window, axes});
+}
+
+/** Whether any term of the model counted a record as a second save of a flight. */
+function countedAsDuplicate(history) {
+  const key = history.records[0].aircraftKey;
+  return buildSensitivityModel(history, key).terms
+    .some(term => (term.exclusions.DUPLICATE_OF_STORED_FLIGHT ?? 0) > 0);
+}
+
+test('the same flight opened again with a different axis selected is still recognised, '
+  + 'swept over every pair of analysed axes', () => {
+  // MEASURED FAILURE. The viewer measures hold and stop evidence only for the
+  // axes its memory budget allows, starting with the one selected in the Axis
+  // panel — and that picker is back on roll after a restart. On a flight over
+  // about 120k records per axis (two minutes at 1 kHz, so most real flights),
+  // one saved with yaw selected and opened again with roll selected carried
+  // hold numbers on different axes, so a signature over every axis did not
+  // match: Save was offered again, and the flight's own earlier save became its
+  // baseline. Between about 120k and 180k records two axes are analysed, and
+  // the axis both opens shared then counted twice in the floor and the fit.
+  let compared = 0;
+  for (let seed = 0; seed < 40; seed += 1) {
+    const random = makeRandom(seed * 104_729 + 7);
+    const flights = Array.from({length: 3}, () => randomViewerFlight(random));
+    for (const savedWith of AXIS_SUBSETS) {
+      let history = createHistory();
+      for (const flight of flights) {
+        history = addFlightRecord(history, viewerRecord(flight, savedWith));
+      }
+      // After a restart: nothing process-local survives, only what was stored.
+      const restarted = importHistory(exportHistory(history)).history;
+      const stored = findRecords(restarted, history.records[0].aircraftKey);
+      assert.equal(stored.length, 3);
+
+      for (const reopenedWith of AXIS_SUBSETS) {
+        for (const [index, flight] of flights.entries()) {
+          const label = `seed ${seed}, flight ${index + 1}: saved with `
+            + `${savedWith.join('+')} analysed, opened again with ${reopenedWith.join('+')}`;
+          const found = selectBaseline(restarted, viewerRecord(flight, reopenedWith));
+          assert.equal(found.storedAs, stored[index].recordId,
+            `${label}: a flight already kept was offered to be saved again`);
+          assert.equal(found.matchedBy, 'content', label);
+          assert.equal(found.baseline?.recordId ?? null,
+            index === 0 ? null : stored[index - 1].recordId,
+            `${label}: compared against a flight it did not follow`);
+          compared += 1;
+        }
+      }
+    }
+  }
+  assert.equal(compared, 40 * 7 * 7 * 3, 'the sweep did not run every pair');
+});
+
+test('a flight differing in any identity field, or in any number both saves measured, is a '
+  + 'different flight', () => {
+  const flight = randomViewerFlight(makeRandom(4_242));
+  const history = addFlightRecord(createHistory(), viewerRecord(flight, ['yaw', 'roll']));
+  const storedId = history.records[0].recordId;
+
+  // THE CONTROL, without which every refusal below could pass on a matcher that
+  // never matches: the same flight opened again with roll and pitch analysed —
+  // roll shared, yaw and pitch each measured by one open only — IS this flight.
+  const control = viewerRecord(flight, ['roll', 'pitch']);
+  assert.equal(selectBaseline(history, control).storedAs, storedId);
+  assert.equal(countedAsDuplicate(addFlightRecord(history, control)), true,
+    'the control must reach the model as a copy, or the model half below proves nothing');
+
+  // Each of these differs from the stored flight in exactly one thing. Every
+  // identity field is pinned on its own, so dropping any one of them from the
+  // comparison turns its line red.
+  const variants = [
+    ['a different yaw gain',
+      viewerRecord(flight, ['roll', 'pitch'], {headers: {yawPID: '315,101,29,3,1'}})],
+    ['a different roll gain',
+      viewerRecord(flight, ['roll', 'pitch'], {headers: {rollPID: '53,105,0,100,0'}})],
+    ['a different firmware revision',
+      viewerRecord(flight, ['roll', 'pitch'],
+        {headers: {'Firmware revision': 'Rotorflight 4.6.1 (5d2a1c0) STM32F7X2'}})],
+    ['a different rate curve',
+      viewerRecord(flight, ['roll', 'pitch'], {headers: {rc_rates: '5,5,13'}})],
+    ['a different window basis',
+      viewerRecord(flight, ['roll', 'pitch'], {basis: FlightWindowBasis.ENDED_IN_FLIGHT})],
+    ['one millisecond longer',
+      viewerRecord({...flight, seconds: flight.seconds + 0.001}, ['roll', 'pitch'])],
+    ['a different head speed on one axis',
+      viewerRecord(nudged(flight, 'pitch', 'headspeed', 0.1), ['roll', 'pitch'])],
+    ['different filtered noise on one axis',
+      viewerRecord(nudged(flight, 'roll', 'filtered', 0.0001), ['roll', 'pitch'])],
+    ['different unfiltered noise on one axis',
+      viewerRecord(nudged(flight, 'yaw', 'unfiltered', 0.0001), ['roll', 'pitch'])],
+    ['a different hold error on the axis both measured',
+      viewerRecord(nudged(flight, 'roll', 'error', 0.0001), ['roll', 'pitch'])],
+    ['a different hold ripple on the axis both measured',
+      viewerRecord(nudged(flight, 'roll', 'ripple', 0.0001), ['roll', 'pitch'])],
+    ['a different stop tracking on the axis both measured',
+      viewerRecord(nudged(flight, 'roll', 'tracking', 0.0001), ['roll', 'pitch'])]
+  ];
+  for (const [label, variant] of variants) {
+    const found = selectBaseline(history, variant);
+    assert.equal(found.storedAs, null, `${label}: a different flight was reported as already kept`);
+    assert.equal(found.matchedBy, null, label);
+    assert.equal(found.baseline?.recordId, storedId, `${label}: it follows the stored flight`);
+    assert.equal(countedAsDuplicate(addFlightRecord(history, variant)), false,
+      `${label}: the model counted a different flight as a second save of the stored one`);
+  }
+
+  // Nothing both saves measured is nothing to agree on. Head speed and noise
+  // missing from one, and hold evidence on different axes: no number was seen
+  // twice, so no number can say these are one flight.
+  const blind = buildFlightRecord({
+    session: session({headers: {
+      'Craft name': 'M4Max', 'Board information': 'NEXUS', yawPID: flight.yawPID
+    }}),
+    window: airborneWindow(flight.seconds),
+    axes: {pitch: {holdEvidence: holdEvidence({
+      axis: 'pitch',
+      meanAbsoluteSteadyStateErrorDps: flight.axes.pitch.error,
+      meanErrorRippleRmsDps: flight.axes.pitch.ripple
+    })}}
+  });
+  assert.equal(selectBaseline(history, blind).storedAs, null,
+    'two records with no measured number in common were called one flight');
+  assert.equal(countedAsDuplicate(addFlightRecord(history, blind)), false);
+
+  // And swept: a random flight, saved and re-opened with random axes that share
+  // at least one analysed axis, with one random shared number moved.
+  let refused = 0;
+  for (let seed = 0; seed < 300; seed += 1) {
+    const random = makeRandom(seed * 7_727 + 3);
+    const original = randomViewerFlight(random);
+    const savedWith = AXIS_SUBSETS[Math.floor(random() * AXIS_SUBSETS.length)];
+    const reopenedWith = AXIS_SUBSETS[Math.floor(random() * AXIS_SUBSETS.length)];
+    const both = savedWith.filter(axis => reopenedWith.includes(axis));
+    const choices = [
+      ...['roll', 'pitch', 'yaw'].flatMap(axis =>
+        [[axis, 'filtered', 0.0001], [axis, 'unfiltered', 0.0001], [axis, 'headspeed', 0.1]]),
+      ...both.flatMap(axis =>
+        [[axis, 'error', 0.0001], [axis, 'ripple', 0.0001], [axis, 'tracking', 0.0001]])
+    ];
+    const [axis, field, by] = choices[Math.floor(random() * choices.length)];
+    const kept = addFlightRecord(createHistory(), viewerRecord(original, savedWith));
+    const moved = viewerRecord(nudged(original, axis, field, by), reopenedWith);
+    const label = `seed ${seed}: ${axis} ${field} moved, saved with ${savedWith.join('+')}, `
+      + `opened with ${reopenedWith.join('+')}`;
+    assert.equal(selectBaseline(kept, moved).storedAs, null, label);
+    assert.equal(countedAsDuplicate(addFlightRecord(kept, moved)), false, label);
+    refused += 1;
+  }
+  assert.equal(refused, 300);
+});
+
+test('a stored flight saved twice matches a candidate only when EVERY save of it agrees, '
+  + 'swept over seeds, axis pairs and the measured fields', () => {
+  // A history written before reopened flights were recognised can hold one
+  // flight twice, saved under different axis subsets. A candidate that agrees
+  // with one save and contradicts the other is not that flight: matching on any
+  // save would hide Save and bind Forget to a flight the candidate is not.
+  const axes = ['roll', 'pitch', 'yaw'];
+  let refused = 0;
+  let controls = 0;
+  for (let seed = 0; seed < 20; seed += 1) {
+    const flight = randomViewerFlight(makeRandom(seed * 3_571 + 11));
+    for (const first of axes) {
+      for (const second of axes.filter(axis => axis !== first)) {
+        let history = createHistory();
+        history = addFlightRecord(history, viewerRecord(flight, [first]));
+        history = addFlightRecord(history, viewerRecord(flight, [second]));
+        const restarted = importHistory(exportHistory(history)).history;
+        const stored = findRecords(restarted, history.records[0].aircraftKey);
+
+        // Control: the two saves ARE one flight, and the unmoved candidate is it.
+        const same = selectBaseline(restarted, viewerRecord(flight, [first, second]));
+        assert.equal(same.storedAs, stored[0].recordId, `seed ${seed}: control did not match`);
+        assert.deepEqual([...same.sameFlightIds], stored.map(record => record.recordId),
+          `seed ${seed}: the two saves were not read as one flight`);
+        controls += 1;
+
+        // Moved only on the axis the FIRST save measured: the second save, which
+        // never measured that axis, still agrees with it.
+        for (const [field, by] of [['error', 0.01], ['ripple', 0.01], ['tracking', 0.01]]) {
+          const label = `seed ${seed}: saved with ${first} then ${second}, ${first} ${field} moved`;
+          const candidate = viewerRecord(nudged(flight, first, field, by), [first, second]);
+          const found = selectBaseline(restarted, candidate);
+          assert.equal(found.storedAs, null,
+            `${label}: matched a flight one of whose saves contradicts it`);
+          assert.equal(found.matchedBy, null, label);
+          assert.equal(found.baseline?.recordId, stored[0].recordId,
+            `${label}: it follows the stored flight, named by its first save`);
+          refused += 1;
+        }
+      }
+    }
+  }
+  assert.equal(controls, 20 * 6);
+  assert.equal(refused, 20 * 6 * 3, 'the sweep did not run every case');
+});
+
+test('a shared part with only a status or a count is not a measured figure, so it cannot '
+  + 'make two records one flight', () => {
+  // An analysed axis with zero holds keeps holdCount 0 and a status; one with
+  // zero stops keeps a status and event counts of 0. Both are common on real
+  // flights (the corpus has no roll or pitch stops at all). Equal statuses and
+  // counts are what two DIFFERENT flights of one header share as easily as one
+  // flight saved twice, so they must never be the evidence.
+  const hold = axis => ({
+    schemaVersion: 1, kind: HOLD_EVIDENCE_KIND, axis, term: 'I',
+    status: 'inconclusive', codes: ['NO_HOLDS'], holds: [], summary: null
+  });
+  const stop = axis => ({
+    schemaVersion: 1, kind: DIRECTIONAL_EVIDENCE_KIND, axis, status: 'inconclusive',
+    codes: ['NO_STOPS'],
+    directions: {
+      positive: {status: 'inconclusive', codes: ['INSUFFICIENT_DIRECTION_STOPS']},
+      negative: {status: 'inconclusive', codes: ['INSUFFICIENT_DIRECTION_STOPS']}
+    },
+    asymmetry: {}, directionsComparable: false, totalEventCount: 0, discardedEventCount: 0
+  });
+  const build = (parts, analysed, noise = null) => {
+    const axes = {};
+    for (const axis of ['roll', 'pitch', 'yaw']) {
+      axes[axis] = {
+        ...(noise === null ? {} : {noise}),
+        holdEvidence: analysed.includes(axis) && parts.includes('hold') ? hold(axis) : null,
+        stopEvidence: analysed.includes(axis) && parts.includes('stop') ? stop(axis) : null
+      };
+    }
+    return buildFlightRecord({
+      session: m4maxSession('315,100,29,3,1'), window: airborneWindow(97.125), axes
+    });
+  };
+
+  let refused = 0;
+  for (const analysed of AXIS_SUBSETS) {
+    for (const parts of [['hold'], ['stop'], ['hold', 'stop']]) {
+      const label = `${parts.join('+')} with no figure on ${analysed.join('+')}`;
+      const stored = addFlightRecord(createHistory(), build(parts, analysed));
+      const storedId = stored.records[0].recordId;
+
+      // Setup guard: the parts really are present, with a status and no figure.
+      for (const axis of analysed) {
+        const kept = stored.records[0].axes[axis];
+        if (parts.includes('hold')) {
+          assert.equal(kept.hold.status, 'inconclusive', label);
+          assert.equal(kept.hold.holdCount, 0, label);
+          assert.equal(kept.hold.meanAbsoluteSteadyStateErrorDps, null, label);
+        }
+        if (parts.includes('stop')) {
+          assert.equal(kept.stop.status, 'inconclusive', label);
+          assert.equal(kept.stop.positive.eventCount, 0, label);
+          assert.equal(kept.stop.positive.trackingRmsDps, null, label);
+        }
+        assert.equal(kept.headspeedMedianRpm, null, label);
+      }
+
+      const found = selectBaseline(stored, build(parts, analysed));
+      assert.equal(found.storedAs, null,
+        `${label}: equal statuses and counts were taken for a measured figure`);
+      assert.equal(found.matchedBy, null, label);
+      assert.equal(countedAsDuplicate(addFlightRecord(stored, build(parts, analysed))), false,
+        `${label}: the model counted it as a second save`);
+
+      // Control: the same two records plus ONE shared measured figure are one
+      // flight, so the refusal above is about the figure and nothing else.
+      const noise = {filteredHighFrequencyRmsDps: 1.2345, unfilteredHighFrequencyRmsDps: 3.4567};
+      const withFigure = addFlightRecord(createHistory(), build(parts, analysed, noise));
+      assert.equal(selectBaseline(withFigure, build(parts, analysed, noise)).storedAs,
+        withFigure.records[0].recordId, `${label}: control with a shared figure did not match`);
+      assert.notEqual(storedId, null);
+      refused += 1;
+    }
+  }
+  assert.equal(refused, AXIS_SUBSETS.length * 3);
+});
+
+test('within one decoded session, the session recognises its saved flight even after the '
+  + 'stored numbers moved', () => {
+  // The content match cannot do this, and must not: picking an axis the memory
+  // budget skipped re-runs the analysis on the SAME decoded session, and the
+  // window can be moved and moved back. Those change what the candidate
+  // carries, and the session it came from is then the only thing that knows it
+  // is the flight already kept. Without it Save comes back for a flight that is
+  // on disk.
+  const source = m4maxSession('315,100,29,3,1');
+  const flight = randomViewerFlight(makeRandom(99));
+  const history = addFlightRecord(createHistory(),
+    viewerRecord(flight, ['roll'], {sourceSession: source}));
+  const storedId = history.records[0].recordId;
+  const moved = nudged(flight, 'roll', 'error', 0.01);
+
+  const sameSession = selectBaseline(history,
+    viewerRecord(moved, ['roll', 'yaw'], {sourceSession: source}));
+  assert.equal(sameSession.storedAs, storedId,
+    'the flight on screen, from the session it was saved from, was offered to be saved again');
+  assert.equal(sameSession.matchedBy, 'session');
+
+  // THE CONTROL that makes the line above about the session and not the
+  // numbers: the same changed numbers from a FRESH decode are not this flight,
+  // while the unchanged numbers from a fresh decode are.
+  const freshSession = () => m4maxSession('315,100,29,3,1');
+  const fresh = selectBaseline(history,
+    viewerRecord(moved, ['roll', 'yaw'], {sourceSession: freshSession()}));
+  assert.equal(fresh.storedAs, null, 'a moved number was matched by content');
+  assert.equal(fresh.matchedBy, null);
+  assert.equal(selectBaseline(history,
+    viewerRecord(flight, ['roll', 'yaw'], {sourceSession: freshSession()})).matchedBy, 'content');
+});
+
+test('Forget takes every save of a flight, so no copy is left standing in for it at the '
+  + 'place it was saved again', () => {
+  // MEASURED FAILURE. In a history already holding [A, B, A saved again],
+  // "Forget this flight" was bound to the first save. It removed that and left
+  // the copy, which then WAS the flight — at the position it was saved again,
+  // after B. Opened again, A was matched to the copy, B became its baseline,
+  // and the panel reported yaw I going from 140 to 100.
+  const flights = [
+    {yawPID: '315,100,29,3,1', seconds: 61.25, errorDps: 0.0812},
+    {yawPID: '315,140,29,3,1', seconds: 74.5, errorDps: 0.0633},
+    {yawPID: '315,180,29,3,1', seconds: 88.75, errorDps: 0.0541}
+  ];
+  const decode = ({yawPID, seconds, errorDps}, analysed) => record({
+    sourceSession: m4maxSession(yawPID), seconds, errorDps, ordinal: null, analysed
+  });
+
+  let history = createHistory();
+  history = addFlightRecord(history, decode(flights[0], ['yaw']));
+  history = addFlightRecord(history, decode(flights[1], ['yaw']));
+  // A saved again after a restart, with the picker back on roll.
+  history = addFlightRecord(history, decode(flights[0], ['roll', 'pitch']));
+  history = addFlightRecord(history, decode(flights[2], ['yaw']));
+  history = importHistory(exportHistory(history)).history;
+  const key = history.records[0].aircraftKey;
+  const stored = findRecords(history, key);
+  const ids = kept => findRecords(kept, key).map(entry => entry.recordId);
+
+  const reopened = selectBaseline(history, decode(flights[0], ['roll']));
+  assert.equal(reopened.storedAs, stored[0].recordId, 'A is stored, as its FIRST save');
+  assert.deepEqual(reopened.sameFlightIds, [stored[0].recordId, stored[2].recordId],
+    'every save of the flight must be named, or Forget cannot take them all');
+
+  assert.equal(typeof historyModule.forgetSavesOfFlight, 'function');
+  const forgotten = historyModule.forgetSavesOfFlight(history, reopened.storedAs);
+  assert.deepEqual(ids(forgotten), [stored[1].recordId, stored[3].recordId],
+    'a save of the forgotten flight is still in the history');
+  const after = selectBaseline(forgotten, decode(flights[0], ['roll']));
+  assert.equal(after.storedAs, null,
+    'a copy is standing in for the forgotten flight, at the place it was saved again');
+
+  // From the copy's own row in the history panel: the same flight, so the
+  // same answer.
+  assert.deepEqual(ids(historyModule.forgetSavesOfFlight(history, stored[2].recordId)),
+    [stored[1].recordId, stored[3].recordId]);
+  // A flight saved once loses exactly itself.
+  assert.deepEqual(ids(historyModule.forgetSavesOfFlight(history, stored[1].recordId)),
+    [stored[0].recordId, stored[2].recordId, stored[3].recordId]);
+  // An id that is not there changes nothing.
+  assert.deepEqual(ids(historyModule.forgetSavesOfFlight(history, 'm4max::nexus#99')),
+    stored.map(entry => entry.recordId));
+  // And the panel's list of which rows are a later save, and of what.
+  assert.deepEqual({...historyModule.resavedCopies(history, key)},
+    {[stored[2].recordId]: stored[0].recordId});
+
+  // A record that agrees with ONE save of a flight but contradicts another is
+  // not that flight, and Forget must not take it. F was saved with yaw, then
+  // again with roll; R has F's roll numbers but a different yaw hold, so it
+  // cannot be F whatever its roll says.
+  const flight = randomViewerFlight(makeRandom(31_337));
+  let mixed = createHistory();
+  for (const entry of [
+    viewerRecord(flight, ['yaw']),
+    viewerRecord(flight, ['roll']),
+    viewerRecord(nudged(flight, 'yaw', 'error', 0.01), ['roll', 'yaw'])
+  ]) {
+    mixed = addFlightRecord(mixed, entry);
+  }
+  const [first, again, other] = findRecords(mixed, mixed.records[0].aircraftKey);
+  assert.deepEqual({...historyModule.resavedCopies(mixed, first.aircraftKey)},
+    {[again.recordId]: first.recordId},
+    'a record contradicting a save of a flight was folded into that flight');
+  assert.deepEqual(
+    findRecords(historyModule.forgetSavesOfFlight(mixed, first.recordId), first.aircraftKey)
+      .map(entry => entry.recordId),
+    [other.recordId],
+    'Forget took a different flight that agreed with one save of the forgotten one');
+});
+
 // ---------------------------------------------------------------------------
 // The per-aircraft sensitivity model
 //
@@ -1568,10 +2190,16 @@ function gaussian(random) {
  * gains, firmware, rates, head speed, vibration — is held constant unless a
  * fixture deliberately moves it, which is what makes each gate reachable one at
  * a time.
+ *
+ * EACH ENTRY IS A DIFFERENT FLIGHT, so each gets a different length unless it
+ * names one. Two records that agree on every stored number — length to the
+ * millisecond included — are what one flight saved twice looks like, and the
+ * model counts that once. Real flights never agree to the millisecond; a
+ * fixture that means a re-save passes the same `seconds` on purpose.
  */
 function sensitivityHistory(flights) {
   let history = createHistory();
-  for (const flight of flights) {
+  for (const [index, flight] of flights.entries()) {
     const {
       yawP = 315,
       yawI = 250,
@@ -1580,14 +2208,18 @@ function sensitivityHistory(flights) {
       rippleRmsDps = 0.3,
       holdCount = 4,
       headspeedMedianRpm = 2000,
-      headers = {}
+      seconds = 120 + index,
+      headers = {},
+      analysed = ['roll', 'pitch', 'yaw']
     } = flight;
     history = addFlightRecord(history, record({
       headers: {yawPID: `${yawP},${yawI},${yawD},3,1`, ...headers},
       errorDps,
       rippleRmsDps,
       holdCount,
-      headspeedMedianRpm
+      headspeedMedianRpm,
+      seconds,
+      analysed
     }));
   }
   return history;
@@ -2123,6 +2755,190 @@ test('a noisy aircraft loosens its own floor early; a quiet one tightens it late
   assert.equal(early.source, 'corpus');
   assert.equal(early.appliedDps, corpus);
 });
+
+/**
+ * Flights as they look when each is saved twice: once, then again after the app
+ * restarted or the file was opened again. Every stored number agrees, the
+ * length to the millisecond included, because it is the same flight.
+ */
+function savedTwice(flights) {
+  return [...flights, ...flights];
+}
+
+test('a flight saved twice is one flight to the noise floor, so re-saving cannot tighten it', () => {
+  // MEASURED FAILURE. Six flights gave the corpus floor (15 null pairs, 6
+  // flights). The same six saved twice gave 12 "flights" and 66 pairs, cleared
+  // both tightening gates (20 pairs, 10 flights), and every copy added a delta
+  // of exactly zero — so the yaw floor halved, which also satisfied the
+  // own-aircraft condition for quoting a magnitude. No new flying happened.
+  const corpus = SENSITIVITY_FLOOR_DPS.yaw;
+  const six = Array.from({length: 6}, (unused, index) => ({
+    errorDps: 0.2 + (index % 3) * 0.004,
+    seconds: 100 + index * 7
+  }));
+
+  const model = buildSensitivityModel(sensitivityHistory(savedTwice(six)), SENSITIVITY_KEY);
+  const floor = model.floors.yaw;
+  assert.equal(model.flightCount, 12, 'every stored record is still listed');
+  assert.equal(floor.source, 'corpus',
+    `six flights saved twice taught the floor (${floor.reason}, ${floor.nullPairCount} pairs)`);
+  assert.equal(floor.appliedDps, corpus);
+  assert.equal(floor.nullFlightCount, 6);
+  assert.equal(floor.nullPairCount, 15);
+
+  // THE CONTROL, so the refusal above cannot be passed by a floor that never
+  // moves: twelve genuinely different flights with the same spread DO tighten.
+  const twelve = buildSensitivityModel(sensitivityHistory(
+    Array.from({length: 12}, (unused, index) => ({
+      errorDps: 0.2 + (index % 3) * 0.004,
+      seconds: 100 + index * 7
+    }))
+  ), SENSITIVITY_KEY).floors.yaw;
+  assert.equal(twelve.reason, 'OWN_AIRCRAFT_IS_QUIETER');
+  assert.equal(twelve.nullFlightCount, 12);
+  assert.ok(twelve.appliedDps < corpus);
+});
+
+test('a flight saved twice is one point to the fit, so three flights cannot become six', () => {
+  // MEASURED FAILURE. Three yaw I flights (80, 100, 120) are `collecting`. Saved
+  // twice they were six points — enough for a fit — and the repeat of 120 → 80
+  // satisfied "the gain went back down at least once", so the term reached
+  // `usable` with a direction from three flights of evidence.
+  const three = [80, 100, 120].map((yawI, index) => ({
+    yawI,
+    errorDps: 60 / yawI,
+    seconds: 90 + index * 11
+  }));
+
+  const term = yawIterm(savedTwice(three));
+  assert.notEqual(term.state, SENSITIVITY_STATE.USABLE,
+    `three flights saved twice reached ${term.state}`);
+  assert.equal(term.state, SENSITIVITY_STATE.COLLECTING);
+  assert.equal(term.pointCount, 3);
+  assert.equal(term.fit, null, 'no slope may be fitted to copies');
+  assert.equal(term.exclusions.DUPLICATE_OF_STORED_FLIGHT, 3,
+    'each copy is accounted for by name rather than silently dropped');
+  assert.equal(
+    Object.values(term.exclusions).reduce((sum, count) => sum + count, 0),
+    6,
+    'the counts still reconcile with every stored record'
+  );
+
+  // THE CONTROL: the same three values genuinely RE-FLOWN — different flights,
+  // so their numbers differ a little — are six points, and do conclude. What
+  // separated the two histories is only whether the second three were new.
+  const wobble = [-0.0004, 0.0003, 0.0005];
+  const reflown = [...three, ...[80, 100, 120].map((yawI, index) => ({
+    yawI,
+    errorDps: 60 / yawI + wobble[index],
+    seconds: 130 + index * 11
+  }))];
+  const control = yawIterm(reflown);
+  assert.equal(control.pointCount, 6);
+  assert.equal(control.state, SENSITIVITY_STATE.USABLE,
+    `three values re-flown reached ${control.state} (${control.codes.join(',')})`);
+});
+
+test('an old flight saved again does not make its old profile the current one', () => {
+  // A usable six-flight yaw I ladder under one roll profile, then a flight
+  // under a NEW roll profile — which is what is being flown now — and then one
+  // of the old flights saved again after a restart, which puts a copy of the
+  // old profile at the end of the list. Taken at its word, that copy made the
+  // old six-point profile current again and the term `usable`, about a
+  // configuration the pilot had already moved away from.
+  const ladder = [200, 100, 400, 150, 500, 300].map((yawI, index) => ({
+    yawI,
+    errorDps: 50 / yawI,
+    seconds: 100 + index
+  }));
+  const term = yawIterm([
+    ...ladder,
+    {yawI: 250, errorDps: 0.2, seconds: 150, headers: {rollPID: '60,105,0,100,0'}},
+    ladder[2]
+  ]);
+
+  assert.notEqual(term.state, SENSITIVITY_STATE.USABLE,
+    'a re-saved copy brought a superseded profile back as the current one');
+  assert.equal(term.state, SENSITIVITY_STATE.COLLECTING);
+  assert.equal(term.pointCount, 1, 'the current profile is the one flown last');
+  assert.equal(term.exclusions.DUPLICATE_OF_STORED_FLIGHT, 1);
+});
+
+test('a copy teaches the model exactly what forgetting it would, swept over random histories',
+  () => {
+    // THE PROPERTY, rather than three hand-picked cases. A history with copies
+    // saved anywhere after their originals must give the same floors, states,
+    // fits, magnitudes and points as the same history with those copies
+    // FORGOTTEN — forgotten rather than never stored, so every original keeps
+    // the ordinal it was saved under, as it would on a phone. Only the listing
+    // may differ: each copy is counted, by name, against every term.
+    const LEVELS = [80, 120, 200];
+    let usable = 0;
+    let ownFloor = 0;
+    for (let seed = 0; seed < 600; seed += 1) {
+      const random = makeRandom(seed * 7_919 + 101);
+      const count = 4 + Math.floor(random() * 15);
+      const originals = [];
+      for (let index = 0; index < count; index += 1) {
+        const yawI = LEVELS[Math.floor(random() * LEVELS.length)];
+        originals.push({
+          yawI,
+          errorDps: Math.max(0.002, 60 / yawI + gaussian(random) * 0.01),
+          // Distinct by construction: consecutive flights are 1.5 s apart and
+          // the jitter is under a second.
+          seconds: 100 + index * 1.5 + Math.round(random() * 999) / 1000,
+          headspeedMedianRpm: random() < 0.1 ? 2300 : 2000,
+          headers: random() < 0.15 ? {rollPID: '60,105,0,100,0'} : {}
+        });
+      }
+
+      const sequence = originals.map(flight => ({flight, copy: false}));
+      const copyCount = 1 + Math.floor(random() * 8);
+      for (let made = 0; made < copyCount; made += 1) {
+        const original = originals[Math.floor(random() * count)];
+        const at = sequence.findIndex(entry => entry.flight === original && !entry.copy);
+        // Half the copies were saved after a restart with a different axis
+        // selected, so the memory budget analysed a different set of axes and
+        // the copy carries hold and stop numbers on different axes from its
+        // original. On a two-axis flight that is the shape that inflated the
+        // shared axis's floor.
+        const copy = random() < 0.5
+          ? original
+          : {...original, analysed: AXIS_SUBSETS[Math.floor(random() * AXIS_SUBSETS.length)]};
+        sequence.splice(at + 1 + Math.floor(random() * (sequence.length - at)), 0,
+          {flight: copy, copy: true});
+      }
+
+      const withCopies = sensitivityHistory(sequence.map(entry => entry.flight));
+      const copyIds = withCopies.records
+        .filter((stored, index) => sequence[index].copy)
+        .map(stored => stored.recordId);
+      const forgotten = copyIds.reduce((carried, id) => forgetFlight(carried, id), withCopies);
+
+      const model = buildSensitivityModel(withCopies, SENSITIVITY_KEY);
+      const reference = buildSensitivityModel(forgotten, SENSITIVITY_KEY);
+      assert.equal(model.flightCount, reference.flightCount + copyIds.length);
+      assert.deepEqual(model.floors, reference.floors, `seed ${seed}: a copy moved the floor`);
+      for (const term of model.terms) {
+        const {exclusions, ...said} = term;
+        const {exclusions: referenceExclusions, ...referenceSaid} =
+          findSensitivityTerm(reference, term.axis, term.term);
+        assert.deepEqual(said, referenceSaid,
+          `seed ${seed}: a copy changed what ${term.axis} ${term.term} says`);
+        const {DUPLICATE_OF_STORED_FLIGHT: counted = 0, ...rest} = exclusions;
+        assert.equal(counted, copyIds.length, `seed ${seed}: a copy went uncounted`);
+        assert.deepEqual(rest, {...referenceExclusions});
+      }
+
+      usable += findSensitivityTerm(model, 'yaw', 'I').state === SENSITIVITY_STATE.USABLE ? 1 : 0;
+      ownFloor += model.floors.yaw.source === 'own-aircraft' ? 1 : 0;
+    }
+
+    // The sweep has to reach the states a copy could corrupt, or it proves
+    // nothing: a direction being spoken, and a floor learned from repeats.
+    assert.ok(usable >= 100, `only ${usable} of 600 histories reached a usable yaw I`);
+    assert.ok(ownFloor >= 100, `only ${ownFloor} of 600 histories learned their own yaw floor`);
+  });
 
 test('the learned floor gets its own sentence, pinned separately from the default', () => {
   // THE TRAP THIS AVOIDS: the existing `describeNoiseFloor` test keeps passing

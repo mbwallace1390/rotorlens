@@ -42,6 +42,7 @@ import {createUiServer} from '../tools/serve-ui.mjs';
 import {
   addFlightRecord, buildFlightRecord, createHistory, exportHistory
 } from '../src/analysis/flight-history.mjs';
+import {HOLD_EVIDENCE_KIND} from '../src/analysis/pid-evidence.mjs';
 
 function findBrowser() {
   const {
@@ -134,13 +135,41 @@ function connect(endpoint) {
 }
 
 /**
+ * The decoder as the page receives it when a test asks for `faultableDecoder`.
+ *
+ * `decodeLog` is a module binding inside ui/app.mjs, so nothing in the page can
+ * reach the sessions a FIRST open creates before `openSession(0)` has captured
+ * one and started reading it. This stands in for src/blackbox/decode.mjs,
+ * re-exports the real module (fetched under a query string, which the UI
+ * server ignores and the interception does not match), and hands each result
+ * to `globalThis.__rotorlensDecodeFault` when a test has set one — which is
+ * where a test swaps in a session whose `decodeFrames` throws.
+ *
+ * Nothing in src/ or ui/ changes for it; this exists only on the wire.
+ */
+const FAULTABLE_DECODER = `
+export * from './decode.mjs?real';
+import {decodeLog as realDecodeLog} from './decode.mjs?real';
+export function decodeLog(bytes, options) {
+  const result = realDecodeLog(bytes, options);
+  const fault = globalThis.__rotorlensDecodeFault;
+  if (typeof fault === 'function') {
+    fault(result);
+  }
+  return result;
+}
+`;
+
+/**
  * Runs `body` against a freshly loaded viewer.
  *
  * `block` is a list of paths the browser must refuse, intercepted before the
  * request leaves — the same thing the WebView sees when an asset is missing
- * from the APK.
+ * from the APK. `faultableDecoder` serves FAULTABLE_DECODER in place of the
+ * decoder module.
  */
-async function withViewer({block = [], startupScript = null} = {}, body) {
+async function withViewer({block = [], startupScript = null, faultableDecoder = false} = {},
+  body) {
   const server = createUiServer();
   const port = await listen(server);
   const debugPort = await freePort();
@@ -183,13 +212,29 @@ async function withViewer({block = [], startupScript = null} = {}, body) {
       }, sessionId);
     }
 
-    if (block.length > 0) {
-      await client.send('Fetch.enable', {
-        patterns: block.map(target => ({urlPattern: `*${target}`, requestStage: 'Request'}))
-      }, sessionId);
+    const decoderPath = '/src/blackbox/decode.mjs';
+    const patterns = [
+      ...block.map(target => ({urlPattern: `*${target}`, requestStage: 'Request'})),
+      ...(faultableDecoder ? [{urlPattern: `*${decoderPath}`, requestStage: 'Request'}] : [])
+    ];
+    if (patterns.length > 0) {
+      await client.send('Fetch.enable', {patterns}, sessionId);
 
       client.on(message => {
         if (message.method !== 'Fetch.requestPaused' || message.sessionId !== sessionId) {
+          return;
+        }
+        const requested = new URL(message.params.request.url);
+        if (faultableDecoder && requested.pathname === decoderPath && requested.search === '') {
+          client.send('Fetch.fulfillRequest', {
+            requestId: message.params.requestId,
+            responseCode: 200,
+            responseHeaders: [
+              {name: 'Content-Type', value: 'text/javascript; charset=utf-8'},
+              {name: 'Cache-Control', value: 'no-store'}
+            ],
+            body: Buffer.from(FAULTABLE_DECODER).toString('base64')
+          }, sessionId).catch(() => { /* the page may already be gone */ });
           return;
         }
         refused.push(message.params.request.url);
@@ -668,7 +713,19 @@ test('async native writes are confirmed before repaint and stale taps do not reo
   });
 });
 
-test('the automatic consent path defers while About is the topmost in-app page', {
+/**
+ * OWNER DECISION, 2 October 2026: the consent dialog is no longer raised by
+ * itself after an analysis. It asks for a licence on community-contribution
+ * terms that its own footnote calls an unreviewed draft, and this build cannot
+ * send anything anyway. `AUTOMATIC_SHARING_PROMPT` in ui/app.mjs is the switch.
+ *
+ * This test used to pin the opposite — that the automatic prompt fired, and
+ * deferred while About & Legal was on top. It now pins that the automatic path
+ * stays shut even over an admissible flight with nothing covering it, and keeps
+ * the About deferral covered through the path that still exists: the Share
+ * button on the sharing panel.
+ */
+test('the consent dialog is never raised automatically, and the panel path defers to About', {
   skip: browserSkip
 }, async () => {
   const history = exportHistory(createHistory());
@@ -694,14 +751,45 @@ test('the automatic consent path defers while About is the topmost in-app page',
       const consent = document.getElementById('consent');
       const header = document.querySelector('body > header');
       const main = document.querySelector('body > main');
+      const sharingToggle = () => document.getElementById('sharing-toggle');
 
+      for (let attempt = 0; attempt < 200 && !(app.state.sharingWritable && sharingToggle());
+        attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+
+      // 1. The automatic path, with every condition it used to need met: a
+      //    candidate flight, a writable store, a question never answered, and
+      //    nothing on top of the page.
+      app.state.candidate = {forced: 'automatic-consent-path'};
+      app.maybeAskToShare();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const automatic = {
+        flag: app.AUTOMATIC_SHARING_PROMPT,
+        writable: app.state.sharingWritable,
+        asked: app.state.sharing?.asked ?? null,
+        consentOpen: !consent.classList.contains('hidden'),
+        stateOpen: app.state.consentOpen,
+        mainInert: main.hasAttribute('inert'),
+        writes: window.__sharingWrites()
+      };
+
+      // 2. About on top, and the panel's Share button pressed underneath it.
+      //    The click is counted where the app's own delegated handler listens,
+      //    so the assertion below cannot pass merely because the inert page
+      //    swallowed the click before the consent gate ever saw it.
+      let panelClicks = 0;
+      document.getElementById('sharing').addEventListener('click', () => {
+        panelClicks += 1;
+      });
       toggle.focus();
       toggle.click();
       await new Promise(resolve => requestAnimationFrame(() => resolve()));
-      app.state.candidate = {forced: 'automatic-consent-path'};
-      app.maybeAskToShare();
+      sharingToggle().click();
+      await new Promise(resolve => setTimeout(resolve, 0));
 
       const covered = {
+        panelClicks,
         legalOpen: !legal.classList.contains('hidden'),
         consentOpen: !consent.classList.contains('hidden'),
         headerInert: header.hasAttribute('inert'),
@@ -715,35 +803,78 @@ test('the automatic consent path defers while About is the topmost in-app page',
       }));
       await new Promise(resolve => setTimeout(resolve, 0));
 
+      const afterEscape = {
+        legalOpen: !legal.classList.contains('hidden'),
+        consentOpen: !consent.classList.contains('hidden'),
+        headerInert: header.hasAttribute('inert'),
+        mainInert: main.hasAttribute('inert'),
+        focus: document.activeElement?.id ?? null,
+        writes: window.__sharingWrites()
+      };
+
       toggle.click();
       await new Promise(resolve => requestAnimationFrame(() => resolve()));
       const handledBack = window.RotorLensHandleBack();
       await new Promise(resolve => setTimeout(resolve, 0));
+      const afterAndroidBack = {
+        handled: handledBack,
+        legalOpen: !legal.classList.contains('hidden'),
+        consentOpen: !consent.classList.contains('hidden'),
+        headerInert: header.hasAttribute('inert'),
+        mainInert: main.hasAttribute('inert'),
+        focus: document.activeElement?.id ?? null,
+        writes: window.__sharingWrites()
+      };
+
+      // 3. The manual path, with nothing on top: the dialog still opens, on
+      //    the declining answer, and opening it records nothing.
+      sharingToggle().click();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const manual = {
+        consentOpen: !consent.classList.contains('hidden'),
+        stateOpen: app.state.consentOpen,
+        mainInert: main.hasAttribute('inert'),
+        focus: document.activeElement?.id ?? null,
+        writes: window.__sharingWrites()
+      };
+      document.getElementById('consent-not-now').click();
+      for (let attempt = 0; attempt < 200 && app.state.consentOpen; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      const declined = {
+        consentOpen: !consent.classList.contains('hidden'),
+        mainInert: main.hasAttribute('inert'),
+        writes: window.__sharingWrites()
+      };
+
       return JSON.stringify({
-        covered,
-        afterEscape: {
-          legalOpen: !legal.classList.contains('hidden'),
-          consentOpen: !consent.classList.contains('hidden'),
-          headerInert: header.hasAttribute('inert'),
-          mainInert: main.hasAttribute('inert'),
-          focus: document.activeElement?.id ?? null,
-          writes: window.__sharingWrites()
-        },
-        afterAndroidBack: {
-          handled: handledBack,
-          legalOpen: !legal.classList.contains('hidden'),
-          consentOpen: !consent.classList.contains('hidden'),
-          headerInert: header.hasAttribute('inert'),
-          mainInert: main.hasAttribute('inert'),
-          focus: document.activeElement?.id ?? null,
-          writes: window.__sharingWrites()
-        }
+        automatic, covered, afterEscape, afterAndroidBack, manual, declined
       });
     })()`);
 
+    // 1. Never automatically. The setup lines first: the old gate refused
+    //    without a writable store or with the question already answered, so
+    //    "not shown" proves nothing unless both were in the asking state.
+    assert.equal(result.automatic.writable, true,
+      'the sharing store is not writable, so the automatic gate would refuse for that reason');
+    assert.equal(result.automatic.asked, false,
+      'the question was already answered, so the automatic gate would refuse for that reason');
+    assert.equal(result.automatic.consentOpen, false,
+      'the consent dialog opened by itself after an analysis. Its licence terms are an '
+      + 'unreviewed draft, and the owner turned the automatic prompt off on 2 October 2026');
+    assert.equal(result.automatic.stateOpen, false);
+    assert.equal(result.automatic.mainInert, false,
+      'the page was made inert behind a dialog nobody asked for');
+    assert.equal(result.automatic.writes, 0);
+    assert.equal(result.automatic.flag, false,
+      'AUTOMATIC_SHARING_PROMPT must stay false until the owner adopts reviewed terms');
+
+    // 2. The panel path, pressed underneath About & Legal.
+    assert.equal(result.covered.panelClicks, 1,
+      'the Share click never reached the sharing panel, so this does not test the consent gate');
     assert.equal(result.covered.legalOpen, true);
     assert.equal(result.covered.consentOpen, false,
-      'the automatic prompt must not compose underneath About & Legal');
+      'the consent dialog must not compose underneath About & Legal');
     assert.equal(result.covered.headerInert, true);
     assert.equal(result.covered.mainInert, true);
     assert.equal(result.covered.focus, 'legal-back');
@@ -766,6 +897,18 @@ test('the automatic consent path defers while About is the topmost in-app page',
     assert.equal(result.afterAndroidBack.mainInert, false);
     assert.equal(result.afterAndroidBack.focus, 'legal-toggle');
     assert.equal(result.afterAndroidBack.writes, 0);
+
+    // 3. The path that remains still works.
+    assert.equal(result.manual.consentOpen, true,
+      'the Share button on the sharing panel must still open the complete terms');
+    assert.equal(result.manual.stateOpen, true);
+    assert.equal(result.manual.mainInert, true);
+    assert.equal(result.manual.focus, 'consent-not-now',
+      'the dialog must open on the declining answer');
+    assert.equal(result.manual.writes, 0, 'opening the terms is not itself an answer');
+    assert.equal(result.declined.consentOpen, false);
+    assert.equal(result.declined.mainInert, false);
+    assert.equal(result.declined.writes, 1, '"Not now" records exactly one declined answer');
     assert.deepEqual(pageErrors, []);
   });
 });
@@ -889,6 +1032,10 @@ test('enabled consent from an older disclosure fails closed on upgrade', {
     assert.equal(result.termsVersion, null);
     assert.equal(result.id, sharingId, 'terms migration must retain the existing deletion handle');
     assert.match(result.text, /older disclosure.*off now/is);
+    // The automatic prompt is off, so "RotorLens will ask again" would be a
+    // promise this build does not keep.
+    assert.doesNotMatch(result.text, /will ask again/i);
+    assert.match(result.text, /will not ask on its own/i);
     assert.doesNotMatch(result.text, /Nothing about sharing is stored on this device/i);
     assert.equal(result.writes, 0,
       'loading old consent may disable it in memory without rewriting user data');
@@ -989,6 +1136,8 @@ test('a host with no sharing store renders the enable control disabled', {
     assert.equal(result.disabled, true);
     assert.equal(result.ariaDisabled, 'true');
     assert.match(result.text, /sharing cannot be enabled here/i);
+    assert.doesNotMatch(result.text, /press Share measurements/i,
+      'the panel sends the pilot to the button it has just disabled');
     assert.deepEqual(pageErrors, []);
   });
 });
@@ -1157,17 +1306,30 @@ test('a host import dismisses consent without recording an answer', {
   await withViewer({startupScript}, async ({evaluate, pageErrors}) => {
     const result = await evaluate(`(async () => {
       const {state} = await import('/ui/app.mjs');
-      state.consentOpen = true;
-      document.querySelector('header').inert = true;
-      document.querySelector('main').inert = true;
-      document.getElementById('consent').classList.remove('hidden');
-      document.getElementById('consent-not-now').focus();
+      // Opened the way it can still open: from the Share button on the sharing
+      // panel. The automatic prompt is off since 2 October 2026 (see
+      // AUTOMATIC_SHARING_PROMPT), so forcing the dialog up through state would
+      // be testing a screen no pilot can reach.
+      for (let attempt = 0; attempt < 200
+        && !(state.sharingWritable && document.getElementById('sharing-toggle'));
+        attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      document.getElementById('sharing-toggle').click();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const opened = {
+        open: state.consentOpen,
+        shown: !document.getElementById('consent').classList.contains('hidden'),
+        mainInert: document.querySelector('main').inert,
+        writes: window.__sharingWrites()
+      };
 
       window.dispatchEvent(new CustomEvent('rotorlens-import-started', {detail: {
         name: 'replacement.LOG', total: -1, generation: 41
       }}));
       await new Promise(resolve => setTimeout(resolve, 20));
       return JSON.stringify({
+        opened,
         open: state.consentOpen,
         hidden: document.getElementById('consent').classList.contains('hidden'),
         headerInert: document.querySelector('header').inert,
@@ -1177,6 +1339,10 @@ test('a host import dismisses consent without recording an answer', {
       });
     })()`);
 
+    assert.equal(result.opened.open, true, 'the Share button never opened the consent dialog');
+    assert.equal(result.opened.shown, true);
+    assert.equal(result.opened.mainInert, true);
+    assert.equal(result.opened.writes, 0);
     assert.equal(result.open, false);
     assert.equal(result.hidden, true);
     assert.equal(result.headerInert, false);
@@ -1472,6 +1638,24 @@ test('a flight whose header is damaged says so instead of showing another flight
       const listed = options();
       const healthyStats = $('session-stats').textContent;
 
+      // Let the healthy flight's analysis finish, so its advice and its
+      // before/after panel are on screen to be left behind. Selecting the broken
+      // flight before then would retire the analysis mid-run and prove nothing.
+      let analysed = false;
+      for (let attempt = 0; attempt < 800; attempt += 1) {
+        if ($('recommend-status').textContent.length > 0
+            && !$('since-panel').classList.contains('hidden')) {
+          analysed = true;
+          break;
+        }
+        await sleep(25);
+      }
+      const healthy = {
+        analysed,
+        answer: $('recommend-answer').textContent,
+        sinceUp: !$('since-panel').classList.contains('hidden')
+      };
+
       // Select the broken flight, the way a pilot would.
       const picker = $('session');
       picker.value = String(brokenIndex);
@@ -1489,7 +1673,13 @@ test('a flight whose header is damaged says so instead of showing another flight
         // These measure samples there are none of, so they must be down.
         plotUp: !$('plot-panel').classList.contains('hidden'),
         fieldsUp: !$('fields-panel').classList.contains('hidden'),
-        sessionPanelUp: !$('session-panel').classList.contains('hidden')
+        sessionPanelUp: !$('session-panel').classList.contains('hidden'),
+        // The before/after lives outside the measurement panels, so it needs
+        // its own check: it carries a Save button for the PREVIOUS flight.
+        sinceUp: !$('since-panel').classList.contains('hidden'),
+        since: $('since').textContent,
+        answer: $('recommend-answer').textContent,
+        admission: state.candidateAdmission
       };
 
       // And the rest of the dump still works: back to a healthy flight.
@@ -1510,6 +1700,7 @@ test('a flight whose header is damaged says so instead of showing another flight
         brokenIndex,
         listed,
         healthyStats,
+        healthy,
         broken,
         recoveredStats: $('session-stats').textContent,
         recoveredPlotUp: !$('plot-panel').classList.contains('hidden')
@@ -1547,6 +1738,20 @@ test('a flight whose header is damaged says so instead of showing another flight
     assert.equal(run.broken.sessionPanelUp, true,
       'the session panel went away entirely, so nothing tells the pilot what happened');
 
+    // The healthy flight's advice and its before/after panel. The setup first:
+    // a panel that was never up cannot fail to come down.
+    assert.equal(run.healthy.analysed, true, 'the healthy flight never finished its analysis');
+    assert.notEqual(run.healthy.answer, '', 'the healthy flight never put an answer up');
+    assert.equal(run.healthy.sinceUp, true, 'the healthy flight never showed its before/after');
+    assert.equal(run.broken.sinceUp, false,
+      'the HEALTHY flight\'s before/after panel, Save button and all, is still up under a flight '
+      + `that cannot be read: "${run.broken.since.slice(0, 120)}"`);
+    assert.equal(run.broken.since, '', 'the before/after markup was left behind');
+    assert.equal(run.broken.admission, null,
+      'the healthy flight is still the candidate for saving under the broken one');
+    assert.equal(run.broken.answer, '',
+      'the healthy flight\'s answer is still in the page under the broken flight');
+
     // 3. One broken header costs one flight, not the file. Sessions are
     //    independent — that is the property this whole design rests on.
     assert.notEqual(run.recoveredStats, run.broken.stats,
@@ -1556,5 +1761,943 @@ test('a flight whose header is damaged says so instead of showing another flight
 
     assert.deepEqual(pageErrors, [],
       `opening a damaged flight threw in the page: ${JSON.stringify(pageErrors)}`);
+  });
+});
+
+/**
+ * In-page helpers shared by the tests below. Plain text spliced into each
+ * `evaluate` body, so every test drives the same real controls the same way.
+ *
+ * `screen()` reads every panel that measures a flight, because the defects
+ * these tests guard all have one shape: a panel left up, or a panel's markup
+ * left in place, after the flight it described has gone.
+ */
+const PAGE_HELPERS = `
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const up = id => !$(id).classList.contains('hidden');
+  const waitFor = async (condition, attempts = 800) => {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (condition()) return true;
+      await sleep(25);
+    }
+    return false;
+  };
+  const openBytes = (bytes, name) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([bytes], name));
+    const input = $('file');
+    input.files = transfer.files;
+    input.dispatchEvent(new Event('change'));
+  };
+  // A flight that has been analysed all the way: the advice has its provenance
+  // line, the before/after panel has had its say, and the axis numbers are up.
+  const analysed = () => $('recommend-status').textContent.length > 0
+    && up('since-panel') && $('axis-stats').children.length > 0;
+  const screen = () => ({
+    answer: $('recommend-answer').textContent,
+    recommend: $('recommend').textContent,
+    recommendStatus: $('recommend-status').textContent,
+    recommendUp: up('recommend-panel'),
+    since: $('since').textContent,
+    sinceUp: up('since-panel'),
+    axisStats: $('axis-stats').textContent,
+    axisUp: up('axis-panel'),
+    windowUp: up('window-panel'),
+    tuneUp: up('tune-panel'),
+    plotUp: up('plot-panel'),
+    fieldsUp: up('fields-panel'),
+    sessionUp: up('session-panel'),
+    issues: $('session-issues').textContent,
+    status: $('status').textContent,
+    progressUp: up('decode-progress')
+  });
+`;
+
+const TRUNCATED_HEADER = '/fixtures/synthetic/rf46-truncated-header.TXT';
+const STOP_MANOEUVRES = '/fixtures/synthetic/rf46-stop-manoeuvres.TXT';
+
+/** Every panel that measures a flight must be down, and its numbers gone. */
+function assertFlightTakenDown(view, label) {
+  assert.equal(view.answer, '',
+    `${label}: the previous flight's "What to change" answer is still on the page: `
+    + `"${view.answer.slice(0, 120)}"`);
+  assert.equal(view.recommend, '',
+    `${label}: the previous flight's advice cards are still in the page`);
+  assert.equal(view.recommendStatus, '',
+    `${label}: the previous flight's "Measured over…" line is still in the page`);
+  assert.equal(view.recommendUp, false, `${label}: the advice panel is still up`);
+  assert.equal(view.sinceUp, false,
+    `${label}: the previous flight's before/after panel is still up, Save button and all`);
+  assert.equal(view.since, '', `${label}: the before/after markup was left behind`);
+  assert.equal(view.axisStats, '',
+    `${label}: the previous flight's axis numbers are still in the page: `
+    + `"${view.axisStats.slice(0, 120)}"`);
+  assert.equal(view.axisUp, false, `${label}: the axis panel is still up`);
+  assert.equal(view.windowUp, false, `${label}: the flight-window panel is still up`);
+  assert.equal(view.tuneUp, false, `${label}: the tune panel is still up`);
+  assert.equal(view.plotUp, false, `${label}: the plot panel is still up`);
+  assert.equal(view.fieldsUp, false, `${label}: the field table is still up`);
+  assert.equal(view.sessionUp, true,
+    `${label}: the session panel went away, so nothing on screen says what happened`);
+}
+
+test('a flight with a header and no frames takes the previous flight down and says why', {
+  skip: browserSkip
+}, async () => {
+  // rf46-truncated-header.TXT parses to 37 fields and 0 samples: a log whose
+  // header was written and whose frames never arrived, which is what a power
+  // loss or an immediate disarm leaves. `summarizeAxis` returns null for no
+  // samples, and the axis panel dereferenced that and threw — inside an async
+  // handler, so the previous flight's advice and axis numbers stayed on screen
+  // under the new file's name, and the open never finished.
+  //
+  // Driven three ways: as the only flight in a file opened after a healthy
+  // one, as the last flight of a dump reached through the picker, and back to
+  // a healthy flight afterwards.
+  await withViewer({}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      ${PAGE_HELPERS}
+      const {state} = await import('/ui/app.mjs');
+      const good = new Uint8Array(await (await fetch('${TWO_SESSIONS}')).arrayBuffer());
+      const empty = new Uint8Array(await (await fetch('${TRUNCATED_HEADER}')).arrayBuffer());
+
+      // 1. A healthy flight, analysed all the way to advice and axis numbers.
+      openBytes(good, 'GOOD.BBL');
+      const goodReady = await waitFor(analysed);
+      const before = screen();
+
+      // 2. A file whose only flight has a header and no frames.
+      openBytes(empty, 'EMPTY.TXT');
+      const emptyOpened = await waitFor(() => state.result?.sessions?.[0]?.framesDecoded === true
+        && $('status').textContent.includes('EMPTY.TXT'));
+      await sleep(400);
+      const emptySession = state.result?.sessions?.[0];
+      const afterOpen = {
+        ...screen(),
+        fields: emptySession?.fields?.length ?? -1,
+        samples: emptySession?.samples?.length ?? -1
+      };
+
+      // 3. The same shape as the LAST flight of a dump cut after its header,
+      //    reached through the picker. Built in memory; sessions are
+      //    concatenated with no separator, so this is a real dump's layout.
+      const dump = new Uint8Array(good.length + empty.length);
+      dump.set(good, 0);
+      dump.set(empty, good.length);
+      openBytes(dump, 'CUT.BBL');
+      const dumpReady = await waitFor(() => state.result?.sessions?.length === 3
+        && $('status').textContent.includes('CUT.BBL') && analysed());
+      const beforeSwitch = screen();
+      const picker = $('session');
+      picker.value = '2';
+      picker.dispatchEvent(new Event('change'));
+      const switched = await waitFor(() => state.sessionIndex === 2
+        && state.result.sessions[2].framesDecoded === true);
+      await sleep(400);
+      const cut = state.result.sessions[2];
+      const afterSwitch = {
+        ...screen(),
+        picked: picker.value,
+        fields: cut.fields.length,
+        samples: cut.samples ? cut.samples.length : -1
+      };
+
+      // 4. And back. One empty flight costs one flight, not the file.
+      picker.value = '0';
+      picker.dispatchEvent(new Event('change'));
+      const recovered = await waitFor(() => state.sessionIndex === 0 && analysed());
+
+      return JSON.stringify({
+        goodReady, before, emptyOpened, afterOpen,
+        dumpReady, beforeSwitch, switched, afterSwitch,
+        recovered, recoveredScreen: screen()
+      });
+    })()`);
+
+    // The setup has to have worked, or every assertion below passes for the
+    // wrong reason: a screen that never had advice on it cannot fail to clear it.
+    assert.equal(run.goodReady, true, 'the healthy log never finished its analysis');
+    assert.notEqual(run.before.answer, '', 'the healthy log never put an answer up');
+    assert.notEqual(run.before.axisStats, '', 'the healthy log never put axis numbers up');
+    assert.equal(run.emptyOpened, true, 'the header-only file never finished opening');
+    assert.ok(run.afterOpen.fields > 0 && run.afterOpen.samples === 0,
+      `the fixture must be a parsed header with no frames, and it decoded to `
+      + `${run.afterOpen.fields} fields and ${run.afterOpen.samples} samples`);
+
+    // A file opened after a healthy one.
+    assertFlightTakenDown(run.afterOpen, 'header-only file');
+    assert.match(run.afterOpen.issues, /no flight data was recorded/i,
+      `the session panel must say why there is nothing: "${run.afterOpen.issues.slice(0, 160)}"`);
+    // The fixture's decoder skipped 11 bytes after its header: too few to have
+    // held a single frame, so "ends at, or just after, its header" is what the
+    // bytes say. A header followed by kilobytes nobody could decode is a
+    // different fault with a different sentence — see the test after this one.
+    assert.match(run.afterOpen.issues, /ends at, or just after, its header/i);
+    assert.doesNotMatch(run.afterOpen.issues, /could not be decoded/i,
+      'a log that simply stops after its header was described as an undecodable one');
+    assert.doesNotMatch(run.afterOpen.issues, /header block is damaged/i,
+      'the header was read; calling it damaged sends the pilot after the wrong fault');
+    assert.match(run.afterOpen.status, /EMPTY\.TXT/);
+    assert.match(run.afterOpen.status, /read in \d+ ms/,
+      'the open never completed: the status line is the one painted BEFORE the flight was read, '
+      + `so everything after the read was skipped: "${run.afterOpen.status}"`);
+    // NOT asserted here: whether the decode progress bar came down. A 1.3 KiB
+    // file never shows it (the bar waits for 2 MiB or 300 ms), so that
+    // assertion held with `endDecodeProgress` deleted. The test of the bar
+    // opens a file big enough to raise it.
+
+    // The last flight of a dump, through the picker.
+    assert.equal(run.dumpReady, true, 'the cut dump never finished its first analysis');
+    assert.notEqual(run.beforeSwitch.answer, '',
+      'the first flight of the cut dump never put an answer up');
+    assert.equal(run.switched, true, 'the header-only flight was never selected');
+    assert.equal(run.afterSwitch.picked, '2');
+    assert.ok(run.afterSwitch.fields > 0 && run.afterSwitch.samples === 0,
+      `the last flight of the dump must be a header with no frames: `
+      + `${run.afterSwitch.fields} fields, ${run.afterSwitch.samples} samples`);
+    assertFlightTakenDown(run.afterSwitch, 'header-only flight in a dump');
+    assert.match(run.afterSwitch.issues, /no flight data was recorded/i);
+    assert.match(run.afterSwitch.status, /session 3 read in \d+ ms/,
+      `the switch never completed: "${run.afterSwitch.status}"`);
+
+    assert.equal(run.recovered, true, 'going back to a healthy flight never re-analysed it');
+    assert.equal(run.recoveredScreen.recommendUp, true);
+    assert.notEqual(run.recoveredScreen.axisStats, '');
+
+    assert.deepEqual(pageErrors, [],
+      `a flight with no frames threw in the page: ${JSON.stringify(pageErrors)}`);
+  });
+});
+
+test('moving the flight window retires tune evidence measured over the old window', {
+  skip: browserSkip
+}, async () => {
+  // The Tune evidence panel is a measurement of the flight window, like every
+  // other number on the page. All three ways of moving the window re-measured
+  // everything else and left it standing — still counting stops that now lay
+  // outside the window — while the marks it had drawn on the trace were wiped.
+  await withViewer({}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      ${PAGE_HELPERS}
+      const placeholder = () => /Pick a term and analyse/.test($('tune').textContent);
+      const tune = () => ({
+        text: $('tune').textContent.replace(/[ ]+/g, ' ').trim().slice(0, 160),
+        placeholder: placeholder()
+      });
+      const analyseNow = () => {
+        $('analyse').click();
+        return tune();
+      };
+
+      const bytes = new Uint8Array(await (await fetch('${STOP_MANOEUVRES}')).arrayBuffer());
+      openBytes(bytes, 'STOPS.BBL');
+      const ready = await waitFor(analysed);
+
+      $('axis').value = 'roll';
+      $('axis').dispatchEvent(new Event('change'));
+      $('term').value = 'P';
+
+      const analysedWhole = analyseNow();
+      $('window-whole').click();
+      const afterWhole = tune();
+
+      const analysedDetect = analyseNow();
+      $('window-detect').click();
+      const afterDetect = tune();
+
+      const analysedSlider = analyseNow();
+      const start = $('window-start');
+      const sliderUsable = !start.disabled;
+      start.value = String(Math.min(900, Number(start.value) + 100));
+      start.dispatchEvent(new Event('input'));
+      start.dispatchEvent(new Event('change'));
+      const afterSlider = tune();
+
+      return JSON.stringify({
+        ready, sliderUsable,
+        analysedWhole, afterWhole,
+        analysedDetect, afterDetect,
+        analysedSlider, afterSlider
+      });
+    })()`);
+
+    assert.equal(run.ready, true, 'the log never finished its first analysis');
+    assert.equal(run.sliderUsable, true, 'the window sliders were disabled on this log');
+
+    for (const [path, analysed, after] of [
+      ['Whole log', run.analysedWhole, run.afterWhole],
+      ['Use the detected flight', run.analysedDetect, run.afterDetect],
+      ['dragging Takeoff', run.analysedSlider, run.afterSlider]
+    ]) {
+      // Without this the assertion after it cannot fail: a panel that never
+      // left the placeholder cannot be shown to return to it.
+      assert.equal(analysed.placeholder, false,
+        `Analyse did not replace the placeholder before ${path}: "${analysed.text}"`);
+      assert.equal(after.placeholder, true,
+        `after ${path} the Tune evidence panel still shows evidence measured over the OLD `
+        + `window: "${after.text}"`);
+    }
+    // There used to be a check here, 600 ms later, that the re-run analysis had
+    // not put old tune evidence back. Nothing in the analysis writes #tune, so
+    // once the three assertions above hold it could not fail; it was removed
+    // rather than kept as a check that only looks like one.
+    assert.deepEqual(pageErrors, []);
+  });
+});
+
+test('a decoder fault on a session switch stays on screen and takes the previous flight down', {
+  skip: browserSkip
+}, async () => {
+  // `decodeFrames()` throwing is a decoder defect or an allocation failure
+  // under memory pressure — rare, and exactly when the pilot most needs to be
+  // told. openSession wrote "Decoder fault" and returned; the picker's handler
+  // then repainted the status line over it with a normal "read in 0 ms", and
+  // the previous flight's advice, before/after and axis numbers stayed up under
+  // a picker naming the flight that failed.
+  //
+  // The decoder defines `decodeFrames` non-writable, so the fault is injected
+  // by standing a session in front of the real one that inherits everything
+  // from it and throws from `decodeFrames` — the one thing that differs.
+  await withViewer({}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      ${PAGE_HELPERS}
+      const {state} = await import('/ui/app.mjs');
+      const bytes = new Uint8Array(await (await fetch('${TWO_SESSIONS}')).arrayBuffer());
+      openBytes(bytes, 'PAIR.BBL');
+      const ready = await waitFor(() => state.result?.sessions?.length === 2 && analysed());
+      const before = screen();
+
+      const beforeAdmission = state.candidateAdmission;
+      const real = state.result.sessions[1];
+      const unopened = real.framesDecoded === false;
+      // What was still on screen at the moment the new flight began to be
+      // read — the one moment a slow decode lets a pilot see. Every end state
+      // is cleared again later by the fault, so only this can show whether the
+      // previous flight's advice was retired BEFORE the read.
+      let duringRead = null;
+      state.result.sessions[1] = Object.create(real, {
+        decodeFrames: {value() {
+          duringRead = {
+            answer: $('recommend-answer').textContent,
+            recommend: $('recommend').textContent,
+            sinceUp: up('since-panel'),
+            since: $('since').textContent,
+            admission: state.candidateAdmission
+          };
+          throw new RangeError('Invalid array length');
+        }}
+      });
+
+      const picker = $('session');
+      picker.value = '1';
+      picker.dispatchEvent(new Event('change'));
+      const switched = await waitFor(() => state.sessionIndex === 1);
+      await sleep(400);
+      return JSON.stringify({
+        ready, before, beforeAdmission, unopened, switched, duringRead,
+        after: {
+          ...screen(),
+          picked: picker.value,
+          admission: state.candidateAdmission
+        }
+      });
+    })()`);
+
+    assert.equal(run.ready, true, 'the log never finished its first analysis');
+    assert.notEqual(run.before.answer, '', 'the first flight never put an answer up');
+    assert.equal(run.before.sinceUp, true, 'the first flight never showed its before/after panel');
+    assert.equal(run.unopened, true,
+      'the second flight was already read, so the switch never reaches decodeFrames()');
+    assert.equal(run.switched, true);
+    assert.equal(run.after.picked, '1');
+
+    assert.match(run.after.status, /Decoder fault: Invalid array length/,
+      `the fault was painted over: the status line reads "${run.after.status}"`);
+    assertFlightTakenDown(run.after, 'decoder fault');
+    assert.match(run.after.issues, /could not read this flight/i,
+      `the session panel must say this flight was not read: "${run.after.issues.slice(0, 160)}"`);
+    // The setup line for the two below: the first flight had been judged for
+    // saving, so there was a before/after to retire. (It is not admissible, so
+    // `state.candidate` was null all along and is not asserted on.)
+    assert.notEqual(run.beforeAdmission, null, 'the first flight was never judged for saving');
+    assert.equal(run.after.admission, null,
+      'the previous flight is still the candidate for saving under a flight that failed');
+
+    // RETIRED BEFORE THE READ, not merely by the time it failed. Picking a
+    // flight must take the previous one's advice and before/after down before
+    // reading a byte of the new one: on a large dump that read takes seconds,
+    // and for all of them the old answer stood under a picker naming the new
+    // flight.
+    assert.ok(run.duringRead, 'decodeFrames() was never entered, so nothing here was measured');
+    assert.equal(run.duringRead.answer, '',
+      `while the new flight was being read, the previous flight's answer was still up: `
+      + `"${run.duringRead.answer.slice(0, 120)}"`);
+    assert.equal(run.duringRead.recommend, '', 'and its advice cards');
+    assert.equal(run.duringRead.sinceUp, false, 'and its before/after panel');
+    assert.equal(run.duringRead.since, '', 'and its before/after markup');
+    assert.equal(run.duringRead.admission, null, 'and it was still the candidate for saving');
+    // The progress bar is not asserted here: a 14 KiB session never raises it,
+    // so the check could not fail. The bar has its own test with a session big
+    // enough to show it.
+    assert.deepEqual(pageErrors, []);
+  });
+});
+
+/**
+ * In-page, after PAGE_HELPERS: the two-session fixture, where its first
+ * flight's header block ends, and a builder for that header followed by bytes
+ * no decoder can read as a frame. Built in memory; nothing is written to disk.
+ *
+ * A newline every KiB of junk keeps the header parser from reading the junk as
+ * one header line longer than it allows, so the junk reaches the FRAME
+ * decoder — which is the case being built.
+ */
+const BODY_BUILDERS = `
+  const good = new Uint8Array(await (await fetch('${TWO_SESSIONS}')).arrayBuffer());
+  let headerEnd = 0;
+  for (let index = 0; index < good.length - 1; index += 1) {
+    if (good[index] === 10 && good[index + 1] !== 72) { headerEnd = index + 1; break; }
+  }
+  const undecodable = length => {
+    const bytes = new Uint8Array(headerEnd + length);
+    bytes.set(good.subarray(0, headerEnd), 0);
+    bytes.fill(0xff, headerEnd);
+    for (let index = headerEnd + 1023; index < bytes.length; index += 1024) {
+      bytes[index] = 10;
+    }
+    return bytes;
+  };
+`;
+
+test('a flight whose frames cannot be decoded, or that holds one sample, says exactly that', {
+  skip: browserSkip
+}, async () => {
+  // MEASURED. A header followed by kilobytes the decoder cannot read decodes to
+  // the same shape as a log that stops at its header — fields, no samples, one
+  // corrupt-frame error — apart from how many bytes the decoder skipped. The
+  // panel told both that the log ended at its header, "what a log looks like
+  // when power was lost or the model was disarmed", with the decoder's own
+  // corrupt-frame code printed directly above: the pilot was sent after the
+  // wrong fault. And a flight cut one frame after its header went the whole
+  // analysis path, which put "The analysis could not be run" over axis numbers
+  // measured from a single sample.
+  await withViewer({}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      ${PAGE_HELPERS}
+      ${BODY_BUILDERS}
+      const {state} = await import('/ui/app.mjs');
+      const {decodeLog} = await import('/src/blackbox/decode.mjs');
+
+      // The shortest cut of the first flight that holds exactly one sample.
+      let oneSample = null;
+      for (let length = headerEnd; length < good.length && oneSample === null; length += 1) {
+        const probe = decodeLog(good.subarray(0, length), {lazy: true}).sessions[0];
+        probe.decodeFrames();
+        if (probe.samples.length === 1) { oneSample = good.slice(0, length); }
+        if (probe.samples.length > 1) { break; }
+      }
+
+      // Each one opened over a healthy flight that was analysed all the way, so
+      // there is advice on screen to be left behind.
+      const openAfterHealthy = async (bytes, name) => {
+        openBytes(good, 'GOOD-' + name);
+        const ready = await waitFor(analysed);
+        openBytes(bytes, name);
+        const opened = await waitFor(() => state.result?.sessions?.[0]?.framesDecoded === true
+          && $('status').textContent.includes(name + ' ')
+          && $('status').textContent.includes('read in'));
+        await sleep(400);
+        const session = state.result?.sessions?.[0];
+        return {
+          ready,
+          opened,
+          ...screen(),
+          samples: session?.samples?.length ?? -1,
+          fields: session?.fields?.length ?? -1,
+          skipped: session?.frameCounts?.resyncBytes ?? -1
+        };
+      };
+
+      return JSON.stringify({
+        headerEnd,
+        found: oneSample !== null,
+        junk: await openAfterHealthy(undecodable(6000), 'JUNK.BBL'),
+        single: oneSample === null ? null : await openAfterHealthy(oneSample, 'ONE.BBL')
+      });
+    })()`);
+
+    assert.ok(run.headerEnd > 0, 'the header block was never found, so nothing was built from it');
+
+    // A header, then 6000 bytes that are not frames.
+    const {junk} = run;
+    assert.equal(junk.ready, true, 'the healthy flight before it never finished its analysis');
+    assert.equal(junk.opened, true, 'the undecodable flight never finished opening');
+    assert.ok(junk.fields > 0 && junk.samples === 0 && junk.skipped >= 6000,
+      `the fixture must be a parsed header and 6000 skipped bytes: ${junk.fields} fields, `
+      + `${junk.samples} samples, ${junk.skipped} bytes skipped`);
+    assertFlightTakenDown(junk, 'undecodable flight');
+    assert.match(junk.issues, /could not be decoded/i,
+      `the panel must say the recorded data could not be read: "${junk.issues.slice(0, 240)}"`);
+    assert.match(junk.issues, /\d+ KiB/, 'and how much of it there was');
+    assert.match(junk.issues, /Unrecognized frame marker/,
+      'and what the decoder itself said, so the code above it means something');
+    assert.doesNotMatch(junk.issues,
+      /no flight data was recorded|ends at, or just after|power was lost|disarmed/i,
+      'kilobytes of unreadable frames were explained as a log that stopped at its header');
+
+    // A flight with exactly one sample.
+    assert.equal(run.found, true, 'no cut of the fixture holds exactly one sample');
+    const {single} = run;
+    assert.equal(single.ready, true, 'the healthy flight before it never finished its analysis');
+    assert.equal(single.opened, true, 'the one-sample flight never finished opening');
+    assert.equal(single.samples, 1, `the fixture must hold one sample, not ${single.samples}`);
+    assertFlightTakenDown(single, 'one-sample flight');
+    assert.match(single.issues, /one sample/i,
+      `the panel must say there is one sample: "${single.issues.slice(0, 240)}"`);
+    assert.doesNotMatch(single.issues, /could not be decoded/i,
+      'a cleanly cut flight was described as an undecodable one');
+
+    assert.deepEqual(pageErrors, [],
+      `an unreadable or one-sample flight threw in the page: ${JSON.stringify(pageErrors)}`);
+  });
+});
+
+test('the decode progress bar comes down after an open that shows no flight, and after a '
+  + 'decoder fault on the first open', {
+  skip: browserSkip
+}, async () => {
+  // The bar appears only for 2 MiB or more, or after 300 ms, so every fixture
+  // the other tests open is too small to raise it — and their "the bar is not
+  // up" assertions held with `endDecodeProgress` deleted. These open a 2.2 MiB
+  // flight built in memory, and first check the bar did appear.
+  //
+  // The first-open fault needs the fault inside `openFile`'s own
+  // `openSession(0)`, which nothing in the page can reach in time:
+  // `faultableDecoder` hands each decode result to the hook below.
+  await withViewer({faultableDecoder: true}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      ${PAGE_HELPERS}
+      ${BODY_BUILDERS}
+      const {state} = await import('/ui/app.mjs');
+      let raised = false;
+      new MutationObserver(() => {
+        if (up('decode-progress')) { raised = true; }
+      }).observe($('decode-progress'), {attributes: true, attributeFilter: ['class']});
+
+      const big = undecodable(Math.round(2.2 * 1024 * 1024));
+      const dump = new Uint8Array(good.length + big.length);
+      dump.set(good, 0);
+      dump.set(big, good.length);
+
+      // 1. A first open of a file whose only flight has no readable frames.
+      raised = false;
+      openBytes(big, 'BIG.BBL');
+      const bigOpened = await waitFor(() => state.result?.sessions?.[0]?.framesDecoded === true
+        && $('status').textContent.includes('BIG.BBL ')
+        && $('status').textContent.includes('read in'));
+      await sleep(300);
+      const firstOpen = {
+        opened: bigOpened, raised, upAfter: up('decode-progress'),
+        issues: $('session-issues').textContent
+      };
+
+      // 2. A picker switch to such a flight, inside a dump.
+      openBytes(dump, 'DUMP.BBL');
+      const dumpReady = await waitFor(() => state.result?.sessions?.length === 3 && analysed());
+      const picker = $('session');
+      raised = false;
+      picker.value = '2';
+      picker.dispatchEvent(new Event('change'));
+      const switchedTo = await waitFor(() => state.sessionIndex === 2
+        && state.result.sessions[2].framesDecoded === true);
+      await sleep(300);
+      const switched = {
+        ready: dumpReady, switched: switchedTo, raised, upAfter: up('decode-progress')
+      };
+
+      // 3. A decoder fault on the FIRST open of a file, with a healthy flight
+      //    on screen beforehand to be taken down.
+      openBytes(good, 'GOOD.BBL');
+      const goodReady = await waitFor(analysed);
+      const beforeFault = screen();
+      globalThis.__rotorlensDecodeFault = result => {
+        globalThis.__rotorlensDecodeFault = null;
+        const real = result.sessions[0];
+        result.sessions[0] = Object.create(real, {
+          decodeFrames: {value() { throw new RangeError('PROBE fault'); }}
+        });
+      };
+      raised = false;
+      openBytes(dump, 'FAULT.BBL');
+      const faulted = await waitFor(() => $('status').textContent.includes('Decoder fault'), 400);
+      await sleep(400);
+      const fault = {
+        faulted,
+        raised,
+        ...screen(),
+        options: $('session').options.length,
+        upAfter: up('decode-progress')
+      };
+
+      // 4. One failed flight costs one flight: the rest of the file opens.
+      picker.value = '1';
+      picker.dispatchEvent(new Event('change'));
+      const recovered = await waitFor(() => state.sessionIndex === 1 && analysed());
+
+      return JSON.stringify({firstOpen, switched, goodReady, beforeFault, fault, recovered});
+    })()`);
+
+    assert.equal(run.firstOpen.opened, true, 'the 2.2 MiB flight never finished opening');
+    assert.equal(run.firstOpen.raised, true,
+      'the progress bar never appeared, so its coming down below would prove nothing');
+    assert.equal(run.firstOpen.upAfter, false,
+      'the decode progress bar was left up after a first open that showed no flight');
+    assert.match(run.firstOpen.issues, /could not be decoded/i);
+
+    assert.equal(run.switched.ready, true, 'the dump never finished its first analysis');
+    assert.equal(run.switched.switched, true, 'the 2.2 MiB flight was never selected');
+    assert.equal(run.switched.raised, true,
+      'the progress bar never appeared for the switch, so its coming down would prove nothing');
+    assert.equal(run.switched.upAfter, false,
+      'the decode progress bar was left up after switching to a flight with nothing to show');
+
+    assert.equal(run.goodReady, true, 'the healthy flight never finished its analysis');
+    assert.notEqual(run.beforeFault.answer, '', 'the healthy flight never put an answer up');
+    assert.equal(run.fault.raised, true,
+      'the progress bar never appeared for the faulting open, so its state proves nothing');
+    assert.equal(run.fault.faulted, true,
+      `the decoder fault never stayed on the status line, which reads "${run.fault.status}"`);
+    assert.match(run.fault.status, /Decoder fault: PROBE fault/);
+    assertFlightTakenDown(run.fault, 'decoder fault on the first open');
+    assert.match(run.fault.issues, /could not read this flight/i,
+      `the session panel must say this flight was not read: "${run.fault.issues.slice(0, 160)}"`);
+    assert.equal(run.fault.options, 3,
+      'the picker must list the file\'s flights, so another one can be chosen');
+    assert.equal(run.fault.upAfter, false,
+      'the decode progress bar was left up after a decoder fault on the first open');
+    assert.equal(run.recovered, true, 'another flight of the same file never opened after it');
+
+    assert.deepEqual(pageErrors, [], `the page threw: ${JSON.stringify(pageErrors)}`);
+  });
+});
+
+test('the sharing panel promises no question this build never asks, and points at no control '
+  + 'it has disabled', {
+  skip: browserSkip
+}, async () => {
+  // The two sentences rewritten when the automatic prompt was switched off
+  // were pinned only by a test that needs a private real log and had never
+  // run. `sharingHtml` is pure, so they are pinned here, in every run.
+  await withViewer({}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      const {sharingHtml, AUTOMATIC_SHARING_PROMPT} = await import('/ui/app.mjs');
+      const {createHistory} = await import('/src/analysis/flight-history.mjs');
+      const fresh = {
+        schemaVersion: 1, kind: 'rotorlens-sharing-preference',
+        asked: false, sharing: false, termsVersion: null, ids: {}
+      };
+      const render = options => {
+        const holder = document.createElement('div');
+        holder.innerHTML = sharingHtml(createHistory(), fresh, options);
+        const toggle = holder.querySelector('#sharing-toggle');
+        return {text: holder.textContent, toggleDisabled: toggle ? toggle.disabled : null};
+      };
+      return JSON.stringify({
+        automatic: AUTOMATIC_SHARING_PROMPT,
+        writable: render({}),
+        noStore: render({writable: false}),
+        outdated: render({codes: ['SHARING_TERMS_OUTDATED']}),
+        // An old consent beside a history that could not be read, or beside a
+        // host with no sharing store: both disable the Share button.
+        outdatedHistoryBlocked: render({historyBlocked: true, codes: ['SHARING_TERMS_OUTDATED']}),
+        outdatedNoStore: render({writable: false, codes: ['SHARING_TERMS_OUTDATED']})
+      });
+    })()`);
+
+    assert.equal(run.automatic, false,
+      'these sentences are pinned for the automatic prompt switched off, as the owner decided');
+
+    assert.equal(run.writable.toggleDisabled, false);
+    assert.match(run.writable.text, /does not ask about sharing on its own/);
+    assert.match(run.writable.text, /press Share measurements below/);
+    assert.doesNotMatch(run.writable.text, /will ask/i,
+      'the panel promises a question this build never asks');
+
+    // A host with no sharing store: the button is disabled, and the sentence
+    // must not send the pilot to it.
+    assert.equal(run.noStore.toggleDisabled, true, 'the Share button is not disabled here');
+    assert.match(run.noStore.text, /sharing cannot be enabled here/);
+    assert.match(run.noStore.text, /Nothing about sharing is stored on this device/);
+    assert.doesNotMatch(run.noStore.text, /press Share measurements/,
+      'the panel tells the pilot to press a button it has disabled');
+    assert.doesNotMatch(run.noStore.text, /will ask/i);
+
+    assert.match(run.outdated.text, /older disclosure/);
+    assert.match(run.outdated.text, /will not ask on its own/);
+    assert.doesNotMatch(run.outdated.text, /will ask again/,
+      'an outdated consent promises a question this build never asks');
+    // Positive control: where the button works, the outdated sentence does
+    // point at it, so the two cases below are distinguishing something.
+    assert.equal(run.outdated.toggleDisabled, false);
+    assert.match(run.outdated.text, /Share measurements shows the current terms/);
+
+    // The panel's words point at the Share button only where it works. The
+    // button's own label is "Share measurements", so the pointer is matched by
+    // the sentences that send the pilot to it, not by the label.
+    for (const [name, panel] of [['history unreadable', run.outdatedHistoryBlocked],
+      ['no sharing store', run.outdatedNoStore]]) {
+      assert.equal(panel.toggleDisabled, true, `${name}: the Share button is not disabled here`);
+      assert.match(panel.text, /older disclosure/, `${name}: the outdated consent is not reported`);
+      assert.match(panel.text, /will not ask on its own/, name);
+      assert.doesNotMatch(panel.text, /Share measurements (shows|below)|press Share measurements/,
+        `${name}: the panel sends the pilot to a Share button it has disabled`);
+      assert.doesNotMatch(panel.text, /will ask/i, name);
+    }
+    assert.deepEqual(pageErrors, []);
+  });
+});
+
+test('a flight saved twice reads as one flight saved twice, and Forget takes every save of it', {
+  skip: browserSkip
+}, async () => {
+  // Histories written before a reopened flight could be recognised can hold
+  // one flight twice. The model counts each later save under
+  // DUPLICATE_OF_STORED_FLIGHT, and the learning panel printed that code bare
+  // to the pilot. Forget took the one save it was bound to and left the other
+  // standing in for the flight, at the place it was saved again.
+  const session = yawI => ({
+    firmware: {revision: 'Rotorflight 4.6.0 (118e912) STM32F7X2'},
+    headers: {
+      'Craft name': 'TEST',
+      'Board information': 'BOARD',
+      rollPID: '52,105,0,100,0',
+      pitchPID: '64,111,40,100,0',
+      yawPID: `315,${yawI},29,3,1`,
+      rates_type: '4',
+      rc_rates: '5,5,12',
+      rc_expo: '30,30,50',
+      rates: '10,10,25'
+    }
+  });
+  const hold = (axis, errorDps) => ({
+    schemaVersion: 1,
+    kind: HOLD_EVIDENCE_KIND,
+    axis,
+    term: 'I',
+    status: 'captured',
+    codes: [],
+    holds: [],
+    summary: {
+      holdCount: 4,
+      zeroHoldCount: 4,
+      sustainedHoldCount: 0,
+      totalMeasuredDurationUs: 20_000_000,
+      meanSteadyStateErrorDps: errorDps,
+      meanAbsoluteSteadyStateErrorDps: errorDps,
+      worstAbsoluteSteadyStateErrorDps: errorDps * 1.4,
+      meanErrorDriftDpsPerSecond: null,
+      driftMeasuredHoldCount: 0,
+      meanErrorRippleRmsDps: 0.3,
+      meanErrorCrossingRateHz: 5,
+      meanErrorNoiseRmsDps: 0.1,
+      meanITermRms: 385.6,
+      meanITermDriftPerSecond: 0
+    }
+  });
+  const flight = ({yawI, seconds}) => buildFlightRecord({
+    session: session(yawI),
+    window: {basis: 'FLIGHT_WINDOW_DETECTED', startUs: 0, endUs: seconds * 1e6},
+    axes: Object.fromEntries(['roll', 'pitch', 'yaw'].map(axis => [axis, {
+      headspeedMedianRpm: 2000,
+      noise: {filteredHighFrequencyRmsDps: 1.2, unfilteredHighFrequencyRmsDps: 3.4},
+      holdEvidence: hold(axis, 60 / yawI)
+    }]))
+  });
+  // Three flights, then the first and the second saved again.
+  const flights = [{yawI: 80, seconds: 90}, {yawI: 100, seconds: 101}, {yawI: 120, seconds: 112}];
+  let history = createHistory();
+  for (const entry of [...flights, flights[0], flights[1]]) {
+    history = addFlightRecord(history, flight(entry));
+  }
+  const startupScript = `(() => {
+    let file = ${JSON.stringify(exportHistory(history))};
+    window.RotorLensNative = {
+      pickFile() {},
+      readHistory() { return file; },
+      writeHistory(text) { file = text; return true; },
+      forgetHistory() { file = ''; return true; },
+      readSharing() { return ''; },
+      writeSharing() { return true; },
+      forgetSharing() { return true; }
+    };
+    window.__historyIds = () => (file === ''
+      ? [] : JSON.parse(file).records.map(record => record.recordId));
+  })();`;
+
+  await withViewer({startupScript}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      await import('/ui/app.mjs');
+      const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+      const panel = () => ({
+        text: document.getElementById('history').textContent,
+        rows: document.querySelectorAll('#history .flight').length,
+        ids: window.__historyIds()
+      });
+      const before = panel();
+
+      // The before/after panel's Forget. Its button is drawn only over an open,
+      // admissible flight that is already kept, bound to that flight's first
+      // save; it is put where the panel puts it and pressed, so the delegated
+      // handler on #since — the code under test — is what runs.
+      const since = document.getElementById('since');
+      since.innerHTML = '<button type="button" data-forget-flight="test::board#0">'
+        + 'Forget this flight</button>';
+      since.querySelector('button').click();
+      await sleep(150);
+      const afterSince = panel();
+
+      // The history panel's own Forget, on the row of the LATER save of the
+      // second flight.
+      document.querySelector('#history [data-forget-flight="test::board#4"]').click();
+      await sleep(150);
+      const afterRow = panel();
+      return JSON.stringify({before, afterSince, afterRow});
+    })()`);
+
+    assert.equal(run.before.rows, 5, 'the seeded history must list all five saves');
+    assert.match(run.before.text, /the same flight saved again/,
+      'the learning panel must say in words why a save was not used');
+    assert.match(run.before.text, /counted once/);
+    assert.doesNotMatch(run.before.text, /DUPLICATE_OF_STORED_FLIGHT/,
+      'an engine code reached the pilot\'s screen instead of a sentence');
+    assert.match(run.before.text, /same flight as #1, saved again/,
+      'the row of a later save must say which flight it is a save of');
+    assert.match(run.before.text, /same flight as #2, saved again/);
+
+    assert.deepEqual(run.afterSince.ids, ['test::board#1', 'test::board#2', 'test::board#4'],
+      'Forget this flight left a save of it behind, which then stood in for the flight');
+    assert.deepEqual(run.afterRow.ids, ['test::board#2'],
+      'the history panel\'s Forget left a save of the flight behind');
+    assert.equal(run.afterRow.rows, 1);
+    assert.deepEqual(pageErrors, []);
+  });
+
+  // Forget must also recompute the before/after on screen. The since-panel
+  // reuses the comparison `considerFlight` made; when the record forgotten is
+  // its baseline — reachable from a "saved again" row, which now deletes the
+  // first save too — the panel kept comparing against a deleted record.
+  // `considerFlight` is the real entry point, fed state shaped as an opened log.
+  const candidateScript = `
+      const app = await import('/ui/app.mjs');
+      const {state} = app;
+      const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+      const sessionOf = ${JSON.stringify(session(140))};
+      state.result = {sessions: [{
+        craftName: 'TEST',
+        firmware: {revision: sessionOf.firmware.revision, board: 'BOARD'}
+      }]};
+      state.sessionIndex = 0;
+      state.sessionHeaders = [{craftName: 'TEST', board: 'BOARD', headers: sessionOf.headers}];
+      state.window = {basis: 'FLIGHT_WINDOW_DETECTED', startUs: 0, endUs: 123e6};
+      app.considerFlight(${JSON.stringify(Object.fromEntries(['roll', 'pitch', 'yaw'].map(axis => [
+        axis, {
+          headspeedMedianRpm: 2000,
+          noise: {filteredHighFrequencyRmsDps: 1.2, unfilteredHighFrequencyRmsDps: 3.4},
+          holdEvidence: hold(axis, 60 / 140)
+        }])))});
+      const look = () => ({
+        ids: window.__historyIds(),
+        candidate: state.candidate !== null,
+        storedAs: state.candidateStoredId,
+        beforeId: state.comparisonBefore?.recordId ?? null,
+        since: document.getElementById('since').textContent
+      });`;
+  // Two flights, the newer saved again, so the on-screen baseline has a
+  // "saved again" row of its own.
+  let twice = createHistory();
+  for (const entry of [flights[0], flights[1], flights[1]]) {
+    twice = addFlightRecord(twice, flight(entry));
+  }
+  const twiceScript = startupScript.replace(JSON.stringify(exportHistory(history)),
+    JSON.stringify(exportHistory(twice)));
+  assert.notEqual(twiceScript, startupScript, 'the second history was not seeded');
+  for (const route of ['copy row', 'first-save row', 'forget everything']) {
+    await withViewer({startupScript: twiceScript}, async ({evaluate, pageErrors}) => {
+      const run = await evaluate(`(async () => {
+        ${candidateScript}
+        const before = look();
+        // The row that deletes the on-screen baseline: either the baseline's own
+        // row, or the row of a later save of the same flight.
+        // The seeded history saved its newest flight, #1, again as #2.
+        const savedAgainAs = {'test::board#1': 'test::board#2'};
+        const route = ${JSON.stringify(route)};
+        if (route === 'forget everything') {
+          // Behind a second tap, as the pilot does it.
+          const all = document.getElementById('history-forget-all');
+          all.click();
+          all.click();
+          await sleep(150);
+          return JSON.stringify({before, target: 'all', pressed: true, after: look()});
+        }
+        const target = route === 'first-save row'
+          ? before.beforeId
+          : savedAgainAs[before.beforeId] ?? null;
+        const button = target === null ? null
+          : document.querySelector('#history [data-forget-flight="' + target + '"]');
+        button?.click();
+        await sleep(150);
+        return JSON.stringify({before, target, pressed: button !== null, after: look()});
+      })()`);
+
+      // Setup guards: a candidate exists, it is not stored, and it is compared
+      // against a stored record the chosen row deletes.
+      assert.equal(run.before.candidate, true, `${route}: considerFlight built no candidate`);
+      assert.equal(run.before.storedAs, null, `${route}: the new flight read as already stored`);
+      assert.ok(run.before.beforeId !== null && run.before.ids.includes(run.before.beforeId),
+        `${route}: the candidate had no stored baseline: ${JSON.stringify(run.before)}`);
+      assert.equal(run.pressed, true, `${route}: no row deletes the baseline (${run.target})`);
+      assert.ok(!run.after.ids.includes(run.before.beforeId),
+        `${route}: the Forget did not delete the baseline record`);
+
+      assert.ok(run.after.beforeId === null || run.after.ids.includes(run.after.beforeId),
+        `${route}: the before/after still compares against ${run.after.beforeId}, which Forget `
+        + `deleted; the history now holds ${JSON.stringify(run.after.ids)}`);
+      assert.equal(run.after.beforeId, route === 'forget everything' ? null : 'test::board#0',
+        `${route}: the flight left standing is the one to compare against`);
+      assert.notEqual(run.after.since, run.before.since,
+        `${route}: the before/after panel was not redrawn against the new baseline`);
+      assert.deepEqual(pageErrors, []);
+    });
+  }
+
+  // The before/after panel's own Forget, on the open flight just saved: Save
+  // must come back, and the baseline must stay the flight it followed.
+  await withViewer({startupScript: twiceScript}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      ${candidateScript}
+      const before = look();
+      document.getElementById('since-save').click();
+      await sleep(150);
+      const saved = look();
+      const forget = document.querySelector('#since [data-forget-flight]');
+      forget?.click();
+      await sleep(150);
+      return JSON.stringify({
+        before, saved, pressed: forget !== null, after: look(),
+        offersSave: document.getElementById('since-save') !== null
+      });
+    })()`);
+    assert.equal(run.before.storedAs, null, 'the new flight read as already stored');
+    assert.ok(run.saved.storedAs !== null && run.saved.ids.includes(run.saved.storedAs),
+      `Save did not store the open flight: ${JSON.stringify(run.saved)}`);
+    assert.equal(run.pressed, true, 'the before/after panel offered no Forget for a kept flight');
+    assert.deepEqual(run.after.ids, run.before.ids, 'Forget did not remove exactly the save');
+    assert.equal(run.after.storedAs, null,
+      'the open flight still reads as stored after its only save was forgotten');
+    assert.equal(run.offersSave, true, 'Save did not come back after Forget');
+    assert.equal(run.after.beforeId, run.before.beforeId,
+      'forgetting the open flight moved its baseline');
+    assert.deepEqual(pageErrors, []);
   });
 });

@@ -144,6 +144,23 @@ export const EVIDENCE_LIMITS = Object.freeze({
   /** Holds needed before hold evidence is conclusive. */
   minimumHolds: 2,
 
+  /**
+   * Holds needed before a STANDING error is read as one (2 October 2026, round
+   * three of the review). JUDGEMENT, chosen as the smallest count that can
+   * show a side being kept rather than met by chance.
+   *
+   * A standing error the I term should close stays on one side of the command
+   * from hold to hold; a slow wander does not. Two holds cannot tell them
+   * apart: half a cycle of a wander puts both on one side as often as not, and
+   * on the review's closed loop a healthy integrator pushed by a 0.06-0.10 Hz
+   * torque, flown as ordinary 5.5-8 s holds, was told "Raise I" in up to 54 of
+   * 90 flights. Three is the least that can show the side being KEPT, and on
+   * the round-three sweep (0.03-0.30 Hz, 3-8 holds 6.5-12 s apart, all three
+   * axes) no healthy integrator kept it, while an aircraft with no integrator
+   * kept it in three holds of 5.5 s. The pilot guide asks for five.
+   */
+  minimumHoldsForStandingError: 3,
+
   /** |median setpoint| under this makes it a hold at zero — heading/attitude hold. */
   zeroHoldThresholdDps: 10,
 
@@ -485,11 +502,24 @@ export function driftSignificance(timesUs, slowValues, slopePerSec, correlationF
 }
 
 /**
+ * Sign changes per full cycle of an oscillation.
+ *
+ * `zeroCrossingRateHz` counts sign changes, and a sine crosses its mean twice
+ * per cycle, so its "Hz" is half-cycles per second. Every band in this module
+ * is a band of oscillation frequency. A crossing rate is divided by this before
+ * it is compared with one; it is reported raw everywhere a pilot reads it.
+ */
+export const CROSSINGS_PER_CYCLE = 2;
+
+/**
  * Sign changes per second of a mean-removed signal.
  *
  * Steady offset and slow hunting both raise the average error magnitude, but
  * only hunting keeps crossing zero — which is what separates "not enough I" from
  * "too much I".
+ *
+ * Not a frequency: a sine of f Hz returns about 2f. Divide by
+ * `CROSSINGS_PER_CYCLE` before comparing with a frequency band.
  */
 export function zeroCrossingRateHz(timesUs, values) {
   const centre = mean(values);
@@ -1115,6 +1145,11 @@ export function buildHoldEvidence(records, selection, options = {}) {
   const segments = detectHoldSegments(records, axisIndex, {limits});
   const holds = [];
   const rejections = {};
+  // WHERE each refused segment was, not only how many (2 October 2026). Every
+  // axis is analysed over the same records, and a still hover is a hold on all
+  // three, so a count summed across axes counts one hover three times. The
+  // windows let a caller count physical segments instead.
+  const rejectedHolds = [];
   let clippedSegmentCount = 0;
 
   for (const segment of segments) {
@@ -1148,6 +1183,11 @@ export function buildHoldEvidence(records, selection, options = {}) {
     const measured = measureHold(records, segment, axisIndex, termIndex, limits);
     if (measured.rejected) {
       rejections[measured.rejected] = (rejections[measured.rejected] ?? 0) + 1;
+      rejectedHolds.push(Object.freeze({
+        startTimeUs: records[segment.startIndex].timeUs,
+        endTimeUs: records[segment.endIndex].timeUs,
+        reason: measured.rejected
+      }));
       continue;
     }
     holds.push(measured);
@@ -1226,6 +1266,8 @@ export function buildHoldEvidence(records, selection, options = {}) {
     holds,
     summary,
     rejectedHoldCounts: rejections,
+    /** Each refused segment's extent and reason, in the order they were found. */
+    rejectedHolds: Object.freeze(rejectedHolds),
 
     /**
      * Steady segments that ran off the start or the end of the records and were
@@ -1253,6 +1295,20 @@ export function buildHoldEvidence(records, selection, options = {}) {
     })
   });
 }
+
+/**
+ * The sizes `interpretHoldEvidence` reads holds against, by default. Exported so
+ * a sentence that quotes one — "under the 2 deg/s that would have been read"
+ * — quotes the number actually used rather than a copy of it (round three).
+ */
+export const HOLD_READING_THRESHOLDS = Object.freeze({
+  /** A mean error over the holds above this is a standing error. */
+  errorDps: 3,
+  /** A measured drift above this, deg/s per second, is still converging. */
+  driftDpsPerSecond: 1.5,
+  /** The slow part's RMS about its mean above this is movement worth reading. */
+  huntingRippleDps: 2
+});
 
 /**
  * Interprets hold evidence as an indication about the I term.
@@ -1305,12 +1361,17 @@ export function interpretHoldEvidence(evidence, options = {}) {
   }
 
   const {
-    errorDpsThreshold = 3,
-    driftDpsPerSecondThreshold = 1.5,
+    errorDpsThreshold = HOLD_READING_THRESHOLDS.errorDps,
+    driftDpsPerSecondThreshold = HOLD_READING_THRESHOLDS.driftDpsPerSecond,
     // I-term hunting is slow. A band, not a floor: on a real flight the error
     // crossed at 5 Hz, which is frame or tail resonance, and a floor-only test
     // called it an I-term fault. Anything faster than a few Hz is something the
     // I term did not cause and lowering the I term will not fix.
+    //
+    // UNITS, corrected 2 October 2026: this band is an oscillation frequency, and
+    // a crossing rate is halved before it is tested against it. Whether "crossed
+    // at 5 Hz" above was a crossing rate (a 2.5 Hz oscillation, now inside the
+    // band) or a frequency was not recorded, and that flight was not re-checked.
     //
     // Defaulted from the capture, not restated here. The smoothing window that
     // produces `meanErrorCrossingRateHz` is derived from this band's top edge; a
@@ -1318,7 +1379,7 @@ export function interpretHoldEvidence(evidence, options = {}) {
     // filter tuned for a different one.
     huntingBandHz: declaredBandHz =
       evidence.measurement?.huntingBandHz ?? EVIDENCE_LIMITS.huntingBandHz,
-    huntingRippleDps = 2
+    huntingRippleDps = HOLD_READING_THRESHOLDS.huntingRippleDps
   } = options;
 
   // The filter caps what may be blamed on the I term. Crossings are counted on a
@@ -1354,14 +1415,68 @@ export function interpretHoldEvidence(evidence, options = {}) {
   const ripple = summary.meanErrorRippleRmsDps ?? 0;
   const noise = summary.meanErrorNoiseRmsDps ?? 0;
 
-  const inHuntingBand = crossingRate >= huntingBandHz[0] && crossingRate <= huntingBandHz[1];
+  // The band is a band of oscillation FREQUENCY; the crossing rate counts sign
+  // changes, two per cycle. Until 2 October 2026 the two were compared directly,
+  // which halved the band in effect to about 0.15-1.5 Hz: a 0.2 Hz wander below
+  // the floor read as hunting, and a 2 Hz hunt inside the band read as nothing.
+  const oscillationHz = crossingRate / CROSSINGS_PER_CYCLE;
+  const inHuntingBand = oscillationHz >= huntingBandHz[0] && oscillationHz <= huntingBandHz[1];
   // The slow component must actually stand above what was filtered out, or the
   // "oscillation" is the tail of the noise rather than a signal.
   const hunting = inHuntingBand && ripple > huntingRippleDps && ripple > noise;
 
-  if (!inHuntingBand && crossingRate > huntingBandHz[1] && ripple > huntingRippleDps) {
+  if (!inHuntingBand && oscillationHz > huntingBandHz[1] && ripple > huntingRippleDps) {
     addCode(codes, 'OSCILLATION_ABOVE_I_TERM_BAND');
   }
+  // The mirror of the above, added 2 October 2026 with the units correction: the
+  // slow part of the error DID move, by more than the ripple threshold and above
+  // the noise, but slower than the band's floor — the pilot, the wind, a governor,
+  // or a drift. Not an I-term reading either way; recorded so that "within
+  // tolerance" is never read as "the error did not move".
+  const slowMovement = !inHuntingBand && oscillationHz < huntingBandHz[0]
+    && ripple > huntingRippleDps && ripple > noise;
+  if (slowMovement) {
+    addCode(codes, 'SLOW_MOVEMENT_BELOW_I_TERM_BAND');
+  }
+  // A SLOW RIPPLE NO LARGER THAN THE NOISE (2 October 2026, round three). At or
+  // below the band top the slow part moved by more than the threshold, and was
+  // refused as hunting, or as a wander, only because it did not stand above
+  // what the filter removed. That is "it could not be told from the noise", not
+  // "it did not move" — and it carried no code at all, so the all-clear took it:
+  // the review found in-band ripples of 11-24 deg/s RMS cleared that way.
+  const rippleWithinNoise = oscillationHz <= huntingBandHz[1]
+    && ripple > huntingRippleDps && ripple <= noise;
+  if (rippleWithinNoise) {
+    addCode(codes, 'SLOW_RIPPLE_NOT_CLEAR_OF_NOISE');
+  }
+
+  // A STANDING ERROR MUST STAND CLEAR OF THE SLOW MOVEMENT AROUND IT (2 October
+  // 2026, round two of the review of the units correction). A movement slower
+  // than the window does not average out of a hold's mean: each hold keeps part
+  // of a cycle, up to the movement's own size, so an error with NO standing
+  // component reads several deg/s of "standing error". With the band in the
+  // right units nothing else stood between that and "increase", and on a closed
+  // loop it was "Raise yaw I" on a healthy integrator pushed by a hunting
+  // governor, a belt or the wind — a 30 deg/s RMS wander described as an error
+  // that "sat off the commanded rate and stayed there".
+  //
+  // So a mean is read as standing only where it is LARGER than the slow part's
+  // own RMS about it: a clean standing error has almost no slow ripple (0.003
+  // deg/s on the no-integrator fixture against a 4.65 deg/s mean), and across
+  // the 0.06-0.29 Hz sweep that found this, a healthy loop's wander had a ripple
+  // from about three to thirty times its mean.
+  // A ramp from zero — a loop still converging — has a mean of 1.7 times its
+  // ripple and is still read. A wander much slower than the hold is not
+  // separable from a slowly varying standing torque by any rule on one window;
+  // that is the integrator's own job, and it is still read as one.
+  //
+  // Exempt above the band: an oscillation at f leaves at most A/(pi f T) in a
+  // T-second mean — under 3% of its amplitude at 3 Hz over a 5 s hold — so it
+  // cannot manufacture a standing error. It CAN hide a hunt under it, though,
+  // which this rule is not about: the per-hold rule below refuses that.
+  const slowEnoughToLeaveAMean = oscillationHz <= huntingBandHz[1];
+  const standingClearOfMovement = !slowEnoughToLeaveAMean
+    || summary.meanAbsoluteSteadyStateErrorDps > ripple;
 
   if (standingError) {
     addCode(codes, 'STEADY_STATE_ERROR_PRESENT');
@@ -1385,7 +1500,25 @@ export function interpretHoldEvidence(evidence, options = {}) {
     return Object.freeze({indication: 'decrease', confidence: 'medium', codes});
   }
 
+  // A standing error or a drift that the slow movement could have left behind
+  // is not evidence about the integrator. Not a judgement either way.
+  if ((standingError || drifting) && !standingClearOfMovement) {
+    addCode(codes, 'STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT');
+    return Object.freeze({indication: 'hold', confidence: 'low', codes});
+  }
+
   if (standingError || drifting) {
+    // ...AND IT MUST STAND IN EVERY HOLD, ON THE SAME SIDE (round three). The
+    // rule above compares means over all the holds, and over a short hold a
+    // slice of a slow cycle has a mean larger than its own ripple — so a healthy
+    // integrator pushed by a 0.06-0.10 Hz torque, flown as ordinary 5.5-8 s
+    // holds, was still told "Raise I". See `standingErrorRefusal`.
+    const refusal = standingErrorRefusal(evidence.holds ?? [],
+      options.minimumHoldsForStandingError ?? EVIDENCE_LIMITS.minimumHoldsForStandingError);
+    if (refusal) {
+      addCode(codes, refusal);
+      return Object.freeze({indication: 'hold', confidence: 'low', codes});
+    }
     return Object.freeze({
       indication: 'increase',
       confidence: standingError && drifting ? 'medium' : 'low',
@@ -1393,8 +1526,84 @@ export function interpretHoldEvidence(evidence, options = {}) {
     });
   }
 
+  // The error moved, slower than the band. Nothing about the I term was read
+  // from it, so this is not "within tolerance" either — that code is a
+  // positive measurement of an error that did not move, and this one did.
+  if (slowMovement) {
+    return Object.freeze({indication: 'hold', confidence: 'low', codes});
+  }
+
+  // NOR WHERE NOTHING COULD HAVE BEEN SEEN (round three). A slow ripple no larger
+  // than the noise was not told from it; and an oscillation above the band
+  // dominates the crossing count, so whatever moved more slowly under it — a
+  // hunt, a wander — was never measured. Neither is a measurement of an error
+  // that did not move, which is the only thing the code below may say.
+  if (rippleWithinNoise || codes.includes('OSCILLATION_ABOVE_I_TERM_BAND')) {
+    return Object.freeze({indication: 'hold', confidence: 'low', codes});
+  }
+
+  // A positive measurement: the error's mean stayed under the standing-error
+  // threshold, and its slow part moved by no more than `huntingRippleDps` RMS —
+  // a size this measurement would have seen at any frequency the band admits.
   addCode(codes, 'HOLD_EVIDENCE_WITHIN_TOLERANCE');
   return Object.freeze({indication: 'hold', confidence: 'medium', codes});
+}
+
+/**
+ * Why a standing error over these holds is NOT read as one, or null when it is.
+ *
+ * Added 2 October 2026, round three of the review. A real shortfall of I is
+ * CONSISTENT: the integrator leaves the same error, on the same side of the
+ * command, every time the aircraft is held. A slow wander — a governor hunting,
+ * a belt, the wind — puts a slice of its cycle in each hold's mean, and the
+ * slices change side as the cycle turns: [19.8, -26.0, 25.2, -23.0, 18.6,
+ * -13.1] deg/s on the review's healthy loop, against [-4.7] six times over with
+ * no integrator. So, in order:
+ *
+ *   1. Every hold's mean must be larger than the slow part's own movement in
+ *      that hold (STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD). This includes a
+ *      fast oscillation: it cannot manufacture a mean, but it hides a hunt
+ *      under it, and a standing error with a hunt is the conflicting signature,
+ *      which is refused — "Raise I" was given to an aircraft with no integrator
+ *      and an in-band wobble once a 12 Hz vibration was laid over it.
+ *   2. Every hold must sit on the same side of the command
+ *      (STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS). The side is the error's own
+ *      sign, for holds at zero and at a rate alike. The review suggested
+ *      normalising a turn's error to its direction; measured on the closed
+ *      loop, that refused 25 of 89 flights with no integrator against a
+ *      steady torque — every one of them turns flown both ways — and, of 120
+ *      healthy flights whose turns alternated in step with a wander, passed 28
+ *      of the 57 the round-two rule had read as "increase". An error that
+ *      changes side exactly with the stick is named for what it is
+ *      (STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION): a loop lagging behind every
+ *      turn, or a wander in step with them, which these holds cannot separate.
+ *   3. At least `minimum` holds (TOO_FEW_HOLDS_FOR_A_STANDING_ERROR); see
+ *      `EVIDENCE_LIMITS.minimumHoldsForStandingError`.
+ *
+ * What it cannot do: an open-loop wander so slow that every hold sits on one
+ * side of it is, on these holds, a slowly varying standing torque, and is read
+ * as one. On the closed loop the round-three sweep flew (0.03-0.30 Hz, 3-8
+ * holds 6.5-12 s apart) rule 1 caught every one of those, because the hold
+ * nearest the wander's crossing moves more than it averages.
+ */
+function standingErrorRefusal(holds, minimum) {
+  const errors = holds.map(hold => hold.steadyStateErrorDps);
+  if (holds.some(hold => !(Math.abs(hold.steadyStateErrorDps) > hold.errorRippleRmsDps))) {
+    return 'STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD';
+  }
+  const oneSide = values => values.every(value => value > 0) || values.every(value => value < 0);
+  if (!oneSide(errors)) {
+    const directions = holds.map(hold =>
+      (hold.holdKind === 'sustained' ? Math.sign(hold.setpointMedianDps) : 0));
+    const bothWays = directions.includes(1) && directions.includes(-1);
+    return bothWays && oneSide(errors.map((error, index) => error * directions[index]))
+      ? 'STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION'
+      : 'STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS';
+  }
+  if (holds.length < minimum) {
+    return 'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR';
+  }
+  return null;
 }
 
 /** Compares two hold captures. Same tolerance discipline as the stop comparison. */

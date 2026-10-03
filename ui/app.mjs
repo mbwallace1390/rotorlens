@@ -89,9 +89,8 @@ import {
   TERM_VIEWS
 } from '../src/analysis/axis-report.mjs';
 import {
-  analyzeMechanicalTimeSeries,
+  analyzeMechanicalWindow,
   buildMechanicalSeries,
-  MECHANICAL_CONSTANTS,
   sessionTimeBounds,
   summarizeMechanicalVibration
 } from '../src/analysis/advisor/mechanical-spectrum.mjs';
@@ -116,12 +115,13 @@ import {
   findRecords,
   forgetAircraft,
   forgetEverything,
-  forgetFlight,
+  forgetSavesOfFlight,
   HISTORY_LIMITS,
   importHistory,
   isSharingId,
   listAircraft,
   newSharingId,
+  resavedCopies,
   selectBaseline,
   shareableRecord
 } from '../src/analysis/flight-history.mjs';
@@ -324,6 +324,29 @@ const PANELS = [
 ];
 
 /**
+ * The panels that measure a flight's samples: everything in PANELS except the
+ * session panel, which holds the picker and so must stay reachable when the
+ * flight on screen has nothing to measure.
+ */
+const ANALYSIS_PANELS = PANELS.filter(id => id !== 'session-panel');
+
+/** What the Tune evidence panel says before Analyse has been pressed on this window. */
+const TUNE_PLACEHOLDER = '<p class="muted">Pick a term and analyse. The Axis panel above ' +
+  'already measures this axis on whatever you flew.</p>';
+
+/**
+ * Puts the Tune evidence panel back to its unanalysed state.
+ *
+ * Its numbers are measured over the flight window, like every other number on
+ * the page, so anything that changes the window, the axis or the flight retires
+ * them. Before 2 October 2026 moving the window did not, and the panel went on
+ * counting stops that now lay outside it.
+ */
+function resetTunePanel() {
+  $('tune').innerHTML = TUNE_PLACEHOLDER;
+}
+
+/**
  * Which way each axis' two command directions point, for a pilot rather than a sign.
  *
  * These words name the side of the aircraft a measurement belongs to, so a wrong
@@ -468,19 +491,74 @@ function retireCurrentFile(name) {
   const token = state.fileOpenRun += 1;
   state.fileName = name;
   state.recommendationRun += 1;
+  state.answerScrolled = false;
+  retireAdvice();
+  closeCurrentLog();
+  if (dismissedConsent) {
+    $('drop').focus({preventScroll: true});
+  }
+  return token;
+}
+
+/**
+ * Takes the advice and the before/after off the page, in memory and on screen.
+ *
+ * Both are about ONE flight, and both used to outlive it: a session switch
+ * cleared neither until the next analysis ran, so any switch that never
+ * reached an analysis — a flight with no frames, a header that cannot be read,
+ * a decoder fault — left the previous flight's "Start here" and its Save button
+ * under a picker naming another one. Called before anything else moves.
+ *
+ * The caller retires any analysis still running (`recommendationRun`); this
+ * does not, because the analysis itself calls `forgetCandidateFlight` and must
+ * not retire itself.
+ */
+function retireAdvice() {
+  // `state.recommendations` as well as the markup: `relearnFromHistory` repaints
+  // the cards from it after any history change, which would put them back.
   state.recommendations = null;
   state.recommendationCoverage = null;
   state.learning = null;
   $('recommend').innerHTML = '';
   $('recommend-status').textContent = '';
   $('recommend-answer').innerHTML = '';
-  state.answerScrolled = false;
   forgetCandidateFlight();
-  closeCurrentLog();
-  if (dismissedConsent) {
-    $('drop').focus({preventScroll: true});
-  }
-  return token;
+}
+
+/**
+ * Takes down every panel that measures a flight, and empties it.
+ *
+ * For a session on screen that has nothing to measure: no frames after its
+ * header, a header that cannot be read, or frames the decoder failed on. The
+ * session panel stays — it holds the picker, and it is where the reason is
+ * written — and everything else comes down with its markup, its window and its
+ * axis state, so neither a resize nor a stray handler can draw the previous
+ * flight back into it.
+ */
+function takeDownAnalysis() {
+  // Retire any analysis still running, here as well as in `openSession`: an
+  // analysis that finished after this would repaint its advice and re-show the
+  // before/after over a flight that has nothing to measure.
+  state.recommendationRun += 1;
+  retireAdvice();
+  windowedSessionCache = null;
+  state.window = null;
+  state.windowPreview = null;
+  state.windowTrace = null;
+  state.records = null;
+  state.recordsAxis = null;
+  state.marks = [];
+  state.marksAxis = null;
+  state.axisSignals = null;
+  state.axisSummary = null;
+  $('axis-stats').innerHTML = '';
+  $('axis-note').innerHTML = '';
+  $('axis-plot-caption').textContent = '';
+  $('tune').innerHTML = '';
+  $('fields').innerHTML = '';
+  $('field').innerHTML = '';
+  resetVibration();
+  ANALYSIS_PANELS.forEach(id => show(id, false));
 }
 
 /**
@@ -604,14 +682,36 @@ async function openFile(source) {
 
   // ONE session — the one about to be shown. The other 72 in a dataflash dump
   // are listed, described from their headers, and left alone.
-  await openSession(0);
+  //
+  // In a try/finally, because a throw from here used to escape as an unhandled
+  // rejection that skipped everything below it: the progress bar stayed up and
+  // the status line was never told the open had finished. A throw is a defect
+  // in this app, so it is reported as one rather than left as a blank screen.
+  let opened = false;
+  try {
+    opened = await openSession(0);
+  } catch (error) {
+    if (token === state.fileOpenRun) {
+      renderSessionFault(`RotorLens could not show this flight: ${error.message}`);
+      console.error(error);
+    }
+  } finally {
+    // Overtaken during that read: the newer open owns the progress bar.
+    if (token === state.fileOpenRun) {
+      endDecodeProgress();
+    }
+  }
 
   // Overtaken during that read. The newer open owns the screen from here.
   if (token !== state.fileOpenRun) {
     return;
   }
-  endDecodeProgress();
-  renderLogStatus();
+  // Only for a session that is actually on screen. After a fault the status
+  // line carries the fault, and repainting it would replace the one sentence
+  // that says what went wrong with "read in 0 ms".
+  if (opened) {
+    renderLogStatus();
+  }
 }
 
 /**
@@ -862,11 +962,16 @@ function evictDecodedSessions(keepIndex) {
  * The decode is one synchronous call that cannot be interrupted, so the step is
  * announced and PAINTED before it starts — the same reason `openFile` paints
  * "Decoding NAME…" before touching the decoder at all.
+ *
+ * @return {Promise<boolean>} true when this session is now on screen; false when
+ *   there was no such session, a newer open overtook this one, or the decoder
+ *   failed. The callers repaint the status line only on true, because after a
+ *   fault that line is the fault.
  */
 async function openSession(index) {
   const session = state.result?.sessions?.[index];
   if (!session) {
-    return;
+    return false;
   }
 
   // The LOG this call belongs to, kept by identity rather than by name. A run
@@ -890,6 +995,13 @@ async function openSession(index) {
   // all. That was a real blank screen, not a hypothetical one.
   state.recommendationRun += 1;
 
+  // ...and take its advice and its before/after down with it, now rather than
+  // when the next analysis gets round to it. Not every session reaches an
+  // analysis — one with no frames, an unreadable header or a decoder fault
+  // never does — and each of those left the previous flight's "Start here" and
+  // its Save button up under a picker naming a different flight.
+  retireAdvice();
+
   state.sessionIndex = index;
   windowedSessionCache = null;
   state.records = null;
@@ -908,7 +1020,7 @@ async function openSession(index) {
     state.decodedSessions = [index, ...state.decodedSessions.filter(item => item !== index)];
     evictDecodedSessions(index);
     renderSession();
-    return;
+    return true;
   }
 
   // Free what can be freed BEFORE allocating the new session, never after:
@@ -929,16 +1041,21 @@ async function openSession(index) {
   // to read it. `state.result !== log` is the same thing one level up — a whole
   // new FILE arrived, and this flight belongs to a log nobody is looking at.
   if (token !== state.sessionOpenRun || state.result !== log) {
-    return;
+    return false;
   }
 
   const started = performance.now();
   try {
     session.decodeFrames();
   } catch (error) {
+    // A decoder defect, or an allocation that failed under memory pressure.
+    // Nothing of this flight was read, so nothing of the previous one may stay
+    // up either, and the fault stays where it was written: the callers do not
+    // repaint the status line over a `false`.
     endDecodeProgress();
-    $('status').innerHTML = `<span class="error">Decoder fault: ${esc(error.message)}</span>`;
-    return;
+    state.sessionDecodeMs = null;
+    renderSessionFault(`Decoder fault: ${error.message}`);
+    return false;
   }
   state.sessionDecodeMs = Math.round(performance.now() - started);
   state.frameDecodeCount += 1;
@@ -960,13 +1077,14 @@ async function openSession(index) {
   // can be read in chunks — the obvious next step — and at that point this is
   // the only thing between an obsolete read and the screen.
   if (token !== state.sessionOpenRun || state.result !== log) {
-    return;
+    return false;
   }
 
   // This session's label changes from "not opened yet" to its real sample count,
   // and only now can it.
   renderSessionPicker();
   renderSession();
+  return true;
 }
 
 /**
@@ -1319,6 +1437,18 @@ function renderSession() {
     return;
   }
 
+  // A header that parsed and fewer than two samples after it. Every panel below
+  // measures samples, and the axis panel used to throw on the first one it
+  // asked for — inside an async handler, with the previous flight's numbers
+  // still up. One sample is the same case: it has no duration and no rate, and
+  // the whole analysis path used to run on it and put "The analysis could not
+  // be run" over axis numbers measured from that one frame. Two is the floor
+  // `checkFlightWindow` already holds every window to (WINDOW_TOO_FEW_SAMPLES).
+  if (session.samples.length < 2) {
+    renderEmptySession(session);
+    return;
+  }
+
   const {durationSeconds, rateHz} = sessionTiming(session);
   const counts = session.frameCounts ?? {};
 
@@ -1388,12 +1518,144 @@ function renderSession() {
   PANELS.forEach(id => show(id));
   state.marks = [];
   state.marksAxis = null;
-  $('tune').innerHTML = '<p class="muted">Pick a term and analyse. The Axis panel above ' +
-    'already measures this axis on whatever you flew.</p>';
+  resetTunePanel();
 
   // The window has to be settled before anything measures anything, because
   // everything below measures over it.
   applyFlightWindow({detect: true});
+}
+
+/** The header-level facts every "nothing to measure" view can still state. */
+function headerOnlyStatsHtml(session, samples) {
+  return [
+    ['Firmware', session?.firmware?.revision ?? session?.firmware?.type ?? '—'],
+    ['Craft', session?.craftName ?? '—'],
+    ['Samples', samples]
+  ].map(([key, value]) => `<div class="stat"><div class="k">${key}</div><div class="v">${esc(value)}</div></div>`)
+    .join('');
+}
+
+/** The decoder's own error codes for a session, as a short list, or nothing. */
+function decodeErrorListHtml(session) {
+  const codes = (session?.errors ?? []).slice(0, 5);
+  return codes.length > 0
+    ? `<ul class="codes">${codes.map(
+      error => `<li><code>${esc(error.code)}</code>${
+        Number.isFinite(error.offset) ? ` at byte ${error.offset}` : ''}</li>`
+    ).join('')}</ul>`
+    : '';
+}
+
+/** "Pick another from the list above", only when there is another to pick. */
+function otherFlightsSentence() {
+  return (state.result?.sessions?.length ?? 0) > 1
+    ? ' The other flights in this file are unaffected — pick another from the list above.'
+    : '';
+}
+
+/**
+ * How many bytes after this flight's header the decoder skipped as unreadable,
+ * when that is enough to have held a frame — otherwise 0.
+ *
+ * "Enough to have held a frame" is a marker byte plus one byte per field: every
+ * intra frame in a Rotorflight log we hold encodes each field in at least one
+ * byte. Fewer than that is a recording cut at, or inside, the end of its header
+ * — the committed rf46-truncated-header fixture skips 11 bytes, the remains of
+ * a header line — and saying anything more about it would be inventing it.
+ */
+function undecodedBodyBytes(session) {
+  const skipped = session?.frameCounts?.resyncBytes;
+  if (!Number.isFinite(skipped)) {
+    return 0;
+  }
+  return skipped >= 1 + (session.fields?.length ?? 0) ? skipped : 0;
+}
+
+/**
+ * What the session panel shows for a flight whose header was read and which
+ * holds fewer than two samples: nothing with a duration, a rate or a response.
+ *
+ * NOT the unreadable view: that one says the header block is damaged, which is
+ * false here and sends a pilot after the wrong fault. And not ONE sentence for
+ * every such flight either, because the decoder knows which of two different
+ * things happened:
+ *
+ *   - Bytes followed the header and none of them decoded. MEASURED: a header
+ *     followed by 5 KiB of junk decodes to exactly the shape of a log that
+ *     stopped at its header — fields, no samples, one corrupt-frame error —
+ *     apart from the bytes skipped. The panel says how much could not be read
+ *     and what the decoder said about it, and names no cause: corruption and a
+ *     format this decoder does not know look the same from here.
+ *   - Nothing that could have been a frame followed it. Only then does the
+ *     panel say the log ends at, or just after, its header, and mention the
+ *     common causes — as common causes, because the bytes cannot say which.
+ *
+ * Everything below the session panel measures samples, so it comes down; the
+ * axis panel used to throw on the first one it asked for and leave the
+ * previous flight's numbers under this one's name.
+ */
+function renderEmptySession(session) {
+  takeDownAnalysis();
+  const samples = session.samples?.length ?? 0;
+  const skipped = undecodedBodyBytes(session);
+  const firstError = (session.errors ?? [])
+    .find(error => typeof error?.message === 'string' && error.message !== '') ?? null;
+  const decoderSaid = firstError === null ? '' : ` (the decoder reported: ${firstError.message})`;
+
+  let verdict;
+  let sentence;
+  if (skipped > 0) {
+    verdict = pill('bad', 'frames not decoded');
+    // No cause is named: corruption and a format this decoder does not know
+    // look identical from here, and only the decoder's own message is evidence.
+    sentence = samples === 0
+      ? `This flight's header was read, but the ${formatBytes(skipped)} recorded after it ` +
+        `could not be decoded as flight data${decoderSaid}. The log is not empty; RotorLens ` +
+        'could not read what it holds, so there is nothing in it to measure.'
+      : `This flight's header was read and one sample decoded, but the other ` +
+        `${formatBytes(skipped)} recorded after it could not be decoded as flight ` +
+        `data${decoderSaid}. One sample has no duration and no rate, so there is nothing in it ` +
+        'to measure.';
+  } else if (samples === 0) {
+    verdict = pill('warn', 'no frames');
+    sentence = 'No flight data was recorded in this session: the log ends at, or just after, ' +
+      'its header. Power lost, or the model disarmed as logging began, are the common causes. ' +
+      'There is nothing in it to measure.';
+  } else {
+    verdict = pill('warn', 'one sample');
+    sentence = 'Only one sample of flight data was recorded in this session: the log ends ' +
+      'straight after its first frame. One sample has no duration and no rate, so there is ' +
+      'nothing in it to measure.';
+  }
+
+  $('session-stats').innerHTML = headerOnlyStatsHtml(session, String(samples));
+  $('session-issues').innerHTML =
+    `<h3>Integrity</h3>${verdict}` +
+    decodeErrorListHtml(session) +
+    `<p class="muted" style="font-size:12.5px">${esc(sentence)}${otherFlightsSentence()}</p>`;
+  show('session-panel');
+}
+
+/**
+ * What the screen shows when reading or showing a flight failed outright.
+ *
+ * `message` goes in the status line, where the pilot looks first, and the
+ * callers leave it there rather than repainting it. The previous flight's
+ * panels come down: whatever is on screen after a fault must not be a
+ * different flight's numbers under this one's name.
+ */
+function renderSessionFault(message) {
+  takeDownAnalysis();
+  const session = currentSession();
+  $('status').innerHTML = `<span class="error">${esc(message)}</span>`;
+  show('status-panel');
+  $('session-stats').innerHTML = headerOnlyStatsHtml(session, '—');
+  $('session-issues').innerHTML =
+    `<h3>Integrity</h3>${pill('bad', 'not read')}` +
+    `<p class="muted" style="font-size:12.5px">RotorLens could not read this flight, so ` +
+    `nothing from it is shown. That says nothing either way about the helicopter.` +
+    `${otherFlightsSentence()}</p>`;
+  show('session-panel');
 }
 
 /**
@@ -1410,30 +1672,20 @@ function renderSession() {
  * header costs exactly one flight and the picker still lists the others.
  */
 function renderUnreadableSession(session) {
-  const codes = (session?.errors ?? []).slice(0, 5);
+  // Everything below the session panel measures samples there are none of —
+  // and the before/after, which is not one of those panels, goes too: it
+  // carried the previous flight's Save button under this one's name.
+  takeDownAnalysis();
 
-  $('session-stats').innerHTML = [
-    ['Firmware', session?.firmware?.revision ?? session?.firmware?.type ?? '—'],
-    ['Craft', session?.craftName ?? '—'],
-    ['Samples', '—']
-  ].map(([key, value]) => `<div class="stat"><div class="k">${key}</div><div class="v">${esc(value)}</div></div>`)
-    .join('');
+  $('session-stats').innerHTML = headerOnlyStatsHtml(session, '—');
 
   $('session-issues').innerHTML =
     `<h3>Integrity</h3>${pill('bad', 'cannot be read')}` +
-    (codes.length > 0
-      ? `<ul class="codes">${codes.map(
-        error => `<li><code>${esc(error.code)}</code>${
-          Number.isFinite(error.offset) ? ` at byte ${error.offset}` : ''}</li>`
-      ).join('')}</ul>`
-      : '') +
+    decodeErrorListHtml(session) +
     `<p class="muted" style="font-size:12.5px">This flight's header block is damaged, so ` +
     `nothing in it can be decoded. The other flights in this file are unaffected — pick ` +
     `another from the list above.</p>`;
 
-  // Everything below the session panel measures samples there are none of.
-  ['recommend-panel', 'window-panel', 'axis-panel', 'tune-panel', 'plot-panel', 'fields-panel']
-    .forEach(id => show(id, false));
   show('session-panel');
 }
 
@@ -1529,6 +1781,10 @@ function applyFlightWindow(options = {}) {
   state.marks = [];
   state.marksAxis = null;
   state.windowTrace = null;
+  // The tune evidence was measured over the old window too, and the stop marks
+  // it drew have just been cleared. Left up, it went on counting stops that now
+  // lie outside the window — every path that moves the window comes here.
+  resetTunePanel();
 
   renderWindowPanel();
   renderAxisPanel();
@@ -2000,24 +2256,209 @@ const AXIS_STOP = {
  * appears, in what order, or which way a gain moves, and an id with no entry
  * falls through to the engine's own wording rather than being guessed at.
  */
+/** "once", "twice" or "once and twice", from a rotor-order finding's codes. */
+function perTurn(codes) {
+  const once = codes.includes('MAIN_ROTOR_ORDER_1');
+  const twice = codes.includes('MAIN_ROTOR_ORDER_2');
+  return once && twice ? 'once and twice' : (twice ? 'twice' : 'once');
+}
+
+/**
+ * The strongest rotor-order tone's size, and how many times the limit it is,
+ * read from the finding's own basis — the numbers the card shows underneath —
+ * or null when the basis does not carry them.
+ */
+function strongestRotorTone(finding) {
+  const basis = finding.basis ?? [];
+  // Its size WHILE PRESENT (round 3): the flight average of a tone that comes
+  // and goes is pulled under the very limit the card says it was above.
+  const size = basis.find(entry => entry.unit === 'deg/s'
+    && /^(?:roll|pitch|yaw): main rotor (?:once|twice)-per-rev, band RMS while above/
+      .test(entry.label));
+  const ratio = basis.find(entry => entry.label === 'strongest tone against the experimental level');
+  const share = basis.find(entry => entry.unit === '%'
+    && /^strongest tone, share of (?:the range|its stretch) above/.test(entry.label));
+  const average = basis.find(entry => entry.unit === 'deg/s'
+    && /^strongest tone, band RMS averaged over all of/.test(entry.label));
+  if (!Number.isFinite(size?.value) || !Number.isFinite(ratio?.value)) {
+    return null;
+  }
+  // How long it was there, and its flight average, beside its size: never the
+  // average in place of the size.
+  const where = /its stretch/.test(share?.label ?? '')
+    ? 'the part of this flight it was measured in' : 'this flight';
+  const presence = Number.isFinite(share?.value) && Number.isFinite(average?.value)
+    ? `It was above that limit for ${text(share.value, 0)}% of ${where}, and averaged `
+      + `${text(average.value, 1)} degrees a second over all of it. `
+    : '';
+  return {size: text(size.value, 1), ratio: text(ratio.value, 1), presence};
+}
+
+/** The vibration check's "too little continuous gyro" family of reasons. */
+const GYRO_COVERAGE_CODES = [
+  'INSUFFICIENT_CONTIGUOUS_GYRO_DATA', 'VALID_WINDOW_COVERAGE_INSUFFICIENT',
+  'FINITE_GYRO_SAMPLE_COVERAGE_INSUFFICIENT', 'FINITE_GYRO_TIME_SPAN_COVERAGE_INSUFFICIENT',
+  'SELECTED_TIMESTAMP_SPAN_COVERAGE_INSUFFICIENT', 'GYRO_COVERAGE_INSUFFICIENT'
+];
+/** ...and its "one stretch too long for one analysis" family. */
+const STRETCH_CAP_CODES = [
+  'SELECTION_SAMPLE_LIMIT_EXCEEDED', 'SELECTION_DURATION_LIMIT_EXCEEDED',
+  'RESAMPLED_SAMPLE_LIMIT_EXCEEDED'
+];
+
+/** Why "only the main rotor" was not established, from the refusal the engine names. */
+const ROTOR_ORDER_NOT_ESTABLISHED_PLAIN = {
+  STRETCH_NOT_MEASURED: 'part of the flight could not be measured',
+  ROTOR_NOT_COMPARED: 'your rotor speed could not be compared against it across the whole flight',
+  AXIS_NOT_MEASURED_ON_UNFILTERED_GYRO: 'not every axis was logged unfiltered',
+  ATTENTION_PEAK_LIST_INCOMPLETE: 'some of it sat too close together to check piece by piece'
+};
+
+/** The part of a flight the rotor was NOT compared over, and why, in a pilot's words. */
+const ROTOR_REST_PLAIN = {
+  NOT_EVALUATED: 'the vibration itself could not be measured there',
+  FIELD_MISSING: 'no head speed was logged',
+  NO_VALID_RPM_IN_RANGE: 'no usable rotor speed was logged',
+  INSUFFICIENT_COVERAGE: 'head speed was logged for too little of it',
+  RPM_OUT_OF_RANGE: 'the logged head speed is outside anything a rotor in flight turns at',
+  RPM_UNSTABLE_IN_SELECTION: 'your rotor speed moved too much'
+};
+
 const PLAIN_ENGLISH = {
   AIRFRAME_CLEAR: () =>
     'Your helicopter is running smoothly enough for the rest of this to mean something.',
-  AIRFRAME_VIBRATION_PRESENT: () =>
-    'Your helicopter is shaking. Nothing about the tune can be judged until that stops — '
-    + 'vibration looks exactly like a badly set D term, and chasing it with gains makes it '
-    + 'worse.',
+  // Reworded 2 October 2026. This said "Your helicopter is shaking." as a plain
+  // fact, on a threshold calibrated only on synthetic signals. It now says what
+  // was measured: vibration above a cautious limit that the main rotor's own
+  // once- and twice-per-turn do not account for.
+  AIRFRAME_VIBRATION_PRESENT: finding => {
+    const codes = finding.codes ?? [];
+    let why = 'it is not the main rotor\'s own once- or twice-per-turn.';
+    if (codes.includes('ROTOR_ORDER_NOT_ESTABLISHED')) {
+      const refusal = Object.keys(ROTOR_ORDER_NOT_ESTABLISHED_PLAIN)
+        .find(code => codes.includes(code));
+      why = 'it looks like the main rotor\'s own once- or twice-per-turn, but '
+        + `${refusal ? ROTOR_ORDER_NOT_ESTABLISHED_PLAIN[refusal]
+          : 'the check could not confirm it is only that'}, so that is not certain.`;
+    } else if (codes.includes('VIBRATION_NOT_COMPARED_WITH_ROTOR')) {
+      why = 'it could not be checked against your rotor speed, so it may or may not be the '
+        + 'main rotor.';
+    }
+    return 'Vibration above a cautious, still-unproven limit was measured on this flight, and '
+      + `it is unexplained — ${why} Until it is explained the tune cannot be judged: vibration `
+      + 'looks exactly like a badly set D term, and chasing it with gains makes it worse.';
+  },
+  // Reworded 2 October 2026: this called every such tone "a little above" the
+  // limit, whatever it measured. It states the size and the ratio, and the
+  // engine shows this card only when nothing else on the airframe blocks, so
+  // "does not hold back the rest" is true wherever it appears.
+  AIRFRAME_ROTOR_ORDER_TONE: finding => {
+    const measured = strongestRotorTone(finding);
+    const how = perTurn(finding.codes ?? []);
+    if (!measured) {
+      return finding.headline;
+    }
+    // Round 3: "at its strongest" named a flight average. It now says the size
+    // while the tone was there, and how long it was there for.
+    return `Your main rotor is shaking the helicopter ${how} per turn: ${measured.size} degrees `
+      + `a second while it was above a cautious, still-unproven limit, ${measured.ratio} times `
+      + `that limit. ${measured.presence}`
+      + 'That is usually blade tracking or balance and is worth checking. On its own it does '
+      + 'not hold back the rest of this advice.';
+  },
+  // Added 2 October 2026: past three times the limit the same tone blocks.
+  AIRFRAME_ROTOR_ORDER_TONE_LARGE: finding => {
+    const measured = strongestRotorTone(finding);
+    const how = perTurn(finding.codes ?? []);
+    if (!measured) {
+      return finding.headline;
+    }
+    return `Your main rotor is shaking the helicopter ${how} per turn: ${measured.size} degrees `
+      + `a second while it was above a cautious, still-unproven limit, ${measured.ratio} times `
+      + `that limit, and more than this app will read a tune over. ${measured.presence}`
+      + 'A tone that size usually means the blades are out of track or out of balance. Sort the '
+      + 'tracking and balance before tuning — chasing it with gains changes nothing.';
+  },
   AIRFRAME_BROADBAND_ELEVATED: () =>
     'The gyro is noisy across the whole range, not at one frequency. That is the airframe '
     + 'or the mounting, and it swamps the measurements a tune is judged on.',
-  AIRFRAME_ROTOR_NOT_COMPARED: () =>
-    'Your rotor speed moved too much across this flight for the shaking to be compared '
-    + 'against it, so the head is neither blamed nor ruled out.',
+  // Worded from the reason the engine gives. It used to blame a moving rotor
+  // speed every time, including on logs with no rotor speed in them at all.
+  AIRFRAME_ROTOR_NOT_COMPARED: finding => {
+    const codes = finding.codes ?? [];
+    // A long flight compared over some of its stretches and not the rest. Checked
+    // first: its rest-reason can be NOT_EVALUATED, and "never compared" would be
+    // false about the part that was.
+    if (codes.includes('ROTOR_CORRELATION_PARTIAL')) {
+      const rest = Object.keys(ROTOR_REST_PLAIN).find(code => codes.includes(code));
+      return 'The vibration was compared against your rotor speed over only part of this '
+        + `flight — over the rest, ${rest ? ROTOR_REST_PLAIN[rest] : 'no usable rotor speed was '
+          + 'logged'}. Over that rest the head is neither blamed nor ruled out.`;
+    }
+    if (codes.includes('ROTOR_CORRELATION_NOT_ATTEMPTED') || codes.includes('NOT_EVALUATED')) {
+      return 'The vibration was never compared against your rotor speed, because the '
+        + 'vibration check itself could not measure this flight. The head is neither blamed '
+        + 'nor ruled out.';
+    }
+    if (codes.includes('FIELD_MISSING')) {
+      return 'This log does not record head speed, so the vibration could not be compared '
+        + 'against your rotor. The head is neither blamed nor ruled out.';
+    }
+    if (codes.includes('NO_VALID_RPM_IN_RANGE')) {
+      return 'No usable rotor speed was logged during this flight — the rotor was not '
+        + 'turning, or the RPM sensor was not reading — so the head is neither blamed nor '
+        + 'ruled out.';
+    }
+    if (codes.includes('INSUFFICIENT_COVERAGE')) {
+      return 'Head speed was logged for too little of this flight to compare the vibration '
+        + 'against it, so the head is neither blamed nor ruled out.';
+    }
+    if (codes.includes('RPM_OUT_OF_RANGE')) {
+      return 'The logged head speed is outside anything a rotor in flight turns at, so the '
+        + 'vibration could not be compared against it. The head is neither blamed nor ruled '
+        + 'out.';
+    }
+    if (codes.includes('RPM_UNSTABLE_IN_SELECTION')) {
+      return 'Your rotor speed moved too much across this flight for the vibration to be '
+        + 'compared against it, so the head is neither blamed nor ruled out.';
+    }
+    return 'The vibration could not be compared against your rotor speed on this flight, so '
+      + 'the head is neither blamed nor ruled out.';
+  },
   AIRFRAME_UNFILTERED_GYRO_MISSING: () =>
     'This log only has the filtered gyro in it. The filters take the vibration out before '
     + 'it can be measured, so nothing here can tell you whether your helicopter is smooth.',
-  AIRFRAME_BROADBAND_NOT_MEASURED: () =>
-    'The vibration level could not be read on this flight at all.',
+  // Says WHY, from the reason codes the engine passes on. "Could not be read"
+  // with no reason sends a pilot nowhere.
+  AIRFRAME_BROADBAND_NOT_MEASURED: finding => {
+    const codes = finding.codes ?? [];
+    const why = codes.includes('GYRO_FIELDS_MISSING')
+      ? 'the log has no gyro recorded for at least one axis'
+      : codes.includes('SAMPLE_RATE_UNAVAILABLE')
+        ? 'the log\'s sample rate is too low, or could not be worked out'
+        : codes.includes('SAMPLE_RATE_LIMIT_EXCEEDED')
+          ? 'the log\'s sample rate is higher than the check accepts'
+          : codes.includes('NON_MONOTONIC_TIMESTAMPS')
+            ? 'the log\'s timestamps run backwards'
+            : codes.includes('TIMING_GAPS_EXCESSIVE')
+              ? 'the log has gaps in it — usually the logging storage falling behind'
+              : codes.includes('INSUFFICIENT_TIMESTAMPED_SAMPLES')
+                ? 'the stretch of flight is too short'
+                : GYRO_COVERAGE_CODES.some(code => codes.includes(code))
+                  ? 'too little of it carries continuous gyro data — usually the gyro logging '
+                    + 'dropping out'
+                  : STRETCH_CAP_CODES.some(code => codes.includes(code))
+                    ? 'a stretch of it is longer than one vibration check accepts'
+                    : null;
+    // A long flight is measured in stretches, and one that could not be is not
+    // the whole flight: the engine says which with VIBRATION_PARTLY_MEASURED.
+    const where = codes.includes('VIBRATION_PARTLY_MEASURED') ? 'part of this flight' : 'this flight';
+    return why
+      ? `The vibration level could not be read on ${where}: ${why}. That says nothing `
+        + 'either way about how your helicopter runs.'
+      : `The vibration level could not be read on ${where}${where === 'this flight' ? ' at all' : ''}. `
+        + 'That says nothing either way about how your helicopter runs.';
+  },
   AIRFRAME_NOT_CHECKED: () =>
     'The vibration check has not been run over this window yet.',
   AIRFRAME_RANGE_EXCLUDES_EVENTS: () =>
@@ -2031,6 +2472,30 @@ const PLAIN_ENGLISH = {
     + 'machine is wrong everywhere else.',
   HEADSPEED_NOT_MEASURED: () =>
     'There is no usable head speed in this flight to judge the gains against.',
+  // Added 2 October 2026. A missing RPM sample used to be reported as the head
+  // speed wandering; it is the sensor or the logging, and says so.
+  HEADSPEED_READING_DROPPED_OUT: () =>
+    'Your head-speed reading dropped out during some of the steady flying, so those '
+    + 'stretches could not be used. That is the RPM sensor or the logging, not your governor.',
+  // Added 2 October 2026 (round two). The head speed moved in the one steady
+  // stretch that could be checked; this used to read "held steady enough".
+  HEADSPEED_TOO_FEW_SEGMENTS_TO_JUDGE: () =>
+    'Your head speed moved during the only steady flying long enough to check it, so this '
+    + 'flight cannot say whether your governor holds. That is not an all-clear: fly a few '
+    + 'still hovers and watch the head speed.',
+  // Per hold since round three: a stretch where the head speed moved on one
+  // axis's hold can still hold another axis's hold that stayed steady.
+  HEADSPEED_MOVED_IN_SOME_SEGMENTS: () =>
+    'Your head speed moved during some of your steady flying. Those moments were left out: '
+    + 'the advice uses only holds during which your head speed stayed steady all the way '
+    + 'through.',
+  // Added 3 October 2026: the head speed moved, but in every such stretch another
+  // axis still measured a hold where it held, so nothing was lost to it.
+  HEADSPEED_MOVED_WHERE_A_HOLD_WAS_STILL_MEASURED: () =>
+    'Your head speed moved during part of some of your steady flying, but each of those '
+    + 'stretches still gave a usable hold where it stayed steady, so nothing was lost and the '
+    + 'advice is not held back. Only holds during which your head speed stayed steady all the '
+    + 'way through were used.',
   DIRECTIONAL_ASYMMETRY_MECHANICAL: finding => (finding.axis === 'yaw'
     ? 'Your tail behaves differently stopping one way from the other, by more than a gain '
       + 'would explain. That is the linkage, the travel or the tail running out of '
@@ -2046,9 +2511,32 @@ const PLAIN_ENGLISH = {
   P_TOO_HIGH: finding =>
     `Your ${AXIS_THING[finding.axis] ?? finding.axis} twitches while you are holding it `
     + `steady, and swings past centre when you ${AXIS_STOP[finding.axis] ?? 'stop'}.`,
-  AXIS_DOES_NOT_ARREST: finding =>
-    `Your ${AXIS_THING[finding.axis] ?? finding.axis} keeps going after you centre the `
-    + 'stick instead of stopping where you put it.',
+  // Three roads reach this card (2 October 2026). On the two added that day the
+  // engine itself says there may be nothing wrong, and a card reading as a fault
+  // would contradict it.
+  AXIS_DOES_NOT_ARREST: finding => {
+    const thing = AXIS_THING[finding.axis] ?? finding.axis;
+    const codes = finding.codes ?? [];
+    // Added 3 October 2026: a commanded rate that was missing or zero is a missing
+    // measurement, never a small shortfall.
+    if (codes.includes('COMMANDED_RATE_NOT_MEASURED')) {
+      return `Your ${thing} was still turning a little just after you centred the stick, but `
+        + 'the rate you asked for could not be measured, so how far short of it you sat is not '
+        + 'known. Nothing to change yet.';
+    }
+    if (codes.includes('STANDING_OFFSET_TOO_SMALL_FOR_P')) {
+      return `Your ${thing} was still turning a little just after you centred the stick. `
+        + 'Any healthy loop does that after a big, fast stop, and this flight cannot tell that '
+        + 'apart from too little P — so there is nothing to change yet.';
+    }
+    if (codes.includes('STANDING_OFFSET_WITHIN_NOISE_FLOOR')) {
+      return `Your ${thing} was still turning just after you centred the stick, and sat a `
+        + 'little short of the rate you asked for — but the gyro is noisy enough on this axis '
+        + 'that the shortfall cannot be read as too little P. Nothing to change yet.';
+    }
+    return `Your ${thing} keeps going after you centre the stick instead of stopping where `
+      + 'you put it.';
+  },
   D_TOO_HIGH: finding =>
     `Your ${AXIS_THING[finding.axis] ?? finding.axis} shakes for a moment every time you `
     + `${AXIS_STOP[finding.axis] ?? 'stop'} — and it is quiet while you hold, which is what `
@@ -2076,6 +2564,90 @@ const PLAIN_ENGLISH = {
   I_TERM_VERDICT_UNSTABLE: finding =>
     `The I-term answer for ${finding.axis} changed depending on how it was measured, so `
     + 'there is no answer to give you.',
+  // Added 2 October 2026. This flight used to read "Nothing ... calls for an I
+  // change" here, about holds that were never judged.
+  I_TERM_HOLDS_MIXED: finding =>
+    `Your steady ${finding.axis} flying mixed holding still with holding a steady turn. `
+    + 'Those test the I term in two different ways and cannot be judged together, so the I '
+    + 'term was not judged at all — this is not an all-clear.',
+  // Added 2 October 2026 (round two). Each of these used to read "Nothing in
+  // the way you held ... calls for an I change".
+  I_TERM_SIGNATURES_CONFLICT: finding =>
+    `While you held ${AXIS_THING[finding.axis] ?? finding.axis} steady it both sat off where `
+    + 'you put it and wobbled either side of it. One I setting cannot do both, so something '
+    + 'else is usually moving it — a tight linkage, the governor or the wind. The I term was '
+    + 'not judged; this is not an all-clear.',
+  SLOW_WANDER_NOT_FROM_THE_I_TERM: finding => {
+    const thing = AXIS_THING[finding.axis] ?? finding.axis;
+    const codes = finding.codes ?? [];
+    if (codes.includes('I_TERM_DOES_NOT_OSCILLATE_WITH_THE_ERROR')) {
+      return `Your ${thing} wobbled while you held it steady, but the I term was not moving `
+        + 'with it, so the I term is not what is moving it. Look at the governor, the drive '
+        + 'and the wind first.';
+    }
+    // Since 3 October 2026 the engine sends a side change here only when the
+    // movement was BELOW the band, so "slow wander" is true of it; an in-band or
+    // faster one goes to I_TERM_NOT_JUDGED instead.
+    if (codes.includes('STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS')) {
+      return `Your ${thing} sat off where you put it on one side in some holds and on the other `
+        + 'side in others. Too little I stays on one side, so this is a slow wander — usually '
+        + 'the governor, the drive or the wind. The I term was not judged; this is not an '
+        + 'all-clear.';
+    }
+    if (codes.includes('SLOW_MOVEMENT_BELOW_I_TERM_BAND')
+        || codes.includes('STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT')
+        || codes.includes('STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD')) {
+      return `Your ${thing} wandered slowly while you held it steady — more slowly than the I `
+        + 'term makes a helicopter wander. That is usually the governor, the drive or the '
+        + 'wind. The I term was not judged; this is not an all-clear.';
+    }
+    return `Your ${thing} wanders slowly while you hold it, but the I term is too small a `
+      + 'part of what the controller is doing to be the cause. Look at the governor, the '
+      + 'drive and the wind first.';
+  },
+  // Worded from what was missing since round three, as the engine's card is.
+  I_TERM_NOT_JUDGED: finding => {
+    const thing = AXIS_THING[finding.axis] ?? finding.axis;
+    const codes = finding.codes ?? [];
+    if (codes.includes('OSCILLATION_ABOVE_I_TERM_BAND')) {
+      return `Your ${thing} shook quickly while you held it — faster than the I term works — and `
+        + 'that hid anything slower, so the I term was not judged. Sort out the shake first; '
+        + 'this is not an all-clear.';
+    }
+    if (codes.includes('SLOW_RIPPLE_NOT_CLEAR_OF_NOISE')) {
+      return `Your ${thing} moved slowly while you held it, but by no more than the gyro's own `
+        + 'noise, so that movement could not be read and the I term was not judged. This is not '
+        + 'an all-clear.';
+    }
+    if (codes.includes('STANDING_ERROR_FOLLOWS_COMMAND_DIRECTION')) {
+      return `In every turn your ${thing} sat off where you put it, on the side the turn went. `
+        + 'That can be too little I, or something keeping step with your turns, and these turns '
+        + 'cannot say which. Fly the turns all one way, or still hovers. This is not an '
+        + 'all-clear.';
+    }
+    // Added 3 October 2026: an error that changed side between holds while its
+    // movement inside them was NOT slower than the I term's band comes here, not
+    // to SLOW_WANDER_NOT_FROM_THE_I_TERM, so it is not called a slow wander.
+    if (codes.includes('STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS')) {
+      return `Your ${thing} sat off where you put it on one side in some holds and on the other `
+        + 'side in others. Too little I stays on one side, so these holds could not be read as '
+        + 'that, and this flight cannot say what moved them. The I term was not judged; this is '
+        + 'not an all-clear.';
+    }
+    if (codes.includes('TOO_FEW_HOLDS_FOR_A_STANDING_ERROR')) {
+      return `Your ${thing} sat off where you put it on the same side every time — which can be `
+        + 'too little I — but that few holds cannot tell it from a slow wander. Fly at least '
+        + `${EVIDENCE_LIMITS.minimumHoldsForStandingError} still holds next time. This is not an `
+        + 'all-clear.';
+    }
+    if (codes.includes('STANDING_ERROR_NOT_CLEAR_OF_SLOW_MOVEMENT')
+        || codes.includes('STANDING_ERROR_NOT_CLEAR_IN_EVERY_HOLD')) {
+      return `Your ${thing} sat a little off where you put it, but moved about as much as that `
+        + 'while you held it, so the I term was not judged. This is not an all-clear.';
+    }
+    return `Your ${finding.axis} holds were measured, but not in a way that says anything about `
+      + 'the I term — this is not an all-clear.';
+  },
   NO_HOLD_EVIDENCE: finding =>
     `You never held ${finding.axis} steady for long enough in this flight for the I term to `
     + 'show itself.',
@@ -2441,22 +3013,26 @@ function yieldToPaint() {
  * The range handed to the mechanical analysis.
  *
  * Snapped to the windowed session's own first and last SAMPLE, not to the
- * window's microsecond ends. `analyzeMechanicalTimeSeries` throws
+ * window's microsecond ends. The analysis throws
  * ANALYSIS_RANGE_INVALID for a range that starts before the first sample it was
  * given, and a window dragged with a finger lands between samples essentially
  * always — so asking for `[startUs, endUs]` verbatim killed the whole panel the
- * first time either marker was moved. Then clamped to the longest selection the
- * spectrum analysis accepts, which is what the vibration panel does too.
+ * first time either marker was moved.
+ *
+ * NOT CLAMPED, since 2 October 2026. It used to be cut to the analyser's
+ * 262.144 s duration cap, but one analysis is also capped at 262,144 SAMPLES,
+ * and a Rotorflight log at its own 1007 Hz holds more than that in 262 s — so
+ * every ordinary five-minute pack came back "not measured" and every gain was
+ * blocked, and where the clamp did hold, a stop after 262 s fell outside it.
+ * `analyzeMechanicalWindow` now measures the whole window, in stretches when it
+ * has to, and the vibration panel goes through the same function.
  */
 function mechanicalRange(scoped) {
   const bounds = sessionTimeBounds(scoped);
-  const cap = MECHANICAL_CONSTANTS.maximumSelectionDurationUs;
   const startTimeUs = bounds.startTimeUs ?? state.window.startUs ?? 0;
-  const requested = Math.max(0, (bounds.endTimeUs ?? startTimeUs) - startTimeUs);
   return {
     startTimeUs,
-    endTimeUs: startTimeUs + Math.min(requested, cap),
-    clamped: requested > cap
+    endTimeUs: Math.max(startTimeUs, bounds.endTimeUs ?? startTimeUs)
   };
 }
 
@@ -2500,8 +3076,10 @@ async function collectRecommendationMaterial(scoped, session) {
   const selected = $('axis').value;
   const order = [selected, ...AXIS_ORDER.filter(axis => axis !== selected)];
 
+  // The whole flight window, through the same function the vibration panel
+  // uses, so the airframe finding and the panel are about the same seconds.
   const range = mechanicalRange(scoped);
-  const mechanical = await analyzeMechanicalTimeSeries(
+  const mechanical = await analyzeMechanicalWindow(
     buildMechanicalSeries(scoped), {timeRangeUs: range}
   );
 
@@ -2565,6 +3143,9 @@ async function collectRecommendationMaterial(scoped, session) {
       analysed: Object.keys(axes),
       skipped,
       range,
+      // 1 for a window one analysis accepts; more when it was measured in
+      // consecutive stretches and combined.
+      vibrationStretches: Array.isArray(mechanical.chunks) ? mechanical.chunks.length : 1,
       windowBasis: state.window.basis
     }
   };
@@ -2727,15 +3308,19 @@ async function measureRecommendations() {
     `Measured over the ${esc(seconds)} s flight window below, on ` +
     `${esc(produced.coverage.analysed.join(', ') || 'no axis')}. ` +
     `Took ${Math.round(performance.now() - started)} ms on this device.` +
-    (produced.coverage.range.clamped
-      ? ' The vibration part covered only the first stretch of it — the window is longer ' +
-        'than the spectrum analysis accepts.'
+    (produced.coverage.vibrationStretches > 1
+      ? ` The vibration part was measured as ${produced.coverage.vibrationStretches} ` +
+        'consecutive stretches of it, longer than one analysis takes, and the worst ' +
+        'stretch speaks for the whole flight.'
       : '');
 
   // AFTER the first analysis that produced something, never at first run — see
   // `maybeAskToShare` and design section 4. It goes last in this function on
   // purpose: the advice is on screen behind the dialog, so the question is asked
   // over an answer rather than over an empty page.
+  //
+  // A no-op since 2 October 2026: `AUTOMATIC_SHARING_PROMPT` is off until the
+  // terms the dialog asks for have been reviewed.
   maybeAskToShare();
 }
 
@@ -2977,6 +3562,24 @@ export function considerFlight(axes) {
   }
 
   renderSincePanel();
+}
+
+/**
+ * Re-derives the open flight's before/after from the history as it now stands.
+ *
+ * Called after a Forget. The since-panel otherwise keeps the comparison
+ * `considerFlight` made, and when the record forgotten was its baseline — or the
+ * open flight's own save — it would go on comparing against, or offering to
+ * forget, a record that no longer exists.
+ */
+function recompareCandidate() {
+  if (state.candidate === null || state.historyReadBlocked) {
+    return;
+  }
+  const {baseline, storedAs} = selectBaseline(state.history, state.candidate);
+  state.candidateStoredId = storedAs;
+  state.comparisonBefore = baseline;
+  state.comparison = baseline === null ? null : compareFlightRecords(baseline, state.candidate);
 }
 
 /** Keeps the flight on screen. The only thing in this app that writes anything. */
@@ -3455,7 +4058,13 @@ const EXCLUSION_WORDS = Object.freeze({
     + 'from it would be a vibration result wearing a gain\'s name.',
   HEADSPEED_MISMATCH:
     'flown at a different head speed. The same gains at a different head speed are a '
-    + 'different controller, so those flights are kept in their own group rather than pooled.'
+    + 'different controller, so those flights are kept in their own group rather than pooled.',
+  // A later save of a flight already kept: see `sameStoredFlight` in
+  // flight-history.mjs. Histories written before a reopened flight could be
+  // recognised can hold these, and the bare code used to reach the screen.
+  DUPLICATE_OF_STORED_FLIGHT:
+    'the same flight saved again: every number both saves measured matches an earlier save '
+    + 'of it, so it is counted once.'
 });
 
 /**
@@ -3720,15 +4329,26 @@ function historyListHtml(aircraft, history, readBlocked = false) {
 
   return aircraft.map(entry => {
     const flights = [...findRecords(history, entry.aircraftKey)].reverse();
+    // A later save of a flight already listed says so. Forget on either row
+    // takes every save of the flight, and without this the second row
+    // vanishing with the first would look like a deletion nobody asked for.
+    const copies = resavedCopies(history, entry.aircraftKey);
+    const ordinalOf = new Map(flights.map(record => [record.recordId, record.ordinal]));
     const rows = flights.map(record => {
       const duration = record.durationSeconds === null
         ? '—'
         : `${record.durationSeconds.toFixed(0)} s`;
+      const firstSave = copies[record.recordId];
+      const resaved = firstSave === undefined || !ordinalOf.has(firstSave)
+        ? ''
+        : `<span class="meta">the same flight as #${ordinalOf.get(firstSave) + 1}, `
+          + 'saved again</span>';
       return '<div class="flight">'
         + `<span class="ord">#${record.ordinal + 1}</span>`
         + `<span>${esc(duration)}</span>`
         + `<span class="meta">${esc(record.firmwareRevision ?? 'firmware unknown')} · `
         + `${esc(gainSummary(record))}</span>`
+        + resaved
         + `<button type="button" data-forget-flight="${esc(record.recordId)}" `
         + `aria-label="Forget flight ${record.ordinal + 1} for `
         + `${esc(entry.craftName ?? 'unnamed helicopter')}"${disabled}>Forget</button>`
@@ -3848,7 +4468,8 @@ async function forgetEverythingNow() {
       state.historyCodes = [];
       state.historyReadBlocked = false;
       state.historyWritable = state.historyStorePresent;
-      state.candidateStoredId = null;
+      // Nothing is stored now: no stored id, and no baseline to compare with.
+      recompareCandidate();
     }
 
     // "Forget everything" means both stores. Each awaited native reply reports
@@ -4053,8 +4674,11 @@ async function loadSharing() {
   }
   // Consent is bound to the words that were shown. An enabled preference from
   // an older disclosure fails closed: keep its local identities (the handles a
-  // pilot may need to erase), but turn sharing off and make the current question
-  // eligible to appear after the next admissible analysis.
+  // pilot may need to erase), but turn sharing off and clear `asked`. With
+  // `AUTOMATIC_SHARING_PROMPT` on, that makes the current question eligible to
+  // appear after the next admissible analysis; with it off (this build, since
+  // 2 October 2026) nothing appears on its own, and the pilot chooses again
+  // only by pressing Share measurements — which SHARING_TERMS_OUTDATED says.
   if (sharing.sharing === true && sharing.termsVersion !== SHARING_TERMS_VERSION) {
     sharing = {...sharing, asked: false, sharing: false, termsVersion: null};
     codes.unshift('SHARING_TERMS_OUTDATED');
@@ -4257,7 +4881,30 @@ function dismissConsent({restoreFocus = true} = {}) {
   return true;
 }
 
-/** Opens the complete versioned terms from either the automatic prompt or panel. */
+/**
+ * Whether RotorLens raises the sharing consent dialog by ITSELF, after an
+ * analysis. False.
+ *
+ * Turned off on 2 October 2026 by the owner's decision, until the terms the
+ * dialog asks for are formally reviewed. The dialog asks every pilot to grant a
+ * worldwide licence, commercial use included, on community-contribution terms
+ * that its own footnote calls "a draft awaiting legal review", and
+ * docs/PUBLIC_RELEASE_CHECKLIST.md says no contribution is solicited before the
+ * terms are adopted. Nothing could be sent in any case: this build has no
+ * upload transport.
+ *
+ * What still works, unchanged: the Share measurements button on the sharing
+ * panel opens the same complete dialog, for a pilot who goes looking for it.
+ *
+ * Turning this back on is a deliberate owner decision, taken after the terms
+ * are reviewed and adopted — not a cleanup. Re-enabling it also brings back the
+ * two sentences that promise the question will be asked (see
+ * `SHARING_LOAD_WORDS` and `sharingHtml`), and the tests in
+ * test/ui-open-file.test.mjs and test/ui-browser.test.mjs that pin it off.
+ */
+export const AUTOMATIC_SHARING_PROMPT = false;
+
+/** Opens the complete versioned terms, from the sharing panel's Share button. */
 function openConsent(returnFocus = null) {
   const legalPageOpen = typeof globalThis.RotorLensIsLegalPageOpen === 'function'
     && globalThis.RotorLensIsLegalPageOpen() === true;
@@ -4278,7 +4925,10 @@ function openConsent(returnFocus = null) {
 }
 
 /**
- * Asks, once, after the first analysis that produced something to point at.
+ * Asks, once, after the first analysis that produced something to point at —
+ * when `AUTOMATIC_SHARING_PROMPT` allows it, which since 2 October 2026 it does
+ * not. Kept whole rather than deleted, so turning the prompt back on restores
+ * exactly the gate below rather than a rewrite of it.
  *
  * NOT AT FIRST RUN, which is design section 4 and the reason this function takes
  * so much care about when it fires: asking before the app has done anything
@@ -4293,7 +4943,8 @@ function openConsent(returnFocus = null) {
  * during load and becomes eligible to be asked again.
  */
 export function maybeAskToShare() {
-  if (state.consentOpen
+  if (!AUTOMATIC_SHARING_PROMPT
+      || state.consentOpen
       || state.candidate === null
       || state.historyReadBlocked
       || (state.sharing?.asked === true
@@ -4378,10 +5029,24 @@ const SHARING_LOAD_WORDS = {
   SHARING_SCHEMA_VERSION_MISMATCH: 'The stored preference was written against a different '
     + 'version of these terms. It was not carried over, because agreeing to one wording is not '
     + 'agreeing to another.',
+  // Conditional on the automatic prompt since 2 October 2026: with it off,
+  // "RotorLens will ask again" is a promise this build does not keep. The
+  // prompt-off wording here points at the Share button; `sharingHtml` swaps it
+  // for `SHARING_TERMS_OUTDATED_NO_BUTTON` whenever that button is disabled.
   SHARING_TERMS_OUTDATED: 'Sharing was enabled under an older disclosure, so it is off now. '
-    + 'RotorLens will ask again after it analyses a flight; existing local identities remain '
-    + 'available to erase.'
+    + (AUTOMATIC_SHARING_PROMPT
+      ? 'RotorLens will ask again after it analyses a flight; existing local identities remain '
+        + 'available to erase.'
+      : 'RotorLens will not ask on its own; Share measurements shows the current terms if you '
+        + 'want to choose again. Existing local identities remain available to erase.')
 };
+
+// The same report for a panel whose Share button is disabled (no sharing store,
+// or a flight history that could not be read). Sending the pilot to a control
+// the same panel has switched off is the screen contradicting itself.
+const SHARING_TERMS_OUTDATED_NO_BUTTON = 'Sharing was enabled under an older disclosure, so it '
+  + 'is off now. RotorLens will not ask on its own. Existing local identities remain available '
+  + 'to erase.';
 
 /**
  * `4.2 kB`, so the dialog's "about 4 kB of numbers" can be checked on screen.
@@ -4497,6 +5162,16 @@ export function sharingHtml(history, sharing, {writable = true, blocked = false,
   historyBlocked = false, forgetFailed = false, writeFailed = false, codes = []} = {}) {
   const on = sharing?.sharing === true;
 
+  // Turning an existing preference off is always allowed. Turning it on needs
+  // the complete history so every kept helicopter can receive the deletion
+  // identity promised by the consent screen. Decided before the warnings,
+  // because their words must not point at this button when it is disabled.
+  const toggleDisabled = blocked || !writable || (historyBlocked && !on);
+  const loadWords = code => (code === 'SHARING_TERMS_OUTDATED' && toggleDisabled
+    && !AUTOMATIC_SHARING_PROMPT
+    ? SHARING_TERMS_OUTDATED_NO_BUTTON
+    : SHARING_LOAD_WORDS[code]);
+
   const warnings = [
     forgetFailed
       ? '<p class="error">RotorLens could not erase the sharing identity file, so its saved '
@@ -4520,7 +5195,7 @@ export function sharingHtml(history, sharing, {writable = true, blocked = false,
         + 'enabled here. The current phone app keeps the choice in its own private storage.</p>',
     ...codes
       .filter(code => code in SHARING_LOAD_WORDS)
-      .map(code => `<p class="error">${esc(SHARING_LOAD_WORDS[code])}</p>`)
+      .map(code => `<p class="error">${esc(loadWords(code))}</p>`)
   ].join('');
 
   const hasStoredIdentity = Object.values(sharing?.ids ?? {}).some(id => isSharingId(id));
@@ -4543,19 +5218,24 @@ export function sharingHtml(history, sharing, {writable = true, blocked = false,
       // Covers a fresh install and the state just after an erase alike, because
       // they are the same state and describing them differently would be
       // inventing a distinction the file does not make.
+      // The second sentence follows `AUTOMATIC_SHARING_PROMPT`: with the prompt
+      // off, "RotorLens will ask you once" is a promise nothing keeps. And it
+      // points at the Share button only where that button works: on a host with
+      // no sharing store it is disabled, and the warning above says why.
       + (canSayNothingStored
-        ? '<p class="muted">Nothing about sharing is stored on this device. RotorLens will ask '
-          + 'you once, after it has analysed a flight.</p>'
+        ? '<p class="muted">Nothing about sharing is stored on this device. '
+          + (AUTOMATIC_SHARING_PROMPT && writable
+            ? 'RotorLens will ask you once, after it has analysed a flight.</p>'
+            : writable
+              ? 'RotorLens does not ask about sharing on its own; it stays off unless you press '
+                + 'Share measurements below and agree to the terms it shows you.</p>'
+              : 'RotorLens does not ask about sharing on its own.</p>')
         : '');
 
   // The erase control appears only when there is something to erase. A button
   // that cannot do anything teaches people that the buttons here do nothing.
   const erasable = blocked || sharing?.asked === true || hasStoredIdentity;
 
-  // Turning an existing preference off is always allowed. Turning it on needs
-  // the complete history so every kept helicopter can receive the deletion
-  // identity promised by the consent screen.
-  const toggleDisabled = blocked || !writable || (historyBlocked && !on);
   const toggle = '<div class="controls">'
     + `<button type="button" id="sharing-toggle"${on ? '' : ' class="primary"'}`
     + `${toggleDisabled ? ' disabled aria-disabled="true"' : ''}>`
@@ -4617,9 +5297,10 @@ function renderSharingPanel() {
  *
  * The file is unlinked rather than rewritten empty, exactly as "forget
  * everything" does with the history: a file saying "asked, declined" is still a
- * file about somebody's choices. The cost is that the question comes back once
- * after the next analysis, and the panel says so rather than letting it be a
- * surprise.
+ * file about somebody's choices. With `AUTOMATIC_SHARING_PROMPT` on, the cost
+ * is that the question comes back once after the next analysis, and the panel
+ * says so rather than letting it be a surprise; with it off (since 2 October
+ * 2026) nothing comes back, and the panel says that instead.
  */
 async function eraseSharingIdentity() {
   await enqueueStorageOperation(async () => {
@@ -4669,6 +5350,22 @@ function renderAxisPanel() {
   // column indexes and do not care which session object they are read from.
   const summary = summarizeAxis(windowedSession(), signals);
   state.axisSummary = summary;
+
+  // `summarizeAxis` answers null when there are no samples to summarise. This
+  // dereferenced it and threw, leaving the previous flight's numbers in
+  // #axis-stats. `renderSession` now routes a flight with no frames away before
+  // it gets here; this is the floor under that, for any window with nothing in
+  // it. No signals are kept either, so nothing redraws a trace that is not there.
+  if (summary === null) {
+    state.axisSignals = null;
+    $('axis-stats').innerHTML = '';
+    $('axis-note').innerHTML = 'There are no samples in this flight window, so there is ' +
+      'nothing on this axis to measure.';
+    $('axis-plot-caption').textContent = '';
+    clearAxisPlot();
+    resetVibration();
+    return;
+  }
 
   const noise = summary.unfilteredHighFrequencyRmsDps === null
     ? `${text(summary.gyroHighFrequencyRmsDps)}°/s`
@@ -5096,6 +5793,15 @@ function rotorLine(name, rotor) {
   if (Number.isFinite(rotor.medianRpm)) {
     parts.push(`${Math.round(rotor.medianRpm).toLocaleString()} rpm median`);
   }
+  // A window measured in stretches has no single head speed, and none is
+  // invented for it: each stretch's own median is shown, in time order. Each
+  // peak was compared against the stretch it came from.
+  const stretchMedians = Array.isArray(rotor.stretchMedianRpm) ? rotor.stretchMedianRpm : [];
+  if (!Number.isFinite(rotor.medianRpm) && stretchMedians.some(Number.isFinite)) {
+    parts.push(`${stretchMedians.map(value => (Number.isFinite(value)
+      ? Math.round(value).toLocaleString() : 'none')).join(' / ')} rpm median in its `
+      + `${stretchMedians.length} stretches`);
+  }
   if (Number.isFinite(rotor.fundamentalHz)) {
     parts.push(`${text(rotor.fundamentalHz, 1)} Hz fundamental`);
   }
@@ -5146,7 +5852,17 @@ function peakRotorCell(harmonic) {
   };
 }
 
-function vibrationAxisBlock(axis) {
+/** "in 0–151 s of this window", for a peak from one stretch of a long window. */
+function stretchWords(peak, view) {
+  if (!Array.isArray(peak.chunkRangeUs) || !Number.isFinite(view?.range?.startTimeUs)) {
+    return '';
+  }
+  const from = (peak.chunkRangeUs[0] - view.range.startTimeUs) / 1e6;
+  const to = (peak.chunkRangeUs[1] - view.range.startTimeUs) / 1e6;
+  return `${text(from, 0)}–${text(to, 0)} s into this window`;
+}
+
+function vibrationAxisBlock(axis, view) {
   const parts = [`<h3>${esc(axis.axis)} &mdash; <code>${esc(axis.gyroSource)}</code></h3>`];
 
   // 4. A filtered gyro publishes no peaks at all. An empty list under a heading
@@ -5161,17 +5877,26 @@ function vibrationAxisBlock(axis) {
 
   if (!axis.available) {
     const why = reasonWords(axis.reasonCode);
-    parts.push(`<p style="font-size:13.5px">${pill('bad', 'not measured')} ` +
-      `Nothing was measured on this axis${why ? ` — ${esc(why)}` : ''}.</p>`);
-    return parts.join('');
+    // A long window measured in stretches can have this axis unmeasured in one
+    // stretch and measured in another. Then it is not "nothing was measured":
+    // what the other stretches found is listed, and the axis still has no
+    // verdict for the window as a whole.
+    if (axis.peaks.length === 0) {
+      parts.push(`<p style="font-size:13.5px">${pill('bad', 'not measured')} ` +
+        `Nothing was measured on this axis${why ? ` — ${esc(why)}` : ''}.</p>`);
+      return parts.join('');
+    }
+    parts.push(`<p style="font-size:13.5px">${pill('bad', 'not measured throughout')} ` +
+      `Part of this window could not be measured on this axis${why ? ` — ${esc(why)}` : ''}. ` +
+      `What the rest of it measured is listed below.</p>`);
+  } else {
+    parts.push('<div class="grid" style="margin-top:10px">' + [
+      stat('Broadband', `${text(axis.broadbandRmsDps)}&deg;/s`,
+        'RMS across the analysed band'),
+      stat('Persistent tones', String(axis.peaks.length),
+        axis.peaks.length === 0 ? 'none stood out of the noise floor' : 'listed below')
+    ].join('') + '</div>');
   }
-
-  parts.push('<div class="grid" style="margin-top:10px">' + [
-    stat('Broadband', `${text(axis.broadbandRmsDps)}&deg;/s`,
-      'RMS across the analysed band'),
-    stat('Persistent tones', String(axis.peaks.length),
-      axis.peaks.length === 0 ? 'none stood out of the noise floor' : 'listed below')
-  ].join('') + '</div>');
 
   if (axis.peaks.length === 0) {
     return parts.join('');
@@ -5179,10 +5904,12 @@ function vibrationAxisBlock(axis) {
 
   parts.push('<ul class="peaks">' + axis.peaks.map(peak => {
     const rotor = peakRotorCell(peak.rotorHarmonic);
+    const stretch = stretchWords(peak, view);
     return `<li>
       <span class="hz">${text(peak.frequencyHz, 1)} Hz</span>
       <span class="amp">${text(peak.amplitudeDps)}&deg;/s</span>
-      <span class="amp">present ${Math.round((peak.persistenceRatio ?? 0) * 100)}% of the window</span>
+      <span class="amp">present ${Math.round((peak.persistenceRatio ?? 0) * 100)}% of ${stretch
+        ? `the stretch ${esc(stretch)}` : 'the window'}</span>
       ${rotor.pill}
       ${peak.aboveAttentionThreshold ? pill('warn', 'above the attention threshold') : ''}
       <span class="detail">${esc(rotor.detail)}</span>
@@ -5209,10 +5936,24 @@ export function vibrationHtml(view) {
 
   // 2. "insufficient" means nothing was measured. It must never read like
   //    "clear", which means vibration WAS measured and there was none.
+  const stretches = Array.isArray(view.chunks) ? view.chunks : [];
+  const partlyMeasured = stretches.some(stretch => stretch.status !== 'insufficient');
   if (view.status === 'insufficient') {
-    parts.push(`<p style="font-size:13.5px">Nothing was measured on this window. That is ` +
+    parts.push(`<p style="font-size:13.5px">${partlyMeasured
+      ? 'Part of this window could not be measured, so the window as a whole has no verdict'
+      : 'Nothing was measured on this window'}. That is ` +
       `not the same as a quiet aircraft — it is the absence of a measurement, and it says ` +
       `nothing either way about how this helicopter runs.</p>`);
+  }
+
+  // A window longer than one analysis takes is measured in stretches, and the
+  // worst stretch speaks for the window. Said here so a peak listed against one
+  // stretch is not read as the whole window's.
+  if (stretches.length > 1) {
+    parts.push(`<p class="muted" style="font-size:12.5px">This window is longer than one ` +
+      `analysis takes, so it was measured as ${stretches.length} consecutive stretches and ` +
+      `combined: the worst stretch speaks for the window, and each tone below says which ` +
+      `stretch it was found in.</p>`);
   }
 
   parts.push(`<p class="muted" style="font-size:12.5px">` +
@@ -5259,7 +6000,7 @@ export function vibrationHtml(view) {
     '</ul>');
 
   for (const axis of view.axes) {
-    parts.push(vibrationAxisBlock(axis));
+    parts.push(vibrationAxisBlock(axis, view));
   }
 
   const anyUnchecked = view.axes.some(axis =>
@@ -5324,15 +6065,17 @@ let vibrationRun = 0;
 /** The window a displayed result was measured on, so a pan can retire it. */
 let vibrationShownFor = null;
 
+/**
+ * The window on screen, whole. Not clamped since 2 October 2026: a window longer
+ * than one analysis takes is measured in consecutive stretches by
+ * `summarizeMechanicalVibration`, the same way the recommendation path measures
+ * the flight window, rather than cut to its first 262 s.
+ */
 function vibrationWindow() {
   const {startUs, spanUs} = state.view;
-  const cap = MECHANICAL_CONSTANTS.maximumSelectionDurationUs;
-  const requested = Math.max(0, spanUs);
   return {
     startTimeUs: startUs,
-    endTimeUs: startUs + Math.min(requested, cap),
-    clamped: requested > cap,
-    requestedUs: requested
+    endTimeUs: startUs + Math.max(0, spanUs)
   };
 }
 
@@ -5382,10 +6125,6 @@ function syncVibrationRange() {
 
   range.textContent =
     `${((window_.endTimeUs - window_.startTimeUs) / 1e6).toFixed(1)} s of flight` +
-    (window_.clamped
-      ? `, clipped from ${(window_.requestedUs / 1e6).toFixed(1)} s — longer than the ` +
-        'analysis accepts, so only the first part would be measured'
-      : '') +
     (offWindow
       ? ' — not the flight window, so this will not be the same measurement the airframe '
         + 'finding at the top of the page was made from'
@@ -6025,9 +6764,23 @@ $('file').addEventListener('change', event => {
 $('session').addEventListener('change', async event => {
   const index = Number(event.target.value);
   beginDecodeProgress(state.fileName ?? '', sessionSpanBytes(index), 1);
-  await openSession(index);
-  endDecodeProgress();
-  renderLogStatus();
+  // Same shape as the first open in `openFile`, for the same reasons: the
+  // progress bar always ends, a throw is reported rather than lost, and the
+  // status line is repainted only over a session that is actually on screen —
+  // after a decoder fault it IS the fault, and a "read in 0 ms" over it was the
+  // only thing the pilot was ever shown.
+  let opened = false;
+  try {
+    opened = await openSession(index);
+  } catch (error) {
+    renderSessionFault(`RotorLens could not show this flight: ${error.message}`);
+    console.error(error);
+  } finally {
+    endDecodeProgress();
+  }
+  if (opened) {
+    renderLogStatus();
+  }
 });
 $('field').addEventListener('change', renderPlot);
 $('analyse').addEventListener('click', analyse);
@@ -6044,8 +6797,7 @@ $('axis').addEventListener('change', () => {
   if (!state.result) {
     return;
   }
-  $('tune').innerHTML = '<p class="muted">Pick a term and analyse. The Axis panel above ' +
-    'already measures this axis on whatever you flew.</p>';
+  resetTunePanel();
   renderAxisPanel();
 
   // Recommendations are NOT recomputed on an axis change — they are one ordered
@@ -6142,13 +6894,17 @@ $('since').addEventListener('click', async event => {
     if (state.historyReadBlocked) {
       return;
     }
+    // Every save of the flight, not just the one the button is bound to. A
+    // history written before reopened flights were recognised can hold one
+    // flight twice; forgetting only the first save left the other standing in
+    // for it at the place it was saved again — after flights it never followed.
     const forgotten = await persistHistory(
-      forgetFlight(state.history, recordId), {forget: true}
+      forgetSavesOfFlight(state.history, recordId), {forget: true}
     );
-    if (forgotten && state.candidateStoredId === recordId) {
-      state.candidateStoredId = null;
-    }
     if (forgotten) {
+      // Clears the open flight's stored id when it was the one forgotten, and
+      // moves the before/after off a baseline that no longer exists.
+      recompareCandidate();
       await reconcileSharingIds();
     }
     renderSincePanel();
@@ -6168,19 +6924,17 @@ $('history').addEventListener('click', async event => {
     return;
   }
 
+  // A flight's row forgets every save of that flight, for the reason the
+  // before/after panel's Forget does; the rows of later saves say whose they are.
   const forgotten = await persistHistory(flight
-    ? forgetFlight(state.history, flight)
+    ? forgetSavesOfFlight(state.history, flight)
     : forgetAircraft(state.history, aircraft), {forget: true});
 
   // A flight the pilot just saved and then deleted must offer Save again rather
-  // than a Forget pointing at a record that no longer exists.
-  if (forgotten && state.candidateStoredId !== null
-      && findRecords(state.history, state.candidate?.aircraftKey)
-        .every(record => record.recordId !== state.candidateStoredId)) {
-    state.candidateStoredId = null;
-  }
-
+  // than a Forget pointing at a record that no longer exists, and a before/after
+  // whose baseline was just deleted must compare against what is left.
   if (forgotten) {
+    recompareCandidate();
     await reconcileSharingIds();
   }
   renderHistoryPanel();

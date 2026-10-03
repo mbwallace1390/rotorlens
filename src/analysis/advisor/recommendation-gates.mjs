@@ -229,7 +229,31 @@ export const GAIN_GATE_THRESHOLDS = Object.freeze({
    * that is a NEW requirement rather than an imported one. See
    * `evaluateAirframeGate`.
    */
-  requireHarmonicCorrelationEvaluated: true
+  requireHarmonicCorrelationEvaluated: true,
+
+  /**
+   * How far past the experimental attention level a main-rotor once- or
+   * twice-per-rev may be and still be only REPORTED. Past it, it blocks again.
+   *
+   * A SAFETY BACKSTOP, NOT A CALIBRATION. Decided 2 October 2026 as a refinement
+   * of the owner's rotor-order rule (see `rotorOrderToneAssessment`): the rule
+   * had no upper bound, so a 40 deg/s once-per-rev — the size of a head badly out
+   * of track or balance — would have been reported as an observation while the
+   * gains were read over it. Nothing in this repository says where a real fault
+   * starts; the attention level itself is calibrated only on synthetic signals.
+   * Three times it is a margin, chosen so that no real flight measured so far
+   * comes near it: the worst rotor-order tone across the 43 flight windows of the
+   * private corpus is 17.3 deg/s, under 24. It multiplies the PUBLISHED level, so
+   * it moves with it, and it is never a reason to call anything under it fine.
+   *
+   * Judged since round 3 on a tone's size WHILE PRESENT, which is at least its
+   * flight average and equals it for a tone above the level throughout. The 17.3
+   * above was measured as a flight average; the size while present has not been
+   * re-measured on that corpus (the reference log carries no attention-level
+   * rotor tone), so a real flight whose tone comes and goes may now sit nearer
+   * the ceiling than that number says.
+   */
+  rotorOrderToneCeilingMultiple: 3
 });
 
 /* ------------------------------------------------------------------- utilities */
@@ -254,6 +278,245 @@ function worseDirection(positive, negative) {
 }
 
 /* ------------------------------------------------------------------ gate 1: airframe */
+
+/**
+ * The reason codes a result may carry and still be "rotor-order tones only".
+ *
+ * An ALLOW list, so that any code this module has not been taught — a gap in
+ * one stretch, a filtered source, a tail-rotor match, a correlation that was not
+ * available — keeps the block. Failing closed is the point.
+ */
+const ROTOR_ORDER_TONE_REASONS = Object.freeze([
+  'PERSISTENT_NARROWBAND_ENERGY',
+  'MAIN_ROTOR_HARMONIC_CORRELATION',
+  'PERSISTENT_NARROWBAND_ENERGY_BELOW_ATTENTION_THRESHOLD'
+]);
+const ROTOR_ORDER_TONE_ORDERS = Object.freeze([1, 2]);
+const UNFILTERED_GYRO_SOURCES = Object.freeze(['gyroRAW', 'gyroUnfilt']);
+
+/**
+ * Whether the only vibration above the attention threshold is the main rotor's
+ * own once- or twice-per-rev.
+ *
+ * OWNER DECISION, 2 October 2026. The 8 deg/s attention threshold in
+ * `mechanical-spectrum.mjs` is calibrated on synthetic signals. Measured over 33
+ * real flights it reads attention on 32, and 53 of the 59 peaks that trip it are
+ * main-rotor order 1 or 2 — so on real data the airframe gate was a blade-track
+ * gate set below the operating band of both aircraft in the corpus, and almost
+ * no real flight ever reached a gain. That module's own comment asks whether such
+ * a tone should suppress tuning at all; this is the answer. It is reported, as a
+ * measurement with its basis, and does not by itself withhold a gain.
+ *
+ * Narrow on purpose. Every one of these must hold, or the block stands:
+ *   - the analysis says `attention` (vibration was measured), and no stretch of
+ *     it failed to measure;
+ *   - the rotor was compared (`harmonicCorrelation.state === 'evaluated'`);
+ *   - all three axes were measured, on UNFILTERED gyro;
+ *   - the result carries no reason code outside `ROTOR_ORDER_TONE_REASONS`;
+ *   - there is at least one attention-level peak, and EVERY one is matched to
+ *     the MAIN rotor at order 1 or 2.
+ * An unmatched peak, a tail-rotor peak, a higher order, a raised broadband floor
+ * (held separately, in `assessAirframe`), or a rotor never compared is still
+ * unexplained vibration, and still blocks.
+ *
+ * Added the same day, after review:
+ *   - the peak list must SAY it is complete. The analyser publishes, per axis,
+ *     how many attention-level peaks it merged into a neighbour rather than
+ *     listing (`attentionEligibleUnlistedCount`); "every one is the rotor" is a
+ *     claim about all of them, so anything but a measured zero refuses. Until
+ *     then a five-peak cap could drop an unmatched attention-level peak before
+ *     this rule ever saw it.
+ *   - every tone's size must be measured, and at most
+ *     `GAIN_GATE_THRESHOLDS.rotorOrderToneCeilingMultiple` times the published
+ *     attention level. Past that it is `large`: still the rotor's own tone,
+ *     measured and matched, and still a block.
+ *   - a tone measured in several stretches of one window is ONE tone, at its
+ *     worst, carrying every stretch it was seen in.
+ *
+ * Round 3 of the same review:
+ *   - the ceiling is judged on the tone's size WHILE PRESENT — its RMS over the
+ *     analysis windows in which it was above the level
+ *     (`attentionWindowBandRmsDps`) — never on its flight average. Attention is
+ *     judged window by window, so a once-per-rev at four times the level that is
+ *     there for a third of the flight is attention-eligible while its average
+ *     sits under the ceiling; judged on the average it was waved through.
+ *   - the ceiling is judged FIRST, on every main-rotor 1/rev or 2/rev measured on
+ *     unfiltered gyro, whatever else about the result is incomplete. A tone past
+ *     it is then named as large beside whatever else stops the rule (both
+ *     block), instead of being reported like a small tone whose origin "could
+ *     not be established".
+ *
+ * Returns `{only, large, tones, refusal, ceilingDps}`. `refusal` names the first
+ * condition that did not hold — a measured fact about the result, so a card can
+ * say which — and is null only when `only` is true. When `large` is true it is
+ * `TONE_ABOVE_SEVERITY_CEILING` if nothing else stopped the rule, and otherwise
+ * the other condition, which blocks on its own account as well.
+ *
+ * Measurement only: it says which tones were seen, never what to do about them.
+ */
+export function rotorOrderToneAssessment(mechanical) {
+  const refuse = refusal => frozen({
+    only: false, large: false, tones: frozen([]), refusal, ceilingDps: null
+  });
+  if (!mechanical || typeof mechanical !== 'object' || mechanical.status !== 'attention') {
+    return refuse('NOT_ATTENTION');
+  }
+  const axes = Array.isArray(mechanical.axes) ? mechanical.axes : [];
+  const thresholdDps = mechanical.attentionThreshold?.bandRmsDps;
+  const ceilingDps = Number.isFinite(thresholdDps) && thresholdDps > 0
+    ? GAIN_GATE_THRESHOLDS.rotorOrderToneCeilingMultiple * thresholdDps
+    : null;
+
+  // The ceiling first. Every attention-level main-rotor 1/rev or 2/rev the
+  // analyser measured on unfiltered gyro and matched, with its size measured —
+  // in whichever stretch it was measured, however the rest of the result reads.
+  const measured = [];
+  for (const entry of axes) {
+    if (!UNFILTERED_GYRO_SOURCES.includes(entry?.source ?? entry?.gyroSource)) {
+      continue;
+    }
+    for (const peak of entry.peaks ?? []) {
+      if (peak?.attentionEligible === true && isMainRotorOrder(peak.harmonicMatch)
+          && toneSizeMeasured(peak)) {
+        measured.push(measuredRotorTone(entry, peak));
+      }
+    }
+  }
+  const tones = oneTonePerAxisAndOrder(measured);
+  const refusal = rotorOrderRuleRefusal(mechanical, axes, ceilingDps);
+  if (ceilingDps !== null && tones.some(tone => tone.aboveLevelBandRmsDps > ceilingDps)) {
+    return frozen({
+      only: false, large: true, tones, refusal: refusal ?? 'TONE_ABOVE_SEVERITY_CEILING', ceilingDps
+    });
+  }
+  if (refusal !== null) {
+    return refuse(refusal);
+  }
+  return frozen({only: true, large: false, tones, refusal: null, ceilingDps});
+}
+
+function isMainRotorOrder(match) {
+  return Boolean(match) && match.rotor === 'main' && ROTOR_ORDER_TONE_ORDERS.includes(match.order);
+}
+
+/** Both sizes the rule reads: the flight average, and the size while present. */
+function toneSizeMeasured(peak) {
+  return Number.isFinite(peak.bandRmsDps) && Number.isFinite(peak.attentionWindowBandRmsDps);
+}
+
+/** One main-rotor tone as the rule and its cards read it. */
+function measuredRotorTone(entry, peak) {
+  const match = peak.harmonicMatch;
+  return {
+    axis: entry.axis,
+    order: match.order,
+    frequencyHz: Number.isFinite(peak.frequencyHz) ? peak.frequencyHz : null,
+    // Its average over every analysed window of the range, or of its stretch.
+    bandRmsDps: peak.bandRmsDps,
+    // Its size while present: the RMS over the windows in which it was above the
+    // attention level. What the ceiling is judged on.
+    aboveLevelBandRmsDps: peak.attentionWindowBandRmsDps,
+    // The share of the analysed windows it was above the level in.
+    aboveLevelShare: Number.isFinite(peak.attentionPersistenceRatio)
+      ? peak.attentionPersistenceRatio : null,
+    // The head speed this tone was matched against: the predicted frequency is
+    // the logged fundamental times the order, so this is that rotor speed back
+    // again, not a second measurement.
+    headspeedRpm: Number.isFinite(match.predictedHz)
+      ? Math.round((match.predictedHz / match.order) * 60) : null,
+    chunkRangeUs: Array.isArray(peak.chunkRangeUs) ? [...peak.chunkRangeUs] : null
+  };
+}
+
+/**
+ * One tone per axis and order, at its worst size while present, wherever in the
+ * window it was measured: a window analysed in two stretches is not two tones.
+ */
+function oneTonePerAxisAndOrder(measured) {
+  const groups = new Map();
+  for (const tone of measured) {
+    const key = `${tone.axis}|${tone.order}`;
+    const group = groups.get(key) ?? {worst: tone, ranges: []};
+    if (tone.aboveLevelBandRmsDps > group.worst.aboveLevelBandRmsDps) {
+      group.worst = tone;
+    }
+    if (tone.chunkRangeUs) {
+      group.ranges.push(tone.chunkRangeUs);
+    }
+    groups.set(key, group);
+  }
+  return frozen([...groups.values()].map(({worst, ranges}) => frozen({
+    ...worst,
+    rotor: 'main',
+    // The stretch it was worst in, and every stretch it was measured in; null
+    // and empty on a window analysed whole.
+    chunkRangeUs: worst.chunkRangeUs ? frozen(worst.chunkRangeUs) : null,
+    chunkRangesUs: frozen(ranges
+      .sort((left, right) => left[0] - right[0])
+      .map(range => frozen(range)))
+  })));
+}
+
+/**
+ * The first condition of the rotor-order rule that does not hold, or null when
+ * every one does. The severity ceiling is not among them: it is judged first,
+ * by the caller, on every tone.
+ */
+function rotorOrderRuleRefusal(mechanical, axes, ceilingDps) {
+  // First, because it is the cause rather than a symptom: a stretch that could
+  // not be measured also leaves the rotor uncompared and its own reason codes on
+  // the result, and the pilot should hear about the stretch.
+  if (Array.isArray(mechanical.chunks) && mechanical.chunks.some(chunk =>
+    chunk?.status !== 'attention' && chunk?.status !== 'clear')) {
+    return 'STRETCH_NOT_MEASURED';
+  }
+  if ((mechanical.harmonicCorrelation?.state ?? null) !== 'evaluated') {
+    return 'ROTOR_NOT_COMPARED';
+  }
+  const reasons = [
+    ...(mechanical.reasonCodes ?? []),
+    ...(mechanical.tuningEvidenceGate?.reasonCodes ?? [])
+  ];
+  if (reasons.some(code => !ROTOR_ORDER_TONE_REASONS.includes(code))) {
+    return 'REASON_CODE_OUTSIDE_ALLOW_LIST';
+  }
+  if (axes.length !== AXES.length) {
+    return 'AXIS_NOT_MEASURED_ON_UNFILTERED_GYRO';
+  }
+  for (const name of AXES) {
+    const matching = axes.filter(entry => entry?.axis === name);
+    if (matching.length !== 1 || matching[0].available !== true
+        || !UNFILTERED_GYRO_SOURCES.includes(matching[0].source ?? matching[0].gyroSource)) {
+      return 'AXIS_NOT_MEASURED_ON_UNFILTERED_GYRO';
+    }
+  }
+  // A list that does not say it is complete is treated as one that is not.
+  if (axes.some(entry => entry.attentionEligibleUnlistedCount !== 0)) {
+    return 'ATTENTION_PEAK_LIST_INCOMPLETE';
+  }
+  let attentionPeaks = 0;
+  for (const entry of axes) {
+    for (const peak of entry.peaks ?? []) {
+      if (peak?.attentionEligible !== true) {
+        continue;
+      }
+      attentionPeaks += 1;
+      if (!isMainRotorOrder(peak.harmonicMatch)) {
+        return 'ATTENTION_PEAK_NOT_MAIN_ORDER_1_OR_2';
+      }
+      if (!toneSizeMeasured(peak)) {
+        return 'TONE_SIZE_NOT_MEASURED';
+      }
+    }
+  }
+  if (attentionPeaks === 0) {
+    return 'NO_ATTENTION_PEAK';
+  }
+  if (ceilingDps === null) {
+    return 'ATTENTION_THRESHOLD_UNKNOWN';
+  }
+  return null;
+}
 
 /**
  * Whether the airframe has been ruled out as the source of what was measured.
@@ -284,7 +547,27 @@ function worseDirection(positive, negative) {
  * speed trustworthy enough that each peak could be tested against its orders.
  * Then "not a rotor harmonic" is a measurement, and "clear" means something.
  *
- * @param {object} mechanical a result from `analyzeMechanicalSpectrum`
+ * TWO WAYS THE UPSTREAM GATE BLOCKS, AND THEY ARE OPPOSITE FACTS. `attention`
+ * means vibration was MEASURED; `insufficient` means nothing was. They were one
+ * code until 2 October 2026, so a 40 Hz log was told its range "shows
+ * vibration". Now `MECHANICAL_EVIDENCE_GATE_BLOCKED` is measured vibration and
+ * `MECHANICAL_EVIDENCE_NOT_MEASURED` is a missing measurement. Both block.
+ *
+ * ONE KIND OF MEASURED VIBRATION DOES NOT BLOCK, by owner decision of the same
+ * day. See `rotorOrderToneAssessment`: when everything above the experimental
+ * threshold is the main rotor's own 1/rev or 2/rev, and nothing else about the
+ * result is in doubt, it is reported as an observation and the gate passes on
+ * that account. Every other shape of attention still blocks. Past the severity
+ * ceiling — judged on a tone's size while present — the same tones block again,
+ * as `MAIN_ROTOR_ORDER_TONE_LARGE`, and that code is raised first beside any other
+ * reason the rule did not apply.
+ *
+ * A window measured in stretches that was compared against the rotor in some of
+ * them and not others blocks as `ROTOR_CORRELATION_PARTIAL`, not as "never
+ * compared": the stretches that were compared were genuinely compared.
+ *
+ * @param {object} mechanical a result from `analyzeMechanicalSpectrum`,
+ *   `analyzeMechanicalTimeSeries` or `analyzeMechanicalWindow`
  * @param {object} [options] `{eventTimesUs, holdTimesUs}` — the stop and hold
  *   times a recommendation would rest on, so the analysed range can be checked
  *   to actually contain them. A `clear` measured over a different hundred
@@ -292,30 +575,60 @@ function worseDirection(positive, negative) {
  */
 export function evaluateAirframeGate(mechanical, options = {}) {
   const codes = [];
+  const observations = [];
 
   if (!mechanical || typeof mechanical !== 'object') {
     return frozen({
       gate: 'airframe',
       status: 'blocked',
       codes: frozen(['MECHANICAL_ANALYSIS_ABSENT']),
+      observations: frozen([]),
       measured: frozen({})
     });
   }
 
   const upstream = mechanical.tuningEvidenceGate?.status ?? null;
+  const rotorOrder = upstream === 'permitted' ? null : rotorOrderToneAssessment(mechanical);
   if (upstream !== 'permitted') {
-    codes.push('MECHANICAL_EVIDENCE_GATE_BLOCKED');
+    if (rotorOrder.only) {
+      // Measured, reported, and not a reason on its own to withhold a gain.
+      // The tone-coincidence rule downstream still refuses any gain whose
+      // oscillation sits on one of these tones.
+      observations.push('MAIN_ROTOR_ORDER_TONE_ABOVE_EXPERIMENTAL_THRESHOLD');
+    } else {
+      if (rotorOrder.large) {
+        // The rotor's own tone, measured and matched — and past the severity
+        // ceiling, so it blocks as what it is rather than as "unexplained".
+        // First, because it is the measured thing a pilot can go and fix.
+        codes.push('MAIN_ROTOR_ORDER_TONE_LARGE');
+      }
+      // Whatever else stopped the rotor-order rule still blocks on its own
+      // account, beside the large tone or without it.
+      if (!rotorOrder.large || rotorOrder.refusal !== 'TONE_ABOVE_SEVERITY_CEILING') {
+        codes.push(mechanical.status === 'attention'
+          ? 'MECHANICAL_EVIDENCE_GATE_BLOCKED'
+          : 'MECHANICAL_EVIDENCE_NOT_MEASURED');
+      }
+    }
   }
 
   const correlation = mechanical.harmonicCorrelation?.state ?? null;
+  // A window measured in stretches can have been compared against the rotor in
+  // some of them and not others. That is neither "never" nor "throughout".
+  const comparedInPart = Array.isArray(mechanical.chunks)
+    && mechanical.chunks.some(chunk => chunk?.harmonicCorrelationState === 'evaluated');
   if (GAIN_GATE_THRESHOLDS.requireHarmonicCorrelationEvaluated
       && correlation !== 'evaluated') {
     // The distinction the whole gate turns on: "no rotor harmonic explains this
     // peak" and "no rotor speed was steady enough to ask" are opposite facts
     // and one null used to carry both.
-    codes.push(correlation === 'not-evaluated'
-      ? 'ROTOR_CORRELATION_NOT_ATTEMPTED'
-      : 'ROTOR_CORRELATION_UNAVAILABLE');
+    if (comparedInPart) {
+      codes.push('ROTOR_CORRELATION_PARTIAL');
+    } else {
+      codes.push(correlation === 'not-evaluated'
+        ? 'ROTOR_CORRELATION_NOT_ATTEMPTED'
+        : 'ROTOR_CORRELATION_UNAVAILABLE');
+    }
   }
 
   const eventTimesUs = finite(options.eventTimesUs ?? []);
@@ -343,12 +656,38 @@ export function evaluateAirframeGate(mechanical, options = {}) {
     gate: 'airframe',
     status: codes.length === 0 ? 'permitted' : 'blocked',
     codes: frozen(codes),
+    // Not blockers. Present so a caller can say what was measured.
+    observations: frozen(observations),
     measured: frozen({
       mechanicalStatus: mechanical.status ?? null,
       upstreamGate: upstream,
       harmonicCorrelationState: correlation,
       headspeedRelativeSpread: mechanical.rpmEvidence?.headspeed?.relativeSpread ?? null,
       headspeedState: mechanical.rpmEvidence?.headspeed?.state ?? null,
+      // The measured reason the head speed could not be compared against, so a
+      // sentence about it can name that reason instead of guessing "it moved".
+      headspeedReasonCode: mechanical.rpmEvidence?.headspeed?.reasonCode ?? null,
+      reasonCodes: frozen([...(mechanical.reasonCodes ?? [])]),
+      rotorOrderTonesOnly: rotorOrder?.only === true,
+      rotorOrderTones: rotorOrder?.only === true ? rotorOrder.tones : frozen([]),
+      // Main-rotor 1/rev and 2/rev only, but past the severity ceiling.
+      rotorOrderTonesLarge: rotorOrder?.large === true ? rotorOrder.tones : frozen([]),
+      rotorOrderToneCeilingDps: rotorOrder?.ceilingDps ?? null,
+      // Why the rotor-order rule did not apply, when it was asked and did not;
+      // null when it applied, or when there was nothing to ask it about.
+      rotorOrderRefusal: rotorOrder?.refusal ?? null,
+      // How many stretches of a window were compared against the rotor, of how
+      // many; null on a window analysed whole.
+      rotorComparedStretchCount: Array.isArray(mechanical.chunks)
+        ? mechanical.chunks.filter(chunk => chunk?.harmonicCorrelationState === 'evaluated').length
+        : null,
+      // ...of how many the vibration check could measure at all: an unmeasured
+      // stretch is not one the vibration "was measured in".
+      measuredStretchCount: Array.isArray(mechanical.chunks)
+        ? mechanical.chunks.filter(chunk =>
+          chunk?.status === 'attention' || chunk?.status === 'clear').length
+        : null,
+      stretchCount: Array.isArray(mechanical.chunks) ? mechanical.chunks.length : null,
       attentionThresholdDps: mechanical.attentionThreshold?.bandRmsDps ?? null,
       attentionThresholdBasis: mechanical.attentionThreshold?.basis ?? null,
       rangeStartTimeUs: start,
@@ -856,23 +1195,47 @@ export const GATE_WORDING = Object.freeze({
     'The vibration check has not been run on this range, and a gain is not worth '
     + 'discussing until the airframe is ruled out. Select a range and run it first.',
 
+  // Raised whenever vibration was measured and the rotor-order rule did not apply
+  // — including when the rotor was never compared, and when every tone IS the
+  // rotor's and the rule refused on other grounds — so it names no rotor
+  // comparison. The airframe card says which of those it was.
   MECHANICAL_EVIDENCE_GATE_BLOCKED:
-    'This range shows vibration that has to be explained before any gain is worth '
-    + 'changing. A tracking fault, a worn damper or a dry bearing all look like a '
-    + 'badly tuned D term in the gyro trace, and moving a gain to chase one leaves '
-    + 'the aircraft exactly as it was. Sort the airframe first.',
+    'This range shows measured vibration above the experimental attention level, and it '
+    + 'has to be explained before any gain is worth changing. A tracking fault, a worn '
+    + 'damper or a dry bearing all look like a badly tuned D term in the gyro trace, and '
+    + 'moving a gain to chase one leaves the aircraft exactly as it was. Sort the airframe '
+    + 'first.',
+
+  MAIN_ROTOR_ORDER_TONE_LARGE:
+    'The main rotor\'s own once- or twice-per-rev on this range measured more than three '
+    + 'times the experimental attention level while it was present. A tone that size is '
+    + 'what a head out of track or out of balance produces, and it sits in the gyro trace '
+    + 'under everything a gain would be judged on. Sort the tracking and balance, then fly '
+    + 'the same range again and compare this number.',
+
+  MECHANICAL_EVIDENCE_NOT_MEASURED:
+    'The vibration check could not measure this range, so the airframe has not been '
+    + 'ruled out. That is a missing measurement, and it says nothing either way about '
+    + 'how this aircraft runs. Run it over a range with enough continuous, unfiltered '
+    + 'gyro data to measure.',
 
   ROTOR_CORRELATION_UNAVAILABLE:
-    'The head speed moved too much across this range for the vibration to be '
-    + 'matched against the rotor, so "no rotor problem found" is not something '
-    + 'this flight can support — nothing was compared. Select a range where the '
-    + 'head speed is steady, after the spool-up and before the descent, and run '
-    + 'the vibration check on that.',
+    'No head speed across this range was usable for matching the vibration against '
+    + 'the rotor, so "no rotor problem found" is not something this flight can '
+    + 'support — nothing was compared. Select a range where head speed is logged and '
+    + 'steady, after the spool-up and before the descent, and run the vibration check '
+    + 'on that.',
 
   ROTOR_CORRELATION_NOT_ATTEMPTED:
     'The rotor speed was never compared against the vibration on this range, so '
     + 'the airframe has not been ruled out. Run the vibration check over a range '
     + 'that carries a steady head speed.',
+
+  ROTOR_CORRELATION_PARTIAL:
+    'The rotor speed was compared against the vibration over part of this range and '
+    + 'not the rest, so the airframe has not been ruled out across all of it. Run the '
+    + 'vibration check over a range that is measured, with a steady head speed, '
+    + 'throughout.',
 
   MECHANICAL_RANGE_EXCLUDES_EVENTS:
     'The vibration check covered a different part of this flight from the stops '
