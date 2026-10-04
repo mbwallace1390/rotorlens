@@ -24,8 +24,6 @@ const LOG_PATHS = [...new Set([
 
 const realLogSkip = LOG_PATHS.length === 0 &&
   'set ROTORLENS_REAL_LOG or ROTORLENS_CORPUS_LOGS to owner-approved .bbl paths';
-const continuitySkip = !process.env.ROTORLENS_REAL_LOG &&
-  'set ROTORLENS_REAL_LOG to a continuity-capable owner-approved .bbl path';
 
 let decodedCorpus;
 function corpus() {
@@ -69,11 +67,14 @@ test('owner-supplied firmware logs decode without body damage or lost alignment'
   });
 
 test('owner-supplied firmware values are continuous across I-frame boundaries',
-  {skip: continuitySkip}, () => {
+  {skip: realLogSkip}, () => {
     let measuredSessions = 0;
 
-    const target = path.resolve(process.env.ROTORLENS_REAL_LOG);
-    for (const {file, result} of corpus().filter(entry => entry.file === target)) {
+    // Every supplied log. Until 2026-10-03 this read ROTORLENS_REAL_LOG only, and
+    // the multi-session dumps would have failed it: 32 of their 109 sessions did
+    // under `verify:log`, every one a genuine step that landed on a keyframe,
+    // which the check now tells apart from a decoding fault.
+    for (const {file, result} of corpus()) {
       for (const session of result.sessions) {
         const continuity = measureIntraFrameContinuity({
           samples: session.samples,

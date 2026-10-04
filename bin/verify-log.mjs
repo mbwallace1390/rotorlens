@@ -12,7 +12,9 @@
  *   - time and loop iteration advance monotonically across every frame;
  *   - the sample interval is stable, matching a fixed-rate logger;
  *   - decoded values land inside the physical range their sensor can report;
- *   - **no field jumps at I-frame boundaries** — see below.
+ *   - **no field jumps at I-frame boundaries** — see below. A genuine step that
+ *     happens to land on a keyframe (a throttle cut, the governor engaging) is
+ *     told apart from a decoding fault and printed as a note with its sample.
  *
  * The first four are all *alignment* checks, and alignment is not enough. Three
  * decoder defects shipped past every one of them, because a bit layout can be
@@ -179,21 +181,47 @@ for (const session of result.sessions) {
       `${continuity.reason}. A log needs both keyframes and delta frames for it.`
     );
   } else {
-    const {flagged} = continuity;
+    const {flagged, concentrated} = continuity;
+    const times = ratio => (ratio === Infinity ? 'inf' : `${ratio.toFixed(1)}x`);
+    // Worst among the fields the ratio can speak for: a moment that landed on a
+    // keyframe is reported below in its own words, not as the session's margin.
     const worstClean = continuity.fields
-      .filter(entry => !entry.belowMovementFloor)
+      .filter(entry => !entry.belowMovementFloor && !entry.concentrated)
       .reduce((worst, entry) => (entry.ratio > worst.ratio ? entry : worst),
         {name: 'none', ratio: 0});
 
     check(`${label}: values are continuous across I-frame boundaries`, flagged.length === 0,
       flagged.length === 0
         ? `worst ${worstClean.name} ${worstClean.ratio.toFixed(2)}x ` +
-          `(threshold ${continuity.ratioThreshold}x, ${continuity.intraTransitions} keyframes)`
+          `(threshold ${continuity.ratioThreshold}x, ${continuity.intraTransitions} keyframes)` +
+          (concentrated.length > 0
+            ? `; ${concentrated.length} single-moment step${concentrated.length === 1 ? '' : 's'} set aside`
+            : '')
         : flagged.slice(0, 6)
           .map(entry =>
-            `${entry.name} ${entry.ratio === Infinity ? 'inf' : `${entry.ratio.toFixed(1)}x`} ` +
-            `(${entry.intraMean.toFixed(2)} per keyframe vs ${entry.interMean.toFixed(2)} elsewhere)`)
+            `${entry.name} ${times(entry.ratio)} ` +
+            `(${entry.intraMean.toFixed(2)} per keyframe vs ${entry.interMean.toFixed(2)} elsewhere; ` +
+            (entry.trimmedRatio >= continuity.ratioThreshold
+              ? `${times(entry.trimmedRatio)} without its ` +
+                `${continuity.concentrationKeyframes} largest keyframes)`
+              : `${times(entry.reversalRatio)} undone at keyframes)`))
           .join(', '));
+
+    if (concentrated.length > 0) {
+      notes.push(
+        `${label}: ${concentrated.slice(0, 6)
+          .map(entry =>
+            `${entry.name} ${times(entry.ratio)} rides on ` +
+            entry.largestKeyframeJumps
+              .map(jump => `sample ${jump.sampleIndex} (Δ${jump.size})`)
+              .join(', '))
+          .join('; ')}${concentrated.length > 6 ? `; and ${concentrated.length - 6} more` : ''}. ` +
+        `Each falls under the threshold once its ${continuity.concentrationKeyframes} largest ` +
+        'keyframe jumps are set aside, and its keyframes take back too little of the ' +
+        'delta frames\' movement to look like a mis-read: a step in the flight that ' +
+        'landed on a keyframe, not a field decoded from the wrong bits.'
+      );
+    }
 
     if (flagged.length > 0) {
       notes.push(

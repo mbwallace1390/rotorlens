@@ -23,6 +23,37 @@
  * |Δ| everywhere else. Correct decoding gives ≈1. On the real 4.6 log the three
  * defects gave 33x (loopIteration), 17.9x (attitude[2]) and 5.0x (axisP[1]).
  *
+ * A RATIO ABOVE THE THRESHOLD IS NOT ENOUGH ON ITS OWN, and the 109 sessions of
+ * two private dataflash dumps are what showed it. Under the ratio alone 32 of
+ * them failed, and not one was a decoding fault: each flag was carried by one or
+ * two keyframes on which something in the flight genuinely changed — the
+ * governor engaging, a throttle cut moving four fields on one sample, an ESC
+ * telemetry update, a heading wrapping 3599 -> 0. A flight's moments do not know
+ * where the keyframes are either: of 112,517 step moments in those sessions,
+ * 3.10% and 3.14% landed on one, against 3.13% by chance. But a step that does
+ * land on one has 31x the leverage it would have on a delta frame, so on a field
+ * that otherwise barely moves, one lucky moment IS the ratio.
+ *
+ * Setting the largest few keyframes aside cures that, and on its own it would
+ * have hidden a real defect. TAG2_3S32 selector 3 mis-read only seven groups of
+ * the reference log, so its excess was carried by two keyframes as well:
+ * attitude[2] fell from 17.9x to below 2x once they were removed, and so did
+ * axisP[1]. What tells the two apart is what the keyframe DOES. A mis-read
+ * delta is carried forward until the next keyframe undoes it — axisP[1] jumped
+ * 352 at a keyframe after its delta frames had moved it 353 the other way. A
+ * genuine step is not undoing anything: govI was 0 at the keyframe before and 0
+ * on the sample before, then 450.
+ *
+ * So a field is called out only when the excess has one of the two shapes a
+ * delta defect leaves behind:
+ *   - BROAD: it survives setting the largest keyframe jumps aside, because the
+ *     defect corrupts every keyframe period the field moves in; or
+ *   - REVERSING: the keyframes undo movement the delta frames made since the
+ *     keyframe before, and that undoing alone clears the threshold.
+ * An excess with neither shape is treated as a moment that landed on a keyframe.
+ * It is still reported, with the sample it happened at, as `concentrated`.
+ * Setting `concentrationKeyframes` to 0 gives back the ratio-only rule.
+ *
  * It reports a measurement, never a diagnosis: which field, what ratio, how much
  * the field actually moved. What the wrong bits were is for a human to work out.
  */
@@ -46,11 +77,35 @@ const DEFAULT_MOVEMENT_FLOOR = 0.05;
  * samples in total — the worst correctly decoded field above the movement floor
  * reads 1.16x. The defects read 33x, 17.9x, 5.0x and 2.2x. 2.0 sits in the empty
  * band between those two populations.
+ *
+ * The same 2x is what each of the two shapes above must clear. Over 110 real
+ * sessions the worst correctly decoded field reaches 1.59x broad and 1.63x
+ * reversing; the narrowest defect, selector 3 on axisP[1], reverses at 4.41x.
  */
 const DEFAULT_RATIO_THRESHOLD = 2;
 
 /** Below this many I-frame transitions the two means are not comparable. */
 const DEFAULT_MIN_TRANSITIONS = 16;
+
+/**
+ * How many of the largest keyframe jumps may be a moment in the flight.
+ *
+ * Measured over 110 real sessions: each of the 52 field flags the ratio alone
+ * raised was carried by at most two keyframes, and setting three aside leaves
+ * the worst correctly decoded field at 1.59x. The broad defects barely notice —
+ * TAG8_4S16 permuted stays at 10.0x and above, INCREMENT at 33.0x, TAG8_8SVB
+ * reversed at 28.6x, AVERAGE_2 with floor at 9.96x — because they corrupt every
+ * keyframe period, not three of them.
+ */
+const DEFAULT_CONCENTRATION_KEYFRAMES = 3;
+
+/** Mean over `count`, against `interMean`, with the empty-denominator rule below. */
+function ratioOf(sum, count, interMean) {
+  const mean = count > 0 ? sum / count : 0;
+  // A field that never moves on P frames but jumps at every I frame is the
+  // purest form of this bug, so an empty denominator is a finding, not a skip.
+  return {mean, ratio: interMean > 0 ? mean / interMean : (mean > 0 ? Infinity : 1)};
+}
 
 /**
  * Measures per-field continuity across I-frame boundaries.
@@ -63,16 +118,20 @@ const DEFAULT_MIN_TRANSITIONS = 16;
  * @param {number} [options.ratioThreshold]      flag at or above this ratio
  * @param {number} [options.movementFloor]       ignore fields that barely move
  * @param {number} [options.minTransitions]      minimum transitions of each kind
- * @returns {{measured: boolean, reason?: string, fields: object[], flagged: object[]}}
+ * @param {number} [options.concentrationKeyframes] largest keyframe jumps that
+ *   may be moments in the flight rather than evidence about the decoder
+ * @returns {{measured: boolean, reason?: string, fields: object[],
+ *   flagged: object[], concentrated: object[]}}
  */
 export function measureIntraFrameContinuity(input, options = {}) {
   const {samples, intraSampleIndices, fields} = input;
   const ratioThreshold = options.ratioThreshold ?? DEFAULT_RATIO_THRESHOLD;
   const movementFloor = options.movementFloor ?? DEFAULT_MOVEMENT_FLOOR;
   const minTransitions = options.minTransitions ?? DEFAULT_MIN_TRANSITIONS;
+  const concentrationKeyframes = options.concentrationKeyframes ?? DEFAULT_CONCENTRATION_KEYFRAMES;
 
   if (!Array.isArray(samples) || samples.length < 2 || fields.length === 0) {
-    return {measured: false, reason: 'not enough samples', fields: [], flagged: []};
+    return {measured: false, reason: 'not enough samples', fields: [], flagged: [], concentrated: []};
   }
 
   // Sample 0 has no predecessor, so it contributes no transition.
@@ -94,8 +153,24 @@ export function measureIntraFrameContinuity(input, options = {}) {
       measured: false,
       reason: `only ${intraTransitions} I-frame and ${interTransitions} P-frame transitions`,
       fields: [],
-      flagged: []
+      flagged: [],
+      concentrated: []
     };
+  }
+
+  // Each keyframe with the absolute sample before it — the previous keyframe, or
+  // sample 0 when the log opens on one. Between those two anchors only delta
+  // frames moved the field, so their net movement is what the decoder CLAIMED
+  // happened, and the keyframe is what did.
+  const keyframes = [];
+  const anchors = [];
+  let lastAbsolute = (intraSampleIndices ?? []).some(index => index === 0) ? 0 : -1;
+  for (let index = 1; index < samples.length; index += 1) {
+    if (isIntra[index]) {
+      keyframes.push(index);
+      anchors.push(lastAbsolute);
+      lastAbsolute = index;
+    }
   }
 
   const fieldCount = fields.length;
@@ -117,12 +192,52 @@ export function measureIntraFrameContinuity(input, options = {}) {
 
   const measurements = [];
   for (let field = 0; field < fieldCount; field += 1) {
-    const intraMean = intraSum[field] / intraTransitions;
     const interMean = interSum[field] / interTransitions;
-    // A field that never moves on P frames but jumps at every I frame is the
-    // purest form of this bug, so an empty denominator is a finding, not a skip.
-    const ratio = interMean > 0 ? intraMean / interMean : (intraMean > 0 ? Infinity : 1);
+    const {mean: intraMean, ratio} = ratioOf(intraSum[field], intraTransitions, interMean);
     const moves = intraMean >= movementFloor;
+
+    // The largest keyframe jumps, kept with where they happened so a person can
+    // go and look; and how much of every keyframe's jump undoes the movement the
+    // delta frames claimed since the anchor before it.
+    const largest = [];
+    let reversalSum = 0;
+    for (let position = 0; position < keyframes.length; position += 1) {
+      const at = keyframes[position];
+      const anchor = anchors[position];
+      const jump = samples[at][field] - samples[at - 1][field];
+      const size = jump < 0 ? -jump : jump;
+      const claimed = anchor >= 0 ? samples[at - 1][field] - samples[anchor][field] : 0;
+
+      // Opposite signs: the keyframe is taking the delta frames' movement back.
+      // Only the part it takes back counts — a heading that crept up 20 and then
+      // wrapped 3599 -> 0 on a keyframe took back 20, not 3599.
+      if (jump * claimed < 0) {
+        const taken = claimed < 0 ? -claimed : claimed;
+        reversalSum += taken < size ? taken : size;
+      }
+
+      if (concentrationKeyframes > 0 &&
+          (largest.length < concentrationKeyframes || size > largest[largest.length - 1].size)) {
+        if (largest.length === concentrationKeyframes) {
+          largest.pop();
+        }
+        let slot = largest.length;
+        while (slot > 0 && largest[slot - 1].size < size) {
+          slot -= 1;
+        }
+        largest.splice(slot, 0, {sampleIndex: at, size});
+      }
+    }
+
+    const largestSum = largest.reduce((sum, entry) => sum + entry.size, 0);
+    // Neither mean can exceed `intraMean`: setting the largest jumps aside cannot
+    // raise an average, and no keyframe takes back more than it jumps. So both
+    // shapes below imply the field moves.
+    const trimmed = ratioOf(intraSum[field] - largestSum, intraTransitions - largest.length, interMean);
+    const reversal = ratioOf(reversalSum, intraTransitions, interMean);
+    const broad = trimmed.mean >= movementFloor && trimmed.ratio >= ratioThreshold;
+    const reversing = reversal.mean >= movementFloor && reversal.ratio >= ratioThreshold;
+    const flagged = broad || reversing;
 
     measurements.push({
       name: fields[field].name,
@@ -130,20 +245,28 @@ export function measureIntraFrameContinuity(input, options = {}) {
       intraMean,
       interMean,
       ratio,
+      trimmedRatio: trimmed.ratio,
+      reversalRatio: reversal.ratio,
+      largestKeyframeJumps: largest.filter(entry => entry.size > 0),
       belowMovementFloor: !moves,
-      flagged: moves && ratio >= ratioThreshold
+      // Over the threshold on the ratio alone, but carried by a few keyframes
+      // that take back too little to be a mis-read: a moment in the flight that
+      // landed on a keyframe.
+      concentrated: moves && ratio >= ratioThreshold && !flagged,
+      flagged
     });
   }
 
+  const byRatio = (left, right) => right.ratio - left.ratio;
   return {
     measured: true,
     intraTransitions,
     interTransitions,
     ratioThreshold,
     movementFloor,
+    concentrationKeyframes,
     fields: measurements,
-    flagged: measurements
-      .filter(entry => entry.flagged)
-      .sort((left, right) => right.ratio - left.ratio)
+    flagged: measurements.filter(entry => entry.flagged).sort(byRatio),
+    concentrated: measurements.filter(entry => entry.concentrated).sort(byRatio)
   };
 }
