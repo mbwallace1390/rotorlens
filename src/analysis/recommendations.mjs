@@ -2232,6 +2232,9 @@ export function assessHoldIndication(records, axis, options = {}) {
 
   const codes = [...shipped.codes];
   const indications = new Set();
+  // Every grid point that was run, with what it read — so a reading that flips
+  // can say WHERE it flipped rather than only that it did.
+  const sweepPoints = [];
   let sweepRuns = 0;
   let abstained = 0;
 
@@ -2284,6 +2287,8 @@ export function assessHoldIndication(records, axis, options = {}) {
           huntingRippleDps
         });
         indications.add(verdict.indication);
+        sweepPoints.push(frozen({huntingSmoothingUs, huntingRippleDps,
+          indication: verdict.indication}));
         sweepRuns += 1;
       }
     }
@@ -2439,6 +2444,7 @@ export function assessHoldIndication(records, axis, options = {}) {
     codes: frozen(codes),
     sweepStable: stable,
     sweepIndicationsSeen: frozen([...indications]),
+    sweepPoints: frozen(sweepPoints),
     sweepRunCount: sweepRuns,
     sweepAbstainedFilterCount: abstained,
     observedCrossingRateHz,
@@ -2833,7 +2839,7 @@ export function buildRecommendations(input = {}) {
     const records = material.records ?? anyRecords;
     const summary = input.axisSummaries?.[axis] ?? null;
     const result = axisFindings({
-      axis, material, records, summary, airframe, mechanical,
+      axis, material, records, summary, airframe, headspeed, mechanical,
       hold: holds[axis] ?? null, holdTimesUs, options
     });
     perAxis[axis] = result;
@@ -4285,8 +4291,8 @@ function headspeedFindings(headspeed) {
 
 /* --------------------------------------------------------------- rung: per axis */
 
-function axisFindings({axis, material, records, summary, airframe, mechanical, hold, holdTimesUs,
-  options}) {
+function axisFindings({axis, material, records, summary, airframe, headspeed, mechanical, hold,
+  holdTimesUs, options}) {
   const findings = [];
   const withheld = [];
 
@@ -4504,7 +4510,7 @@ function axisFindings({axis, material, records, summary, airframe, mechanical, h
 
   /* ---- gain-I */
   if (hold) {
-    findings.push(...holdFindings({axis, hold, airframe}));
+    findings.push(...holdFindings({axis, hold, airframe, headspeed}));
   }
 
   /* ---- what the stops that DO exist look like, even when there are too few */
@@ -5530,7 +5536,114 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
   };
 }
 
-function holdFindings({axis, hold, airframe}) {
+/** An I-term reading of one sweep point, as a pilot would say it. */
+const SWEEP_READING_WORDS = Object.freeze({
+  increase: 'the I term slightly low',
+  decrease: 'the I term slightly high',
+  hold: 'nothing in the I term'
+});
+
+/**
+ * Where a hold sweep flipped, in words and as a basis value.
+ *
+ * The reading most points agreed on is the backdrop; every other reading is
+ * listed with the smoothing lengths and ripple thresholds that produced it, so a
+ * pilot — or a reviewer — can see which of the equally defensible settings the
+ * answer moved with. With no strict majority, every reading's points are
+ * listed, because naming one as the backdrop would be choosing.
+ *
+ * @param {{huntingSmoothingUs: number, huntingRippleDps: number, indication: string}[]} points
+ * @returns {{sentence: string|null, points: string|null, rippleLowDps: number|null,
+ *   rippleHighDps: number|null}}
+ */
+function describeSweepFlips(points) {
+  if (!Array.isArray(points) || points.length === 0) {
+    return {sentence: null, points: null, rippleLowDps: null, rippleHighDps: null};
+  }
+  const byReading = new Map();
+  let rippleLowDps = Infinity;
+  let rippleHighDps = -Infinity;
+  for (const point of points) {
+    if (!byReading.has(point.indication)) {
+      byReading.set(point.indication, []);
+    }
+    byReading.get(point.indication).push(point);
+    rippleLowDps = Math.min(rippleLowDps, point.huntingRippleDps);
+    rippleHighDps = Math.max(rippleHighDps, point.huntingRippleDps);
+  }
+
+  const readings = [...byReading.keys()];
+  let majority = null;
+  for (const reading of readings) {
+    const count = byReading.get(reading).length;
+    if (readings.every(other => other === reading || byReading.get(other).length < count)) {
+      majority = reading;
+    }
+  }
+
+  const distinct = values => [...new Set(values)].sort((a, b) => a - b);
+  const allSmoothingUs = distinct(points.map(point => point.huntingSmoothingUs));
+  const allRippleDps = distinct(points.map(point => point.huntingRippleDps));
+  const spoken = values => (values.length < 2
+    ? values.join('')
+    : `${values.slice(0, -1).join(', ')} and ${values[values.length - 1]}`);
+  const ms = values => spoken(values.map(value => value / 1000));
+
+  // One dimension often explains the whole flip — every smoothing length at the
+  // two highest ripple thresholds, say — and then it is said once, with every
+  // value still named, instead of five times over.
+  const where = list => {
+    const group = (key, value) => {
+      const groups = new Map();
+      for (const point of list) {
+        if (!groups.has(point[key])) {
+          groups.set(point[key], []);
+        }
+        groups.get(point[key]).push(point[value]);
+      }
+      for (const [name, values] of groups) {
+        groups.set(name, distinct(values));
+      }
+      return groups;
+    };
+    const uniform = (groups, every) => every.every(name => groups.has(name))
+      && [...groups.values()].every(values =>
+        values.join() === [...groups.values()][0].join());
+
+    const bySmoothing = group('huntingSmoothingUs', 'huntingRippleDps');
+    if (allSmoothingUs.length > 1 && uniform(bySmoothing, allSmoothingUs)) {
+      return `with ${spoken([...bySmoothing.values()][0])} deg/s ripple, at every smoothing `
+        + `length tried (${ms(allSmoothingUs)} ms)`;
+    }
+    const byRipple = group('huntingRippleDps', 'huntingSmoothingUs');
+    if (allRippleDps.length > 1 && uniform(byRipple, allRippleDps)) {
+      return `with ${ms([...byRipple.values()][0])} ms smoothing, at every ripple threshold `
+        + `tried (${spoken(allRippleDps)} deg/s)`;
+    }
+    return [...bySmoothing].map(([smoothingUs, ripples]) =>
+      `${smoothingUs / 1000} ms smoothing with ${spoken(ripples)} deg/s ripple`).join('; ');
+  };
+  const words = reading => `"${SWEEP_READING_WORDS[reading] ?? reading}"`;
+
+  const listed = readings.filter(reading => reading !== majority);
+  const clauses = listed.map(reading => {
+    const list = byReading.get(reading);
+    return `${words(reading)} at ${list.length} of ${points.length} — ${where(list)}`;
+  });
+  const sentence = majority === null
+    ? `Re-read at ${points.length} smoothing and ripple settings, it read ${clauses.join('; and ')}.`
+    : `Re-read at ${points.length} smoothing and ripple settings, it read `
+      + `${words(majority)} at ${byReading.get(majority).length} of them, and `
+      + `${clauses.join('; and ')}.`;
+  return {
+    sentence,
+    points: listed.map(reading => `${reading}: ${where(byReading.get(reading))}`).join(' | '),
+    rippleLowDps,
+    rippleHighDps
+  };
+}
+
+function holdFindings({axis, hold, airframe, headspeed}) {
   const out = [];
   const summary = hold.evidence.summary;
 
@@ -5763,6 +5876,72 @@ function holdFindings({axis, hold, airframe}) {
       ...(readings.includes('hold')
         ? ['the I term is fine, or something outside it is moving the aircraft'] : [])
     ];
+    // WHERE it flipped, not only that it did (Stage 5a, 4 October 2026). Cutting
+    // the spool-down off the window put more ordinary hovers in front of this
+    // sweep, and on the 31 real flights the pitch "slightly high" reading then
+    // flipped on 7 instead of 2. The confirm used to ask for more long still holds, which on
+    // an aircraft whose hover ripple sits among the sweep's own thresholds is
+    // more of the very evidence that just flipped.
+    const flips = describeSweepFlips(hold.sweepPoints ?? []);
+    const ripple = hold.evidence?.summary?.meanErrorRippleRmsDps;
+    const rippleAmongThresholds = Number.isFinite(ripple) && flips.rippleLowDps !== null
+      && ripple >= flips.rippleLowDps && ripple <= flips.rippleHighDps;
+
+    // WHETHER A GAIN STEP IS WORTH FLYING AT ALL (Stage 5a review, 4 October
+    // 2026). This card is built before the airframe check further down, and
+    // orderFindings keeps every finding that is not an adjustment, so whatever it
+    // says reaches the pilot under any blocker above it. A one-change pair IS a
+    // gain step, and mechanical faults outrank gains: flown on a machine that is
+    // shaking, or whose head speed would not hold, it measures the fault and not
+    // the I term. As first reworded, the card offered "the I gain, moved one step"
+    // under an AIRFRAME_BROADBAND_ELEVATED blocker. The pair is now offered only
+    // where both gates pass; otherwise the card says which finding has to be
+    // cleared first, and carries one code per gate so the plain copy in
+    // ui/app.mjs branches on the same fact. Both gates answer no until evidence
+    // makes them answer yes, so a head-speed assessment that is missing
+    // withholds the pair too.
+    const waitsOnAirframe = airframe?.status !== 'permitted';
+    const waitsOnHeadspeed = headspeed?.status !== 'permitted';
+    const gateCodes = [
+      ...(waitsOnAirframe ? ['GAIN_STEP_WAITS_ON_AIRFRAME'] : []),
+      ...(waitsOnHeadspeed ? ['GAIN_STEP_WAITS_ON_HEADSPEED'] : [])
+    ];
+    const flipsAgain = 'More holds like these are likely to flip again on this aircraft: they '
+      + 'land in the same place among the settings and split the same way. ';
+    let confirm;
+    if (gateCodes.length === 0) {
+      // What the pair settles is THIS reading, taken on each side (same review).
+      // The card used to close on "the before/after panel compares the two
+      // flights' holds once each has 5 of them" after asking for 3 — a count no
+      // corpus flight has reached on one axis — so the pair read as though the
+      // panel would settle it. The panel is the stricter test, and it is named
+      // as that, with the sortie that is laid out to reach it.
+      confirm = flipsAgain + 'What settles it is a one-change confirmation pair: two flights '
+        + 'flown the same way with exactly one setting different between them — the '
+        + `${axis} I gain, moved one step either way — and this I-term reading taken on each `
+        + `side. Fly ${HOLDS_FOR_A_FULL_READING} or more long, still holds on this axis in each `
+        + 'flight — hands off the other two — so each side has a reading of its own. A reading '
+        + 'that moves with that step is the I term; one that does not is the filter settings '
+        + 'being read aloud. Comparing the two flights hold for hold in the before/after panel '
+        + `is a stricter test: it needs ${EVIDENCE_LIMITS.minimumComparisonHolds} holds on each `
+        + 'side, which is what the hold block of the tuning sortie in the pilot guide is laid '
+        + 'out to give.';
+    } else {
+      const which = waitsOnAirframe && waitsOnHeadspeed
+        ? 'The airframe and head-speed findings above have'
+        : waitsOnAirframe ? 'The airframe finding above has' : 'The head-speed finding above has';
+      // The airframe's reason first when both stand: it outranks the governor.
+      const why = waitsOnAirframe
+        ? 'flown on a machine the vibration check has not cleared, it would measure the '
+          + 'airframe rather than the I term'
+        : 'flown while the head speed is moving, it would measure the governor rather than '
+          + 'the I term';
+      confirm = flipsAgain + `${which} to be cleared before any gain step is worth flying to `
+        + `settle it — ${why}. Clear that first; then fly ${HOLDS_FOR_A_FULL_READING} or more `
+        + 'long, still holds on this axis — hands off the other two — and this reading is '
+        + 'taken again.';
+    }
+
     out.push(makeFinding({
       id: 'I_TERM_VERDICT_UNSTABLE',
       rung: 'evidence',
@@ -5771,20 +5950,33 @@ function holdFindings({axis, hold, airframe}) {
       confidence: 'none',
       headline: `The ${axis} I-term reading changes depending on how the error is filtered, `
         + 'so it is not a result yet.',
-      reasoning: 'The same holds read one way at one smoothing length or ripple threshold and '
+      reasoning: (flips.sentence === null ? '' : `${flips.sentence} `)
+        + 'The same holds read one way at one smoothing length or ripple threshold and '
         + 'another way at another, across settings that are all equally defensible. A verdict '
         + 'that moves with an internal setting is that setting being read aloud, not a '
-        + 'measurement of the aircraft.',
+        + 'measurement of the aircraft.'
+        + (rippleAmongThresholds
+          ? ` The slow ripple in these holds measured ${round(ripple, 2)} deg/s, between the `
+            + `lowest and highest ripple thresholds the sweep tries (${flips.rippleLowDps} and `
+            + `${flips.rippleHighDps} deg/s), which is why the threshold decides the answer.`
+          : ''),
       basis: [
         ...basis,
         basisEntry('readings seen across the sweep', hold.sweepIndicationsSeen.join(', '),
           null, 'HOLD_SWEEP'),
-        basisEntry('sweep points', hold.sweepRunCount, 'count', 'HOLD_SWEEP')
+        basisEntry('sweep points', hold.sweepRunCount, 'count', 'HOLD_SWEEP'),
+        basisEntry('sweep points that read differently', flips.points, null,
+          'assessHoldIndication, sweepPoints'),
+        basisEntry('slow ripple in the holds, mean', round(ripple, 3), 'deg/s',
+          'measureHold, meanErrorRippleRmsDps'),
+        basisEntry('airframe gate, which a gain step waits on', airframe?.status ?? null, null,
+          'assessAirframe'),
+        basisEntry('head-speed gate, which a gain step waits on', headspeed?.status ?? null, null,
+          'assessHeadspeed')
       ],
       candidates,
-      confirm: `Fly another ${HOLDS_FOR_A_FULL_READING} or more long, still holds on this axis — `
-        + 'hands off the other two — so the reading can settle one way or the other.',
-      codes: [...hold.codes]
+      confirm,
+      codes: [...hold.codes, ...gateCodes]
     }));
     return out;
   }

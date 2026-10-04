@@ -446,6 +446,96 @@ stretches, so that path has been exercised only by tests on synthetic input;
 `AIRFRAME_TONE_ABOVE_LEVEL_IN_PART` and 4 get `AIRFRAME_VIBRATION_PRESENT`; and
 no session produces an adjustment.
 
+### Amended 4 October 2026: only the seconds the governor was flying the rotor
+
+`src/analysis/evidence-span.mjs` cuts the flight window to the stretch in which
+the governor reported ACTIVE (event 50, state 4 — a format fact recorded with
+its evidence in `docs/BLACKBOX_FORMAT_NOTES.md`): from the first ACTIVE moment
+plus a 0.5 s settle to the end of the last ACTIVE range. Both analysis paths in
+`ui/app.mjs` ("What to change" and the Tune evidence) and
+`tools/corpus/measure.mjs` slice through its `spannedSession`, so they cannot
+read different seconds; `test/ui-open-file.test.mjs` fails if either path is
+left on the window. A log with no event 50, or no settled ACTIVE inside the
+window, is analysed over the window exactly as before, and the page says which.
+
+Why: the collective rule ends the window after the landing, and on 30 of the 31
+admissible real flights the governor had left ACTIVE before it did (median
+5.0 s, up to 15.4 s of spool-down inside the window). Every
+`HOLD_HEADSPEED_INVALID` refusal on the corpus came from that tail. Measured on
+the same 31 flights through the app's own calls, before and after: accepted
+holds 29/22/28 → 39/33/38 (roll/pitch/yaw); `HOLD_HEADSPEED_INVALID` 19/16/5 →
+0/0/0; the airframe gate permitted on 30 → 31 flights; the head-speed blocker
+`HEADSPEED_MOVED_DURING_STEADY_FLIGHT` raised on 1 → 0 flights (it had been
+measuring spool-down); adjustments 0 → 0; the reference flight's findings
+unchanged, because it ends in flight at speed and its span is its window.
+
+The airframe gate's 31st flight was opened by the spool-down coming off, not by
+a fault being hidden. Over its window, that flight's persistent tone could not
+be tested against the rotor orders (`ROTOR_HARMONIC_CORRELATION_UNAVAILABLE`):
+the test needs a head speed steady enough to predict the orders from, and the
+5.0 s spool-down tail is a rotor speed falling through all of them. So
+`AIRFRAME_VIBRATION_PRESENT` and `AIRFRAME_ROTOR_NOT_COMPARED` fired. Over the
+span the same tone matches the main rotor (`MAIN_ROTOR_HARMONIC_CORRELATION`)
+and the gate permits. Cutting the end alone does the same and cutting the start
+alone does not, and the trimmed tail measured on its own holds no tone at the
+attention level — the tail made the rotor tone unmatchable; it was not hiding a
+fault. (Review of 4 October 2026, cutting the flight five ways: window, span,
+end only, start only, tail only.)
+
+The identical-gain null pairs behind the per-axis comparison floors move too,
+because the tail was adding noise to them. Section 4 of `npm run corpus:report`
+over the two reference dumps, re-run 4 October 2026: over the span, roll 8 pairs
+(p90 and maximum 0.8096), pitch 12 (p90 0.3636, maximum 1.2472), yaw 19 (p90
+0.0880, maximum 0.1115) — against roll 5 pairs (0.915), pitch 4 (1.3896) and yaw
+18 (p90 0.0966, maximum 0.1006) over whole windows.
+
+- **The gates were left alone.** `SENSITIVITY_FLOOR_DPS` (roll 0.92, pitch 1.39,
+  yaw 0.1) is rounded up from the window-era p90s, and every span **p90** is
+  below its gate, so the cut made none of them looser. Lowering one — pitch's
+  gate is now nearly four times its span p90 — is a calibration decision rather
+  than part of this change. The span **maxima** are not all below the gates, and
+  were never meant to be: yaw's worst pair sat above its 0.1 gate before the cut
+  (0.1006) and still does (0.1115).
+- **The figures the pilot is shown were re-quoted.** `OBSERVED_NULL_PAIRS` in
+  `src/analysis/flight-history.mjs`, behind the floor sentence under every
+  before/after, now quotes the span's pair counts and maxima, each maximum
+  rounded up (roll 8 pairs, 0.81; pitch 12, 1.25; yaw 19, 0.112). Until the
+  review it quoted the window's, and the yaw sentence said nothing-changed
+  flights had differed "at most by 0.101°/s" of a measurement whose span pairs
+  reach 0.1115 — a bound the measurement broke.
+- **Both are tested against the corpus.** When `ROTORLENS_CORPUS_LOGS` is set,
+  `test/corpus-report.test.mjs` reproduces the window-era p90s the gates were
+  derived from (`createCorpusScan({cutToGovernorSpan: false})`), fails if a span
+  p90 rises above its gate, and fails if a span null pair exceeds the maximum
+  the pilot is shown, if the pair count quoted is not the one measured, or if a
+  quoted maximum sits above the measurement by more than rounding.
+
+The I-term card for a reading that flips across the sweep
+(`I_TERM_VERDICT_UNSTABLE`) was reworded in the same change to name the flip
+and to offer a one-change confirmation pair — the axis's I gain moved one step
+either way. That card is built before the airframe check and is not an
+adjustment, so `orderFindings` keeps it under any blocker; as first written it
+offered the gain step beneath an `AIRFRAME_BROADBAND_ELEVATED` blocker. The pair
+is now offered only when the airframe and head-speed gates both pass; otherwise
+the card says which finding has to be cleared before any gain step is worth
+flying, and carries `GAIN_STEP_WAITS_ON_AIRFRAME` or
+`GAIN_STEP_WAITS_ON_HEADSPEED` so the plain-English sentence withholds it too.
+
+A stretch inside the span where the governor left ACTIVE and came back is
+reported, not excluded: cutting a hole in a sample stream would join two
+stretches of flight end to end under one hold or one stop. No admissible real
+flight has one.
+
+**One effect the rule does not intend, stated rather than hidden.** The start
+cut moves the first sample on the 8 flights that lift off before ACTIVE plus
+the settle, and `detectHoldSegments` anchors each segment's band on its first
+sample, so the whole flight re-segments: against cutting the end alone
+(38/36/38), the start cut adds one roll hold and loses three pitch holds, and
+every hold it changes starts after the span does — none of them lost samples
+from before ACTIVE. That path dependence predates this change (the August
+amendment above found the same thing sweeping the takeoff trim) and is Stage
+5b's to remove.
+
 ## Candour about prior exposure
 
 The people involved have previously seen or worked with GPL viewer code, so this

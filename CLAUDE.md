@@ -233,9 +233,12 @@ The blocking item is not code — it is one deliberate sortie, described in
 by review.** `minimumComparisonHolds` is 5 per side; the maximum hold segments
 ever observed on a flight-axis is 4, so all 310 same-aircraft pairs returned
 not-enough-evidence and the comparison had never once fired. And the 0.39 deg/s
-noise floor is a POOLED statistic applied per axis: measured per-axis it is roll
-0.915, pitch 1.390, yaw 0.0966, so it is ~4x too loose on yaw and 2.4-3.6x too
-tight on roll and pitch. The floor is fixed where the app gates a comparison: no
+noise floor is a POOLED statistic applied per axis: measured per-axis over the
+flight window it was roll 0.915, pitch 1.390, yaw 0.0966 (p90), so it is ~4x too
+loose on yaw and 2.4-3.6x too tight on roll and pitch. Since 4 October 2026 holds
+are measured over the governor-ACTIVE span (Stage 5a), where the null pairs read
+roll 0.81 (8 pairs), pitch p90 0.36 / max 1.25 (12), yaw p90 0.088 / max 0.112
+(19); the app quotes those and a corpus test pins them. The floor is fixed where the app gates a comparison: no
 per-axis gate in the app uses the pooled 0.39 any more — `compareFlightRecords`
 gates each axis on its own `SENSITIVITY_FLOOR_DPS` value (roll 0.92, pitch 1.39,
 yaw 0.1). The pooled 0.39 survives as a gate only in `compareHoldEvidence`, which

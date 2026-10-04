@@ -31,8 +31,12 @@ export const SHIPPED_FIGURES = Object.freeze({
   /** src/analysis/pid-evidence.mjs — pooled across all three axes. */
   pooledHoldErrorNoiseFloorDps: EVIDENCE_LIMITS.holdErrorNoiseFloorDps,
   /**
-   * Per-axis identical-gain p90s quoted in flight-history.mjs, at n = 5, 4 and
-   * 18. Comments, not constants: nothing in `src/` reads these.
+   * Per-axis identical-gain p90s that flight-history.mjs's SENSITIVITY_FLOOR_DPS
+   * was rounded up from, at n = 5, 4 and 18. Comments, not constants: nothing in
+   * `src/` reads these. Measured over whole flight windows; over the governor
+   * span (4 October 2026) the same corpus measures roll 0.8096, pitch 0.3636,
+   * yaw 0.0880 at n = 8, 12 and 19, with worst pairs 0.8096, 1.2472 and 0.1115 —
+   * the counts and worst pairs OBSERVED_NULL_PAIRS quotes to a pilot.
    */
   perAxisNoiseFloorP90Dps: Object.freeze({roll: 0.915, pitch: 1.390, yaw: 0.0966}),
   /**
@@ -225,6 +229,13 @@ export function summarizeCorpus(measurements, fileFailures = []) {
   const airborneSeconds = flights.reduce(
     (total, entry) => total + (entry.durationSeconds ?? 0), 0
   );
+  // What the axis measurements were actually taken over: each window cut to
+  // its governor span. The difference from the line above is spool-down.
+  const analysedSeconds = flights.reduce(
+    (total, entry) => total + (entry.analysedSeconds ?? entry.durationSeconds ?? 0), 0
+  );
+  const flightsGovernorSpan = flights
+    .filter(entry => entry.evidenceSpanBasis === 'GOVERNOR_ACTIVE').length;
 
   // --- 1. hold segments per flight-axis
   const holdHistogram = new Map();
@@ -315,6 +326,8 @@ export function summarizeCorpus(measurements, fileFailures = []) {
       flights: flights.length,
       aircraft: aircraftGroups.size,
       airborneSeconds,
+      analysedSeconds,
+      flightsGovernorSpan,
       // Decode health, reported because a donation that decodes badly is
       // evidence about this repository's parser rather than about a helicopter,
       // and those two findings must never be tallied into the same number.
@@ -378,7 +391,9 @@ export function renderCorpusReport(summary, options = {}) {
       ? `  (${Math.round(counts.flights / counts.readable * 100)}% of measured)`
       : ''));
   say(`  distinct aircraft          ${counts.aircraft}`);
-  say(`  airborne minutes analysed  ${(counts.airborneSeconds / 60).toFixed(1)}`);
+  say(`  airborne minutes (windows) ${(counts.airborneSeconds / 60).toFixed(1)}`);
+  say(`  minutes analysed           ${(counts.analysedSeconds / 60).toFixed(1)}`
+    + `   (governor span: ${counts.flightsGovernorSpan} of ${counts.flights} flights)`);
   say(`  sessions ending mid-frame  ${counts.sessionsEndedMidFrame}`
     + '   (normal: a log cut by a power-off)');
   say(`  sessions with decode errors ${counts.sessionsWithDecodeErrors}`
@@ -386,7 +401,9 @@ export function renderCorpusReport(summary, options = {}) {
   say('');
   say('  A SESSION IS NOT A FLIGHT. Bench runs and spool-ups are the majority of');
   say('  any real dump; every distribution below is over the sessions that flew,');
-  say('  measured inside each flight\'s own window.');
+  say('  measured inside each flight\'s own window, cut to the seconds the governor');
+  say('  was flying the rotor wherever the log records that — the same seconds the');
+  say('  app analyses.');
 
   if (summary.failureTally.length > 0) {
     say('');
@@ -528,6 +545,8 @@ export function renderCorpusReport(summary, options = {}) {
   say('');
   say('   A floor is only as good as the number of pairs behind it. Read the pair');
   say('   count first: a p90 over three pairs is a sentence about three flights.');
+  say('   "Previously reported" was measured over whole flight windows, before the');
+  say('   4 October 2026 cut to the governor span; "here" is over the span.');
 
   say('');
   say('='.repeat(72));

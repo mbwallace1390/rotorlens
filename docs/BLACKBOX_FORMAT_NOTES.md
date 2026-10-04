@@ -395,6 +395,52 @@ each, and so also reported no 15 and no 30; the dumps carry both.) The real
 flight's single error is 525 bytes from EOF — a truncated final frame followed
 by erased flash, reported as `truncated`, not an unknown event.
 
+### Event 50, state 4 is governor ACTIVE
+
+An interoperability fact, measured from the logs and recorded here so that code
+can rely on it: **event 50 (governor state) with state 4 means the governor is
+ACTIVE — holding the rotor at its set head speed.**
+`src/analysis/evidence-span.mjs` relies on it to analyse only the seconds the
+governor was flying the rotor, and `advisor/deterministic-metrics.mjs`
+`buildActiveRanges` already assumed it.
+
+The evidence, measured 2026-10-04 with the shipped decoder over every real log
+we hold (110 sessions, 96 of them logging event 50) and the 31 sessions that
+pass the flight-admission gate:
+
+- **Every flight reaches state 4: 31 of 31,** and none leaves it and comes back
+  in flight. State 4 accounts for 1,689 s of the 1,868 s inside the 31 flight
+  windows.
+- **In state 4, `govTarget` stands still and the head speed sits on it.**
+  Within each flight's state-4 stretch the target moves by a median of 0 %
+  (largest 6.8 %, one flight). The logged `headspeed` / `govTarget` ratio over
+  those samples is p10 0.996, median 1.000, p90 1.003.
+- **The states occur in one order.** `1 → 2 → 4 → 7 → 0` on 24 flights;
+  `1 → 2 → 1 → 2 → 4 → 7 → 0` on 6; `1 → 2 → 4` on the one log that stops in
+  flight. Across all 96 sessions only states 0, 1, 2, 4 and 7 appear.
+- **State 4 ends before the flight window does on 30 of 31 flights.** Cutting
+  the window at the end of the last state-4 stretch removes p10 1.9 s, median
+  5.0 s, p90 9.9 s and at most 15.4 s. That tail is where every
+  `HOLD_HEADSPEED_INVALID` refusal on the corpus came from (19 roll, 16 pitch,
+  5 yaw before the cut, 0 after).
+- **8 of 31 flights lift off before state 4 plus a 0.5 s settle.** The latest
+  reaches state 4 2.4 s after the detected liftoff.
+
+**What the other values mean is NOT established, and nothing relies on them.**
+State 0 is where every landed flight ends; during it the logged `govTarget` is
+0. State 2 comes before 4 and its target moves (median 6.5 % within a flight).
+**State 7 is unknown.** It follows 4 at the end of every flight that lands, and
+in it the head speed falls away from the target (ratio median 0.992, p10 0.976).
+That is all these logs show about it. Code treats every state other than 4 as
+"not ACTIVE" and no more. A log from a governor that never reports 4 — an
+external governor, a throttle curve, or firmware we have not seen — is analysed
+over its whole flight window, exactly as before, and says so.
+
+The claim is the same scope as the rest of this file: Rotorflight 4.6, the
+boards and firmware builds in these three logs. A log from another version
+showing a different state order is new evidence, not an exception to wave
+through.
+
 ## Field encodings
 
 "Real log" below means the Rotorflight 4.6.0 flight described above actually used
