@@ -229,6 +229,28 @@
                 <data android:pathPattern=".*\\..*\\..*\\..*\\.LOG" />
             </intent-filter>
 
+            <!--
+              A log that arrives by media-store id rather than by name.
+
+              Samsung My Files opens a file as content://media/external/file/<id>:
+              no name and no extension anywhere in the URI, so the two filters
+              above can never match it, and RotorLens was simply missing from its
+              "Open with" list (seen on a Galaxy Fold, Android 17, 3 Oct 2026).
+              The provider types a .bbl as application/octet-stream, so this
+              offers RotorLens for that type on content URIs whatever the path.
+
+              Binary only, deliberately: text/plain here would put RotorLens in
+              the chooser for every text file on the phone. A .TXT log from such
+              a provider can still be shared in or picked from the app. A file
+              that is not a log is refused by the decoder with a plain message.
+            -->
+            <intent-filter android:label="@string/open_with">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+
             <!-- Sharing a log into RotorLens from any app. -->
             <intent-filter android:label="@string/share_to">
                 <action android:name="android.intent.action.SEND" />

@@ -176,18 +176,23 @@ function globMatches(pattern, input) {
   return at === input.length;
 }
 
-/** The path rules of every VIEW filter on MainActivity. */
-async function viewFilters() {
+/** Every VIEW intent filter on MainActivity, as raw XML with comments removed. */
+async function allViewFilters() {
   const manifest = withoutXmlComments(await read('android/app/src/main/AndroidManifest.xml'));
   const activity = manifest.match(
     /<activity\b[^>]*android:name="\.MainActivity"[\s\S]*?<\/activity>/
   )?.[0];
   assert.ok(activity, 'MainActivity must be declared');
-
-  const filters = [...activity.matchAll(/<intent-filter\b[\s\S]*?<\/intent-filter>/g)]
+  return [...activity.matchAll(/<intent-filter\b[\s\S]*?<\/intent-filter>/g)]
     .map(match => match[0])
     .filter(filter => filter.includes('"android.intent.action.VIEW"'));
-  assert.equal(filters.length, 2, 'one typed and one typeless VIEW filter');
+}
+
+/** The path rules of every VIEW filter on MainActivity that matches by name. */
+async function viewFilters() {
+  const filters = (await allViewFilters())
+    .filter(filter => /android:path(Pattern|Suffix)=/.test(filter));
+  assert.equal(filters.length, 2, 'one typed and one typeless VIEW filter that match by name');
 
   return filters.map(filter => {
     const values = attribute => [...filter.matchAll(
@@ -246,6 +251,26 @@ test('the glob model reproduces the failure it was written to catch', () => {
   assert.equal(globMatches('.*\\..*\\.bbl', '/x/LOG00012.bak.bbl'), true);
   assert.equal(globMatches('.*\\.bbl', '/x/LOG.bbl.zip'), false);
   assert.throws(() => globTokens('a*b'), /does not model/);
+});
+
+test('a log opened by media-store id is offered RotorLens, as binary only', async () => {
+  // Samsung My Files sends content://media/external/file/<id>, typed by the
+  // provider as application/octet-stream: no name, no extension. Only a filter
+  // keyed on the type can match it.
+  const byType = (await allViewFilters())
+    .filter(filter => !/android:path(Pattern|Suffix)=/.test(filter));
+  assert.equal(byType.length, 1, 'exactly one VIEW filter that matches by type rather than name');
+  const [filter] = byType;
+  const values = attribute => [...filter.matchAll(new RegExp(`android:${attribute}="([^"]*)"`, 'g'))]
+    .map(match => match[1]);
+
+  assert.ok(filter.includes('"android.intent.category.DEFAULT"'),
+    'an implicit VIEW intent only reaches a filter with the DEFAULT category');
+  assert.deepEqual(values('scheme'), ['content'],
+    'content URIs only: a file:// path is unreadable without a storage permission');
+  assert.deepEqual(values('mimeType'), ['application/octet-stream'],
+    'binary only: text/plain here would offer RotorLens for every text file on the phone');
+  assert.deepEqual(values('host'), [], 'no authority rule: any provider');
 });
 
 test('both VIEW filters accept exactly the same paths', async () => {
