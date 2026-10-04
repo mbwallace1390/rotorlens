@@ -109,9 +109,9 @@ when it refuses a log: it names the range it opens and why this log falls
 outside it, rather than calling the file damaged. That is an accepted range, not
 an equal verification claim: the committed synthetic corpus covers 4.3 and 4.6,
 firmware output has been decoded for 4.6 alone — 110 private sessions, all 4.6.0
-or its release candidates, with 32 sessions of the two dataflash dumps still
-failing the I-frame continuity check — and the event serializer is pinned to 4.6
-firmware source. No firmware-output 4.3, 4.4 or 4.5 log has been decoded.
+or its release candidates, every one passing `verify:log` including the I-frame
+continuity check — and the event serializer is pinned to 4.6 firmware source. No
+firmware-output 4.3, 4.4 or 4.5 log has been decoded.
 
 **Verified locally against real firmware.** A privately held Rotorflight 4.6.0
 reference log — 8.6 MB and 89 fields — decodes to **134,429 samples with no decode
@@ -143,8 +143,15 @@ npm run verify:log -- /path/to/YOUR_LOG.BFL
 
 It checks properties that only hold if the bytes were genuinely understood — the
 stream is consumed end to end, time and loop iteration advance monotonically, the
-sample interval is stable, and values stay inside sensor range. A decoder subtly
-wrong about a bit layout fails these within a few frames.
+sample interval is stable, values stay inside sensor range, and fields are
+continuous across I-frame boundaries. The first four are alignment checks, and
+alignment is not enough: a wrong bit layout can consume exactly the right number
+of bytes, and three decoder defects once held sync through a whole real log.
+Continuity is the check that sees them, because a field decoded from the wrong
+bits drifts between keyframes and snaps back at each one. A genuine step in the
+flight that happens to land on a keyframe is reported as a note, not a failure;
+the [format notes](docs/BLACKBOX_FORMAT_NOTES.md#the-continuity-check) say how
+the two are separated, and where they cannot be.
 
 ## For pilots
 
@@ -264,9 +271,7 @@ sidecar proves ownership, consent, and the privacy scan required by
    sidecars — or keep them private and run the environment-gated corpus tests.
 2. Close what the decoder has only round-trip evidence for — GPS frames with a
    non-zero home, `TAG2_3SVARIABLE` fields and the rescue event (type 51) each
-   need a real log, as the [format notes](docs/BLACKBOX_FORMAT_NOTES.md) list —
-   and find out why 32 sessions of the two dataflash dumps fail the I-frame
-   continuity check.
+   need a real log, as the [format notes](docs/BLACKBOX_FORMAT_NOTES.md) list.
 3. Keep every new deterministic analysis on the parser contract rather than on
    decoder internals, and add a regression at the public boundary.
 4. Continue profiling large-log peak memory and cancellation on mid-range phones;

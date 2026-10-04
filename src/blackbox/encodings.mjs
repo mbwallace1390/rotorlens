@@ -74,9 +74,9 @@ function decodeTag8_8SVB(reader, count) {
     // samples, 1 error and 525 resync bytes — bit-identical to this order as it
     // decoded then (that error was the cut final frame, reported as `truncated`
     // with no resync since 3 October 2026). Only continuity separates them
-    // (altitude becomes infinite and rssi 29.6x; on a simulator file the decoder
-    // now refuses, axisI[0] read 158.9x), against a worst case of 1.16x in this
-    // order.
+    // (altitude becomes infinite and rssi 28.7x, 29.6x when first measured; on a
+    // simulator file the decoder now refuses, axisI[0] read 158.9x), against a
+    // worst case of 1.16x in this order.
     values[index] = (present & (1 << index)) === 0 ? 0 : reader.signedVB();
   }
   return values;

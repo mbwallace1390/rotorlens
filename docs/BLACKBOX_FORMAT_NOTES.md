@@ -79,6 +79,13 @@ samples against the shipped order:
 | TAG2_3S32 selector 2 values | 5 | **0** | 5 |
 | TAG2_3S32 selector 3 widths | 5 | **1** — `(1,0,2)` | 4 |
 
+Re-measured 2026-10-03 under the current continuity rule (see [The continuity
+check](#the-continuity-check)): every count is unchanged. All 42 non-degenerate
+permutations are still caught. Outside selector 3, the narrowest is selector 2
+order `(1,0,2)`, with `axisP[1]` at 5.1x once its 3 largest keyframes are set
+aside. Selector 3's `(2,1,0)` and `(2,0,1)` orders are the narrowest of all, at
+4.4x undone at keyframes.
+
 See [The one slot pair no log we hold can
 separate](#the-one-slot-pair-no-log-we-hold-can-separate) for what that one costs
 and for what log would settle it.
@@ -131,27 +138,63 @@ Facts about the format worth keeping:
   log declares them. Nothing here narrows the GPS coverage gap noted above.
 - **Both boards log `gyroRAW[0..2]`**, so unfiltered-gyro analysis is available on
   every session in the corpus.
-- **The dumps do not all pass continuity.** Re-run on 2026-10-03, `verify:log`
-  fails "values are continuous across I-frame boundaries" on 32 of the 109 dump
-  sessions (5 of 36 on the NEXUS_XR, 27 of 73 on the VANTAC) and passes every
-  other check on all 109. The flagged fields include governor terms (`govI` up
-  to 87.5x), ESC telemetry (`EscPwm` 41.4x, `EscThr`, `EscRPM`, `EscI`),
-  `rcCommand[4]` at about 10x in several sessions, `headspeed`, `Ibat` and
-  `attitude[2]`. Most of them are SIGNED_VB (predicted by PREVIOUS, or by
-  AVERAGE_2 for `headspeed` and `motor[0]`), which has no width selector to
-  misread; `govI` and `govP` (TAG8_4S16) and `attitude[2]` (TAG2_3S32) are the
-  exceptions. Whether this is the check misjudging fields that change only now
-  and then, or a real decode fault, **has not been investigated**. Until it is,
-  those sessions are evidence of alignment, not of correct values.
+- **The RC firmware's field tables are subsets of the release table, not
+  variants of it** (compared 2026-10-03). Across the five distinct tables in the
+  110 sessions, every field the 4.6.0-RC1 and RC3 sessions share with the 4.6.0
+  reference declares the same I and P encoding and the same I and P predictor;
+  the tables differ only by which fields are present (ESC, debug and
+  accelerometer fields come and go with configuration). The P-frame tag groups
+  are identical everywhere: `rcCommand[0..3]`, `setpoint[0..3]`, `mixer[0..3]` and
+  `govP govI govD govF` as TAG8_4S16, and the PID, `attitude` and (where present)
+  `axisB` triples as TAG2_3S32.
+- **The governor's TAG8_4S16 group is cross-checked by a second encoding.** In
+  the four sessions that log the governor debug mode, `govI`, `govP` and `govSum`
+  are duplicated in `debug[5]`, `debug[4]` and `debug[3]`, which travel as
+  SIGNED_VB. The two copies agree at every sample of all four sessions. That is
+  independent evidence for this group's slot order, which no round-trip test can
+  give.
+- **Every dump session now passes continuity, and for a while 32 did not.** On
+  2026-10-03, before the check changed, `verify:log` failed "values are
+  continuous across I-frame boundaries" on 32 of the 109 dump sessions (5 of 36
+  on the NEXUS_XR, 27 of 73 on the VANTAC, two of the 27 on 4.6.0 final). It
+  passed every other check on all 109. The flagged fields included governor
+  terms (`govI` up to 87.5x), ESC telemetry (`EscPwm` 41.4x, `EscThr`,
+  `EscRPM`, `EscI`), `rcCommand[4]` at about 10x in several sessions,
+  `headspeed`, `Ibat` and `attitude[2]`. Most of them are SIGNED_VB (predicted
+  by PREVIOUS, or by AVERAGE_2 for `headspeed` and `motor[0]`), which has no
+  width selector to misread. `govI` and `govP` (TAG8_4S16) and `attitude[2]`
+  (TAG2_3S32) were the exceptions.
 
-What it does **not** add matters more than the sample count: **110 decoded
-sessions are not 110 flights.** 77 of them carry a setpoint that is identically
-zero on all three axes for their whole length, and 26 never turn the rotor above
-300 rpm — they are bench and spool-up recordings. Classifying on "rotor above
-1000 rpm for more than 20 s and the sticks moved" leaves **33 flights and 35.1
-airborne minutes**. For decoder conformance every session counts; for anything
-measured about flying, only the 33 do, and the corpus block in
-`src/analysis/records.mjs` states that distinction where the constants live.
+**None of the 32 was a decoding fault.** They were moments in the flight that
+landed on a keyframe:
+
+- The evidence that it was not the decoder: across the 109 dump sessions, 112,517
+  step moments (any field moving 50x its own mean in one sample) fell on a
+  keyframe 3.10% and 3.14% of the time. Chance is 1/32, which is 3.13%. A delta
+  defect puts a spike at that phase, and no field had one. The same steps appear
+  at the same sample in fields with different encodings. In five of the eight
+  flagged sessions inspected, the firmware wrote a governor-state event (type 50)
+  immediately before the flagged keyframe. Those five were the throttle cuts and
+  the governor engaging; the other three were throttle-channel and ESC steps with
+  no event. Event frames carry no predictor, so they cannot share a delta bug.
+- Why the ratio fell for it: every flag was carried by one or two keyframes.
+  `govI` went 0 → 450 as the governor engaged. A throttle cut moved the throttle,
+  governor target, motor and `govP` on one sample. An ESC telemetry update
+  arrived. A heading wrapped 3599 → 0. A step on a keyframe weighs 31x what the
+  same step weighs on a delta frame. On a field that otherwise barely moves, that
+  one moment *is* the ratio: 87.5x for `govI`, with a mean movement of only 0.16
+  counts per keyframe.
+
+The check was what needed to change, not the decoder. See the next section.
+
+What the 110 sessions do **not** add matters more than the sample count: **110
+decoded sessions are not 110 flights.** 77 of them carry a setpoint that is
+identically zero on all three axes for their whole length, and 26 never turn the
+rotor above 300 rpm — they are bench and spool-up recordings. Classifying on
+"rotor above 1000 rpm for more than 20 s and the sticks moved" leaves **33
+flights and 35.1 airborne minutes**. For decoder conformance every session
+counts; for anything measured about flying, only the 33 do, and the corpus block
+in `src/analysis/records.mjs` states that distinction where the constants live.
 
 Neither dump closes the open TAG2_3S32 selector-3 question. They widen board and
 firmware coverage, not layout coverage.
@@ -168,23 +211,78 @@ the keyframe period and has it yanked away at the next `I` frame. Measure mean
 else, and correct decoding gives ≈1 — a real signal does not know where the
 keyframes are.
 
-Measured margins on the reference flight's 134,429 samples. (This line said
-224,429 samples across four logs until 2026-10-03; the other 90,000 were the
-three simulator files above, which are not real flight.)
+**That ratio alone is not the test, as of 2026-10-03.** On the reference
+flight's 134,429 samples the worst correctly decoded field reads 1.16x. On the
+109 dump sessions it read up to 87.5x, because a genuine step that lands on a
+keyframe looks like a defect to an average (see the section above). Setting the
+largest few keyframes aside cures that, but on its own it would also have hidden
+a real shipped defect: TAG2_3S32 selector 3 mis-read only seven groups of the
+reference log, so *its* excess also rode on about two keyframes.
 
-| population | ratio |
-| --- | --- |
-| every correctly decoded field above the movement floor | ≤ **1.16x** |
-| `attitude[0]`, TAG2_3S32 widths permuted | 2.2x |
-| `axisP[1]`, TAG2_3S32 widths permuted | 5.0x |
-| `gyroADC[1]`, AVERAGE_2 using floor instead of truncation | 10.0x |
-| `attitude[2]`, TAG2_3S32 widths permuted | 17.9x |
-| `setpoint[3]`, TAG8_4S16 widths permuted | 346x |
-| `loopIteration`, INCREMENT step 1 where the log declares 2 | 33.0x |
+What separates the two cases is what the keyframe does. A mis-read delta is
+carried forward by the predictor until the next keyframe **undoes** it: with
+the selector-3 widths permuted, `axisP[1]` jumped 352 at a keyframe after its
+delta frames had moved it 353 the other way. A genuine step undoes nothing:
+`govI` read 0 at the keyframe before, 0 on the sample before, and then 450.
 
-The threshold sits at 2x, in the empty band between those two populations on
-that log. The two dumps do not show the same empty band — see their continuity
-failures in the multi-session section above.
+So a field is called out only when its excess has one of the two shapes a delta
+defect leaves behind:
+
+- **Broad:** the excess survives when the 3 largest keyframe jumps are set
+  aside. A defect that corrupts every period the field moves in looks like this.
+- **Reversing:** the part of each keyframe's jump that takes back the delta
+  frames' net movement since the previous keyframe clears the threshold on its
+  own. A defect confined to a few periods looks like this.
+
+An excess with neither shape is reported as a note that names its samples, and
+the session passes.
+
+Measured margins, as calculated by `src/blackbox/continuity.mjs` itself. The
+defect rows were produced by putting each wrong layout back into the decoder and
+decoding the reference flight: the three that shipped (TAG8_4S16, TAG2_3S32
+selector 3, INCREMENT) and the two wrong alternatives this file also measures
+(AVERAGE_2 with floor, TAG8_8SVB reversed). The first clean row covers the
+reference flight alone; the second covers it together with all 109 dump
+sessions: 110 sessions and 2,415 field-sessions above the movement floor. (The
+reference row was quoted over 224,429 samples across four logs until
+2026-10-03; the other 90,000 were the three simulator files above, which are
+not real flight.)
+
+| population | ratio alone | without 3 largest keyframes | undone at keyframes | called out |
+| --- | --- | --- | --- | --- |
+| correctly decoded, reference flight | ≤ **1.16x** | ≤ 1.11x | ≤ 0.75x | never |
+| correctly decoded, all 110 sessions | up to 87.5x | ≤ **1.59x** | ≤ **1.63x** | never |
+| `attitude[0]`, TAG2_3S32 widths permuted | 2.2x | 0.92x | 1.32x | no |
+| `axisP[1]`, TAG2_3S32 widths permuted | 5.0x | 0.82x | **4.41x** | yes |
+| `attitude[2]`, TAG2_3S32 widths permuted | 17.9x | 1.01x | 0.27x | no |
+| `gyroADC[1]`, AVERAGE_2 using floor instead of truncation | 10.0x | 9.96x | 8.67x | yes |
+| `mixer[1]`, TAG8_4S16 widths permuted (lowest of its group) | 10.2x | 10.0x | 9.66x | yes |
+| `setpoint[3]`, TAG8_4S16 widths permuted | 346x | 335x | 16.0x | yes |
+| `loopIteration`, INCREMENT step 1 where the log declares 2 | 33.0x | 33.0x | 0.00x | yes |
+| `rssi`, TAG8_8SVB selector bits reversed | 28.7x | 28.6x | 28.7x | yes |
+
+Both thresholds are 2x, unchanged. Every defect still fails `verify:log` on
+the reference log, and every one of the 110 real sessions passes.
+
+What this costs, stated so nobody has to rediscover it:
+
+- **The selector-3 defect is now caught by one field, at 4.41x.** Before this
+  change three fields caught it, the strongest at 17.9x. `attitude[2]`'s 17.9x
+  came from two heading wraps that the mis-read delta frames failed to make and
+  the keyframes then made. That is exactly the shape of a heading genuinely
+  wrapping on a keyframe, and the dumps contain four of those, in two sessions.
+  This is now the narrowest defect margin the check has.
+- **The narrowest clean margin is 1.63x, and it is the reversing shape.** In the
+  session behind that figure, a heading crossed north on a delta frame and
+  crossed back on the next keyframe. From a single occurrence, a genuine
+  excursion that returns exactly on a keyframe cannot be told apart from a
+  mis-read delta that the keyframe corrects. The check will call one a fault if
+  it ever clears 2x.
+- **A mis-read in the last keyframe period of a log is invisible.** No keyframe
+  follows to undo it. The same was always true of the ratio.
+- **Up to three genuine steps landing on keyframes are tolerated, not more.**
+  Each of the 52 field flags raised by the ratio alone, across 32 sessions,
+  was carried by at most two keyframes.
 
 Two guards keep it honest:
 
@@ -344,16 +442,21 @@ and the fifth is its **field-0/field-1 transposition** — reading `(1,0,2)`, so
 field 0 takes the width in slot 1 and field 1 takes the width in slot 0.
 
 Measured on the reference 4.6 log, 2026-08-12, by decoding it under all six
-permutations and diffing the samples:
+permutations and diffing the samples. The `verify:log` column was re-measured on
+2026-10-03 under the current continuity rule:
 
 | permutation | samples differing from shipped | verify:log |
 | --- | --- | --- |
 | `(0,1,2)` — as shipped | — | 13/13 |
 | `(1,0,2)` — field 0 ↔ field 1 | **0 of 134,429** | **13/13** |
-| `(0,2,1)` | 53 | 12/13, `axisP[1]` 30.3x |
-| `(1,2,0)` | 53 | 12/13, `axisP[1]` 30.3x |
-| `(2,1,0)` | 53 | 12/13, `attitude[2]` 17.9x |
-| `(2,0,1)` | 53 | 12/13, `attitude[2]` 17.9x |
+| `(0,2,1)` | 53 | 12/13, `axisP[1]` 30.3x (30.2x undone at keyframes) |
+| `(1,2,0)` | 53 | 12/13, `axisP[1]` 30.3x (30.2x undone at keyframes) |
+| `(2,1,0)` | 53 | 12/13, `axisP[1]` 5.0x (4.4x undone at keyframes) |
+| `(2,0,1)` | 53 | 12/13, `axisP[1]` 5.0x (4.4x undone at keyframes) |
+
+In the last two rows the check used to fail on `attitude[2]` at 17.9x. That
+field is now printed as a set-aside step rather than a failure, because its
+keyframes take back only 0.27x — see [The continuity check](#the-continuity-check).
 
 The six collapse into **three** distinguishable classes, and the shipped order
 shares its class with its own transposition. The reason is arithmetic, not luck:
@@ -417,7 +520,9 @@ what a tuning metric looks at.
 Selectors **0, 1 and 2 were swept over all six permutations each** against the
 real log and measured the same way. Every one of the five non-identity orders
 changes the decoded samples and every one is caught; none of them is marginal.
-The worst offender in each reversal:
+That still holds under the current continuity rule (re-measured 2026-10-03; the
+narrowest is 5.1x, see the sweep table at the top of this file). The worst
+offender in each reversal, as measured on 2026-08-12 by the ratio alone:
 
 | selector reversed | worst continuity ratio |
 | --- | --- |
@@ -446,7 +551,7 @@ no resync since 2026-10-03). Only continuity separates them:
 | order | worst continuity |
 | --- | --- |
 | bit *n* → field *n* (shipped) | 1.16x, nothing flagged |
-| reversed within group | `altitude` **infinite**, `rssi` 29.6x |
+| reversed within group | `altitude` **infinite**, `rssi` 28.7x (29.6x when first measured, 2026-08-12) |
 | reversed, one simulator file (2026-08-12; refused by the decoder since) | `axisI[0]` **158.9x**, `axisI[2]` 39.0x |
 
 (Reversing across all 8 bit positions regardless of group size *does* break sync,
@@ -693,8 +798,12 @@ the corpus needs a case that makes it visible.
 
 1. Run `npm run verify:log` against it.
 2. Read the continuity line specifically, not just the pass/fail total. A worst
-   ratio creeping towards 2x on a field that moves is the early warning; a log
-   that reports "continuity not measured" has told you nothing about its values.
+   ratio creeping towards 2x on a field that moves is the early warning. A field
+   set aside as a keyframe step is not counted in that worst figure; its note
+   prints the two figures that decide a flag ("without its 3 largest keyframes"
+   and "undone at keyframes"), and either one creeping towards 2x is the same
+   warning. A log that reports
+   "continuity not measured" has told you nothing about its values.
 3. If every check passes, add it as a fixture per `docs/FIXTURE_POLICY.md` and
    record its decoded field inventory as a regression baseline.
 4. If a check fails, correct the relevant assumption above, and add a unit test
