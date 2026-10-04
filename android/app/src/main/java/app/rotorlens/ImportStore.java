@@ -121,6 +121,17 @@ final class ImportStore {
     }
 
     /**
+     * Opens the bytes being imported.
+     *
+     * The production source is one ContentResolver call; it is an interface so
+     * the copy below, which is everything that can go wrong with a provider, can
+     * run in a JVM test without an Android runtime.
+     */
+    interface Source {
+        InputStream open() throws IOException;
+    }
+
+    /**
      * Copies the content behind {@code uri} into the cache.
      *
      * @param progress notified as bytes land; may be null
@@ -132,6 +143,11 @@ final class ImportStore {
         if (uri == null) {
             return Result.failed("unreadable");
         }
+        return accept(() -> resolver.openInputStream(uri), name, active, progress);
+    }
+
+    /** The copy itself; see the ContentResolver overload. */
+    Result accept(Source source, String name, BooleanSupplier active, Progress progress) {
         if (!directory.exists() && !directory.mkdirs()) {
             return Result.failed("unreadable");
         }
@@ -148,7 +164,7 @@ final class ImportStore {
         File destination = new File(directory, FILE_PREFIX + id + FILE_SUFFIX);
         long copied = 0;
 
-        try (InputStream input = resolver.openInputStream(uri);
+        try (InputStream input = source.open();
              OutputStream output = new FileOutputStream(destination)) {
             if (input == null) {
                 destination.delete();
@@ -174,7 +190,16 @@ final class ImportStore {
                     progress.copied(copied);
                 }
             }
-        } catch (IOException | SecurityException error) {
+        } catch (IOException | RuntimeException error) {
+            // RuntimeException, not just SecurityException (which is one). A
+            // provider is another app's code, and it reports failure across the
+            // binder as whatever unchecked exception it likes: FileProvider throws
+            // IllegalArgumentException for a path outside its roots, document
+            // providers IllegalStateException or UnsupportedOperationException for
+            // stale or virtual documents. This runs on a bare thread with no
+            // handler, so anything that escapes here kills the app instead of
+            // saying "unreadable". Errors still propagate: those are this process
+            // failing, not the file.
             destination.delete();
             return Result.failed(active.getAsBoolean() ? "unreadable" : "cancelled");
         }

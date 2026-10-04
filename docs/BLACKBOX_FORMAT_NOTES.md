@@ -28,9 +28,14 @@ assumption, so a round-trip agreeing with itself is not evidence about the forma
 4.6.0 log (`Rotorflight 4.6.0 (118e912) STM32F7X2`, board `FRSK VANTAC_RF007`,
 8.5 MB, 89 fields) decodes to **134,429 samples with zero errors through the body
 of the log**, a median sample interval of 993 µs with **no outliers at all**, and
-monotonic time and loop iteration throughout. The only resync is the final 525
-bytes, where the capture stops part-way through a frame — a power-off artefact,
-not a decoding fault.
+monotonic time and loop iteration throughout. The capture stops part-way through
+its last frame — a power-off artefact, not a decoding fault: 13 bytes of a P
+frame (30 of its 89 fields, carrying the same 994 µs and 2-iteration step as the
+frame before it), then 512 bytes of erased flash (0xFF) to the end of the file.
+Since 2026-10-03 that tail is reported as `truncated` with no resync; until then
+the cut frame's varint ran into the 0xFF run and surfaced as one `corrupt-frame`
+plus 525 resync bytes, which the integrity judgment counted as damage in the
+body of the log. See [Erased flash after a cut frame](#deliberate-decoder-behaviors).
 
 **That paragraph used to end here, and it was wrong.** Holding sync proves
 alignment, not correctness — see the TAG8_4S16 section below. Two encodings and a
@@ -109,8 +114,10 @@ Facts about the format worth keeping:
   uniform at 72, the reference log has 89. A decoder that assumes one field table
   per file is wrong on both dumps.
 - **Two error cases in 110 sessions**, both benign and both at an end: the
-  reference log's final `corrupt-frame` (the known power-off artefact) and one
-  `truncated` session in the OMP4MAX dump. No mid-body resync anywhere.
+  reference log's cut final frame (the known power-off artefact, followed by
+  erased flash, reported as `truncated` since 2026-10-03 and as `corrupt-frame`
+  before that) and one `truncated` session in the OMP4MAX dump. No mid-body
+  resync anywhere.
 - **Sample interval stays inside 988.9–1008.2 µs** across all 110 sessions,
   i.e. nominal 1 kHz on both board models with no rate switching.
 - **Neither dump declares location fields and neither carries a G frame.**
@@ -187,7 +194,10 @@ header line and another `H ` line, rather than requiring a preceding newline.
 Getting this wrong silently drops every session after the first.
 
 Header lines are `H key:value`, one per line, until the first line that is not
-well-formed. That point is where frames begin.
+well-formed. That point is where frames begin. Bytes that do not start `H ` end
+the header at once and are never measured as a line: frame data can run far past
+the 64 KiB header-line limit without a 0x0A byte, and treating it as an overlong
+header line used to discard sessions whose header was intact.
 
 Before frames are trusted, the decoder requires the standard Blackbox recorder
 product string, data version `2`, and a Rotorflight **4.3.x–4.6.x** firmware
@@ -246,8 +256,8 @@ the next log carrying something new is recognisable as new evidence:
 
 No **51**, no 14, no 30 appeared in that measured corpus. Their layouts are
 nevertheless known from the pinned firmware serializer above. The real log's
-single decode error is 525 bytes from EOF — a truncated final frame, not an
-unknown event.
+single decode error is 525 bytes from EOF — a truncated final frame followed by
+erased flash, not an unknown event.
 
 ## Field encodings
 
@@ -560,6 +570,28 @@ by a hand-built log in `test/blackbox-decode.test.mjs` instead.
   errors have separate caps. Reaching one records `limit-exceeded`; frame-stage
   caps also set `session.limitExceeded`. A partial prefix can therefore never
   report clean, and a session-count overflow returns no partial session list.
+- **Decoded field values are bounded by the bytes that carry them.** NULL
+  (encoding 9) consumes no bytes and a header may declare 1024 fields, so a
+  crafted header could turn each body byte into a 1024-value frame — 1.66 GB of
+  heap from a 215 KB file. Every I, P, S, G and H frame is charged its field
+  count against 16 values per body byte plus a 65,536 floor, and crossing it
+  records `limit-exceeded` with `resource: 'cell'`. Real sessions run 1.40–1.73
+  values per byte (110 sessions), and no non-NULL encoding packs more than 8
+  fields into one byte. The run of same-encoding fields is measured only up to
+  the encoding's group capacity, which keeps each frame linear in its width.
+- **Erased flash after a cut frame is the end of the capture.** Unwritten flash
+  reads back 0xFF, and a 0xFF run never terminates a variable-byte field, so a
+  frame cut by power-off fails as "exceeded 32 bits" rather than running out of
+  input. When the failing frame began at or before an unbroken run of 0xFF that
+  reaches the end of its session, and its reads went into that run, the failure
+  is reported as `truncated` with `erasedBytes`, and the run is consumed rather
+  than resynced through. Anything else stays damage: an erased run with data
+  after it, a frame that failed on its own written bytes, and a run that a
+  committed frame had already decoded as values (an erased byte and a data byte
+  of 0xFF are indistinguishable). Zero fill is not treated this way; no log we
+  hold ends in it. The 4096-byte tail tolerance in `log-integrity.mjs` still
+  applies, so a cut followed by more than about 4 KB of erased flash reads as
+  damage — no log we hold has one.
 - **Unsigned fields stay unsigned.** An unsigned variable-byte value remains in
   JavaScript's exact `0..2^32-1` integer range. In particular, Blackbox time does
   not become negative at `2^31` microseconds (about 35.8 minutes).

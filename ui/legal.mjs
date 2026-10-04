@@ -3,7 +3,7 @@
  *
  * Apache-2.0 section 4 obliges whoever distributes a binary to give every
  * recipient the license text and the attribution notices for what is inside it.
- * RotorLens declares one Android dependency and ships twenty-eight artifacts
+ * RotorLens declares one Android dependency and ships twenty-seven artifacts
  * from four copyright holders, so Android's component section is built from
  * `legal-data.mjs` — generated from the resolved classpath — rather than from a
  * list someone remembered to update. iOS and web select their own component
@@ -18,9 +18,10 @@
  *
  * That sentence was written before the data was fetched on demand, and until
  * 13 August 2026 it was not true: `legal-data.mjs` was a static import, so all
- * 18 KB of it — twenty-eight Maven coordinates and the 11 KB Apache text — was
- * fetched, parsed and evaluated before the page painted, for every user, on
- * every launch. `import()` in `render` is what makes the claim above accurate.
+ * 18 KB of it — the twenty-eight Maven coordinates it held then, and the 11 KB
+ * Apache text — was fetched, parsed and evaluated before the page painted, for
+ * every user, on every launch. `import()` in `render` is what makes the claim
+ * above accurate.
  *
  * It buys very little. Measured in headless Chromium over 15 loads, dropping
  * this module from the start-up graph moved neither DOMContentLoaded nor

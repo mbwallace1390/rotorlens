@@ -14,6 +14,9 @@ It does three things:
    and tells the page where to fetch it.
 3. Opens the system file picker when the page asks.
 
+And it keeps the WebView alive around those: it replaces a renderer that died
+(see below), and hands a tapped About & Legal link to the user's browser.
+
 It decides nothing. Every byte of decoding, analysis, and presentation happens in
 JavaScript, because that is the part this repository's tests can reach. Java here
 is code that cannot be tested by `npm test`, so there is as little of it as the
@@ -39,8 +42,21 @@ Adding that line later would silently give it up, so don't, and if a feature eve
 seems to require it, treat that as a decision to make deliberately rather than a
 dependency to satisfy.
 
-The WebView is likewise configured with file and content access disabled, and
-navigation is refused to any origin but the app's own.
+The WebView is likewise configured with file and content access disabled.
+`AssetServer` answers every request itself and refuses, with an empty 403, any
+that is not `https://appassets.rotorlens.app` — it used to return null for a
+foreign host, which tells the WebView to load the request itself, so the missing
+permission had been the only barrier. Navigation off the app's origin never loads
+in the WebView.
+
+The one exception is a link the user taps on About & Legal: the source repository
+and each bundled component's project page. Those go to the user's own browser
+through `ACTION_VIEW`, which needs no permission — the browser makes the request,
+because the user asked it to. Only the exact URLs the legal screen shows can leave
+(`ExternalLinks.java`), only on a tap, and only as `https`: a URL is a message,
+and if any URL could be handed over, anything the page can read could be sent in
+one. `test/android-shell.test.mjs` fails if that list and the legal screen's links
+ever differ.
 
 ## The imported log does not outlive the session
 
@@ -51,12 +67,54 @@ mislabelled as the newer choice. `onDestroy` cancels any copy and deletes the
 committed log without waiting on provider I/O. A viewer has no reason to
 accumulate other people's flight data, and a log is location history.
 
-`onDestroy` is not guaranteed, though — a low-memory kill, an uncaught exception
-on the import thread, or a swipe from recents on some builds skips it, and the
-last flight would sit in the cache with nothing to remove it. So the store also
-purges the import directory **once per process** at startup. Once per process and
-not once per instance: the constructor runs again on every activity recreation,
-so purging there would drop the user's open log when they rotate the phone.
+`onDestroy` is not guaranteed, though — a low-memory kill, or a swipe from recents
+on some builds skips it, and the last flight would sit in the cache with nothing
+to remove it. So the store also purges the import directory **once per process**
+at startup. Once per process and not once per instance: the constructor runs again
+on every activity recreation, and a purge there would race the new instance.
+
+An exception from a document provider during the copy is reported to the page as
+"unreadable" rather than escaping the import thread. Providers are other apps'
+code and throw unchecked exceptions across the binder for stale, virtual, or
+out-of-root documents; uncaught on that bare thread, any of them killed the app.
+
+## Configuration changes do not recreate the viewer
+
+Recreating the activity destroys the WebView and runs `onDestroy`, which unlinks
+the open log — and a log chosen in the picker is not re-imported, because the
+activity's intent is just the launcher's. So `android:configChanges` declares
+rotation, window and screen size, smallest width, screen layout, density, font
+scale, locale and layout direction, keyboard, navigation and `uiMode`: split
+screen, fold and unfold, desktop windowing, display-size and font-size changes,
+and a language change all keep the open log.
+
+The WebView re-lays itself out for size and density. Font scale it reads only
+when it is built, so `onConfigurationChanged` re-applies the text zoom a fresh
+WebView would compute. `uiMode` needs nothing because nothing follows it: the
+theme has no night variant and the page is dark-only, and
+`test/android-shell.test.mjs` fails if either stops being true.
+
+Still recreating, deliberately: a SIM change (`mcc`/`mnc`), touchscreen, colour
+mode, bold text (`fontWeightAdjustment`) and grammatical gender. Nobody does those
+mid-analysis, and whether the WebView follows them in place has not been checked.
+
+## A dead renderer is replaced, not fatal
+
+The WebView renders in a separate process. On a large log it can run out of
+memory; in the background the system can reclaim it. Android reports that to
+`onRenderProcessGone`, and an app that does not answer it is killed along with
+the renderer — a hard crash. `MainActivity` answers it: it destroys the dead
+WebView, unlinks the log that was open, builds a fresh viewer, and tells the new
+page through the ordinary `rotorlens-import-failed` event which log was lost:
+reason `viewer-restarted` when the renderer crashed (the log may be why), and
+`viewer-reclaimed` when the system killed it to free memory (the log most
+likely was not).
+
+It never re-offers that log. It may be exactly what the renderer died on, and
+handing it to the replacement could kill that one too, forever. A replacement
+that dies before its own page finishes loading is not replaced again
+(`RendererRecovery`); the activity shows a one-line native message instead of
+looping.
 
 ## Building
 
@@ -122,11 +180,28 @@ Things worth confirming on a real device, in this order:
       locking up for an unacceptable time. If it does, the decode belongs in a
       worker; measure before assuming.
 - [ ] Content is not hidden behind the notch or the gesture bar.
+- [ ] "Open in RotorLens" is offered from the Files app for `LOG00012.bak.bbl`
+      and for a log inside a folder with a dot in its name. On Android 8-11 a
+      path with five or more dots is still not offered; share it instead.
+- [ ] With a log open from the in-app picker, change Display size, then Font
+      size, then enter split screen (and fold/unfold on a foldable): the log stays
+      open and the text follows the new font size.
+- [ ] About & Legal: tapping the repository link and a component link opens the
+      browser, and the back gesture returns to RotorLens.
+- [ ] The renderer dying does not close the app. On a debug build, crash it from
+      `chrome://inspect` with a log open: the viewer comes back and names the log
+      it lost. Then try the real case — the largest dump on the lowest-memory
+      phone available.
+
+The last four were exercised on an Android 17 emulator (WebView 153) through the
+real platform matcher, a real tap, and a DevTools-forced renderer crash. That is
+not a phone: an OEM WebView, a real out-of-memory kill, a fold, and Android 8-11
+have not been tried.
 
 ## Dependencies
 
 The one declared dependency is `androidx.activity`, for the modern back-press
-and activity-result APIs. Its resolved release closure is larger; the exact 28
+and activity-result APIs. Its resolved release closure is larger; the exact 27
 artifacts are pinned in `shipping-dependencies.json` and represented in
 `../THIRD_PARTY_NOTICES.md` and the generated in-app legal screen. The viewer
 and engine have no npm dependencies.

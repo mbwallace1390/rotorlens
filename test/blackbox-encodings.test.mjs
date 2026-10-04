@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {ByteReader, signExtend, zigZagDecode, zigZagEncode} from '../src/blackbox/reader.mjs';
-import {Encoding, decodeGroup, groupSize} from '../src/blackbox/encodings.mjs';
+import {Encoding, decodeGroup, groupCapacity, groupSize} from '../src/blackbox/encodings.mjs';
 import {DecodeErrorCode} from '../src/blackbox/errors.mjs';
 import {ByteWriter, writeGroup} from '../tools/blackbox-writer.mjs';
 
@@ -106,6 +106,26 @@ test('group sizing matches each encoding capacity and never overruns the field l
   assert.equal(groupSize(Encoding.TAG2_3S32, 9), 3);
   assert.equal(groupSize(Encoding.TAG8_4S16, 9), 4);
   assert.equal(groupSize(Encoding.SIGNED_VB, 9), 1);
+});
+
+test('group capacity is what bounds the frame loop\'s run scan', () => {
+  // The frame loop stops scanning a run of same-encoding fields at this
+  // capacity. That is only output-preserving if groupSize never asks for more
+  // than the capacity, whatever run it is handed.
+  assert.equal(groupCapacity(Encoding.TAG8_8SVB), 8);
+  assert.equal(groupCapacity(Encoding.TAG2_3S32), 3);
+  assert.equal(groupCapacity(Encoding.TAG2_3SVARIABLE), 3);
+  assert.equal(groupCapacity(Encoding.TAG8_4S16), 4);
+  for (const encoding of Object.values(Encoding)) {
+    const capacity = groupCapacity(encoding);
+    assert.ok(capacity >= 1, `encoding ${encoding}`);
+    for (let run = 1; run <= 1024; run += 1) {
+      assert.equal(groupSize(encoding, run), groupSize(encoding, Math.min(run, capacity)),
+        `encoding ${encoding}, run ${run}`);
+    }
+  }
+  assert.equal(groupCapacity(Encoding.NULL), 1);
+  assert.equal(groupCapacity(Encoding.SIGNED_VB), 1);
 });
 
 test('an unknown encoding is a typed error rather than silent garbage', () => {

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!--
       This source manifest declares no permissions. AndroidX may add its own
@@ -64,11 +65,30 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.RotorLens">
 
+        <!--
+          configChanges: every change listed here is handled by MainActivity
+          instead of recreating it. Recreation destroys the WebView and runs
+          onDestroy, which unlinks the open log, so a pilot who opened a log from
+          the picker and then rotated, entered split screen, unfolded the phone,
+          resized a desktop window, or changed display size, font size or
+          language came back to an empty viewer.
+
+          The WebView re-lays itself out for size and density. Font size it does
+          not follow on its own, so MainActivity.onConfigurationChanged re-applies
+          it. uiMode (dark mode, car/desk dock) needs nothing: the theme has no
+          night variant and the page is dark-only; test/android-shell.test.mjs
+          fails if either of those stops being true.
+
+          Still recreated, deliberately left out: mcc|mnc (SIM change),
+          touchscreen, colorMode, fontWeightAdjustment (bold text) and
+          grammaticalGender. None is something a pilot does mid-analysis, and
+          whether the WebView follows them in place has not been checked.
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|fontScale|layoutDirection|locale|keyboard|keyboardHidden|navigation|uiMode"
             android:windowSoftInputMode="adjustResize">
 
             <intent-filter>
@@ -80,6 +100,20 @@
               Opening a log from the mass-storage drive or a file manager. Blackbox
               logs have no registered MIME type and arrive as octet-stream or
               text/plain depending on the provider, so the extension is matched.
+
+              WHY EACH EXTENSION APPEARS FIVE TIMES. A pathPattern's ".*" does not
+              backtrack: it stops at the FIRST occurrence of the character after
+              it and commits. So ".*\\.bbl" only matched a path whose first dot
+              was the extension's, and refused LOG00012.bak.bbl, flight.2026.bbl,
+              and anything in a folder like "Rotorflight 4.6" — Uri.getPath() is
+              decoded, so a document provider's folder names are part of it.
+
+              pathSuffix (Android 12+) matches the real end of the path whatever
+              comes before it. Android 8-11 ignore that attribute, so for them the
+              patterns spell out one to four dots; a path with five or more still
+              misses there and can be shared or picked instead.
+              test/android-shell.test.mjs pins both, against a model of the
+              platform matcher that was checked against its source.
             -->
             <intent-filter android:label="@string/open_with">
                 <action android:name="android.intent.action.VIEW" />
@@ -89,14 +123,46 @@
                 <data android:scheme="file" />
                 <data android:mimeType="*/*" />
                 <data android:host="*" />
+                <data android:pathSuffix=".bbl" tools:targetApi="31" />
+                <data android:pathSuffix=".BBL" tools:targetApi="31" />
+                <data android:pathSuffix=".bfl" tools:targetApi="31" />
+                <data android:pathSuffix=".BFL" tools:targetApi="31" />
+                <data android:pathSuffix=".txt" tools:targetApi="31" />
+                <data android:pathSuffix=".TXT" tools:targetApi="31" />
+                <data android:pathSuffix=".log" tools:targetApi="31" />
+                <data android:pathSuffix=".LOG" tools:targetApi="31" />
                 <data android:pathPattern=".*\\.bbl" />
+                <data android:pathPattern=".*\\..*\\.bbl" />
+                <data android:pathPattern=".*\\..*\\..*\\.bbl" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.bbl" />
                 <data android:pathPattern=".*\\.BBL" />
+                <data android:pathPattern=".*\\..*\\.BBL" />
+                <data android:pathPattern=".*\\..*\\..*\\.BBL" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.BBL" />
                 <data android:pathPattern=".*\\.bfl" />
+                <data android:pathPattern=".*\\..*\\.bfl" />
+                <data android:pathPattern=".*\\..*\\..*\\.bfl" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.bfl" />
                 <data android:pathPattern=".*\\.BFL" />
+                <data android:pathPattern=".*\\..*\\.BFL" />
+                <data android:pathPattern=".*\\..*\\..*\\.BFL" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.BFL" />
                 <data android:pathPattern=".*\\.txt" />
+                <data android:pathPattern=".*\\..*\\.txt" />
+                <data android:pathPattern=".*\\..*\\..*\\.txt" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.txt" />
                 <data android:pathPattern=".*\\.TXT" />
+                <data android:pathPattern=".*\\..*\\.TXT" />
+                <data android:pathPattern=".*\\..*\\..*\\.TXT" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.TXT" />
                 <data android:pathPattern=".*\\.log" />
+                <data android:pathPattern=".*\\..*\\.log" />
+                <data android:pathPattern=".*\\..*\\..*\\.log" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.log" />
                 <data android:pathPattern=".*\\.LOG" />
+                <data android:pathPattern=".*\\..*\\.LOG" />
+                <data android:pathPattern=".*\\..*\\..*\\.LOG" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.LOG" />
             </intent-filter>
 
             <!--
@@ -111,6 +177,8 @@
               android:host="*" is required, not decoration: IntentFilter nests the
               path test inside the authority branch, so with no host the
               pathPatterns below would never be evaluated at all.
+
+              The path rules are the same as the filter above, for the same reason.
             -->
             <intent-filter android:label="@string/open_with">
                 <action android:name="android.intent.action.VIEW" />
@@ -119,14 +187,68 @@
                 <data android:scheme="content" />
                 <data android:scheme="file" />
                 <data android:host="*" />
+                <data android:pathSuffix=".bbl" tools:targetApi="31" />
+                <data android:pathSuffix=".BBL" tools:targetApi="31" />
+                <data android:pathSuffix=".bfl" tools:targetApi="31" />
+                <data android:pathSuffix=".BFL" tools:targetApi="31" />
+                <data android:pathSuffix=".txt" tools:targetApi="31" />
+                <data android:pathSuffix=".TXT" tools:targetApi="31" />
+                <data android:pathSuffix=".log" tools:targetApi="31" />
+                <data android:pathSuffix=".LOG" tools:targetApi="31" />
                 <data android:pathPattern=".*\\.bbl" />
+                <data android:pathPattern=".*\\..*\\.bbl" />
+                <data android:pathPattern=".*\\..*\\..*\\.bbl" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.bbl" />
                 <data android:pathPattern=".*\\.BBL" />
+                <data android:pathPattern=".*\\..*\\.BBL" />
+                <data android:pathPattern=".*\\..*\\..*\\.BBL" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.BBL" />
                 <data android:pathPattern=".*\\.bfl" />
+                <data android:pathPattern=".*\\..*\\.bfl" />
+                <data android:pathPattern=".*\\..*\\..*\\.bfl" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.bfl" />
                 <data android:pathPattern=".*\\.BFL" />
+                <data android:pathPattern=".*\\..*\\.BFL" />
+                <data android:pathPattern=".*\\..*\\..*\\.BFL" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.BFL" />
                 <data android:pathPattern=".*\\.txt" />
+                <data android:pathPattern=".*\\..*\\.txt" />
+                <data android:pathPattern=".*\\..*\\..*\\.txt" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.txt" />
                 <data android:pathPattern=".*\\.TXT" />
+                <data android:pathPattern=".*\\..*\\.TXT" />
+                <data android:pathPattern=".*\\..*\\..*\\.TXT" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.TXT" />
                 <data android:pathPattern=".*\\.log" />
+                <data android:pathPattern=".*\\..*\\.log" />
+                <data android:pathPattern=".*\\..*\\..*\\.log" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.log" />
                 <data android:pathPattern=".*\\.LOG" />
+                <data android:pathPattern=".*\\..*\\.LOG" />
+                <data android:pathPattern=".*\\..*\\..*\\.LOG" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.LOG" />
+            </intent-filter>
+
+            <!--
+              A log that arrives by media-store id rather than by name.
+
+              Samsung My Files opens a file as content://media/external/file/<id>:
+              no name and no extension anywhere in the URI, so the two filters
+              above can never match it, and RotorLens was simply missing from its
+              "Open with" list (seen on a Galaxy Fold, Android 17, 3 Oct 2026).
+              The provider types a .bbl as application/octet-stream, so this
+              offers RotorLens for that type on content URIs whatever the path.
+
+              Binary only, deliberately: text/plain here would put RotorLens in
+              the chooser for every text file on the phone. A .TXT log from such
+              a provider can still be shared in or picked from the app. A file
+              that is not a log is refused by the decoder with a plain message.
+            -->
+            <intent-filter android:label="@string/open_with">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="application/octet-stream" />
             </intent-filter>
 
             <!-- Sharing a log into RotorLens from any app. -->

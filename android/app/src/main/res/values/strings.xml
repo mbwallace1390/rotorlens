@@ -3,4 +3,6 @@
     <string name="app_name">RotorLens</string>
     <string name="open_with">Open in RotorLens</string>
     <string name="share_to">Analyse in RotorLens</string>
+    <!-- Shown only if the WebView renderer dies again before its replacement has loaded. -->
+    <string name="viewer_unavailable">The RotorLens viewer stopped and could not be restarted. Close RotorLens and open it again.</string>
 </resources>

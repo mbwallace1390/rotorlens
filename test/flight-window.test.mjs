@@ -23,7 +23,6 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {existsSync} from 'node:fs';
 import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
@@ -46,18 +45,27 @@ const REAL_LOG = process.env.ROTORLENS_REAL_LOG;
 const realLogSkip = !REAL_LOG && 'set ROTORLENS_REAL_LOG to a .bbl path to run this';
 
 /**
- * The other three sample logs sit beside the reference one and are not in the
- * repository. Found by name rather than by a second environment variable; each
- * test that needs them skips loudly when they are absent rather than passing
- * on an empty list.
+ * Every owner-supplied firmware log configured for this run: the reference
+ * flight plus the semicolon-separated ROTORLENS_CORPUS_LOGS, the same two
+ * variables `blackbox-real-firmware.test.mjs` reads and holds to decoding
+ * cleanly. Chosen by what the decoder accepts as firmware output, never by
+ * file name.
+ *
+ * File names chose them once. This test used to read three `sample-*.bbl`
+ * files that sit beside the reference log, on the belief that they were real
+ * logs without a collective column. They are simulator output: no
+ * `Field I signed` header, which every Rotorflight build writes, and a
+ * firmware revision real firmware never emits. The decoder refuses both, so
+ * each came back as an empty session and the test failed on NO_SAMPLES —
+ * from the first public release onwards, because it only runs where those
+ * private files exist.
  */
-const SIBLING_LOGS = ['sample-clean-tuned.bbl', 'sample-governor-sag.bbl', 'sample-vibration-problem.bbl'];
-const siblingPaths = REAL_LOG
-  ? SIBLING_LOGS.map(name => path.join(path.dirname(REAL_LOG), name)).filter(file => existsSync(file))
-  : [];
-const siblingSkip = siblingPaths.length === SIBLING_LOGS.length
-  ? false
-  : `needs ${SIBLING_LOGS.join(', ')} beside ROTORLENS_REAL_LOG`;
+const CORPUS_LOGS = [...new Set([
+  REAL_LOG,
+  ...(process.env.ROTORLENS_CORPUS_LOGS ?? '').split(';')
+].filter(Boolean).map(file => path.resolve(file)))];
+const corpusSkip = CORPUS_LOGS.length === 0
+  && 'set ROTORLENS_REAL_LOG or ROTORLENS_CORPUS_LOGS to owner-approved .bbl paths';
 
 async function decodeFile(file) {
   return decodeLog(new Uint8Array(await readFile(file))).sessions[0];
@@ -748,19 +756,126 @@ test('the reference flight window built from records matches the one built from 
   assert.equal(fromRecords.basis, fromSession.basis);
 });
 
-test('logs with no collective column keep the whole recording', {skip: siblingSkip}, async () => {
-  for (const file of siblingPaths) {
-    const session = await decodeFile(file);
-    const window = detectFlightWindow(session);
-
-    assert.equal(window.basis, FlightWindowBasis.NO_COLLECTIVE, path.basename(file));
-    assert.equal(window.coverageRatio, 1, path.basename(file));
-    assert.equal(window.trimmed, false, path.basename(file));
-    assert.equal(window.resolved.collective, null, path.basename(file));
-    assert.equal(window.resolved.headspeed, 'headspeed', path.basename(file));
-    assert.equal(((window.endUs - window.startUs) / 1e6).toFixed(4), '14.9995', path.basename(file));
+/**
+ * A real session as the decoder would hand it back had the firmware never
+ * written a collective: every collective spelling removed from the field table
+ * AND from every sample row, the remaining fields renumbered. Hiding the name
+ * while the column stayed in place would test a shape no log has.
+ */
+function withoutCollective(session) {
+  const dropped = new Set(session.fields
+    .filter(field => FIELD_MAP.collective.includes(field.name))
+    .map(field => field.index));
+  if (dropped.size === 0) {
+    return {session, removed: false};
   }
+  const kept = session.fields.filter(field => !dropped.has(field.index));
+  return {
+    session: {
+      ...session,
+      fields: kept.map((field, index) => ({...field, index})),
+      samples: session.samples.map(row => kept.map(field => row[field.index]))
+    },
+    removed: true
+  };
+}
+
+/** Bases the detector can only reach after its rotor gate, on the collective. */
+const DECIDED_BY_COLLECTIVE = new Set([
+  FlightWindowBasis.DETECTED,
+  FlightWindowBasis.ENDED_IN_FLIGHT,
+  FlightWindowBasis.NO_LIFTOFF
+]);
+
+test('logs with no collective column keep the whole recording', {skip: corpusSkip}, async t => {
+  // No log we hold was written without a collective, so real flights are made
+  // into one: every decoded firmware session, before and after its collective
+  // is taken away. A session that genuinely lacks the column passes through
+  // unchanged and is held to the same rules.
+  let reachedNoCollective = 0;
+  let declinedEarlier = 0;
+  let loggedWithoutCollective = 0;
+  let sessionsSeen = 0;
+
+  for (const file of CORPUS_LOGS) {
+    const {sessions} = decodeLog(new Uint8Array(await readFile(file)));
+    for (const decoded of sessions) {
+      if (decoded.samples.length === 0) {
+        continue; // nothing to window; whether it decoded is the firmware test's call
+      }
+      sessionsSeen += 1;
+      const label = `${path.basename(file)} session ${decoded.index}`;
+      const intact = resolveFlightWindow(decoded);
+      const {session, removed} = withoutCollective(decoded);
+      if (!removed) {
+        loggedWithoutCollective += 1;
+      }
+      const window = resolveFlightWindow(session);
+      const timeIndex = session.fields.find(field => field.name === 'time').index;
+      const firstUs = session.samples[0][timeIndex];
+      const lastUs = session.samples[session.samples.length - 1][timeIndex];
+
+      // The whole recording, exactly, and no claim of a takeoff or a landing.
+      assert.equal(window.startUs, firstUs, `${label}: window does not open on the first sample`);
+      assert.equal(window.endUs, lastUs, `${label}: window does not close on the last sample`);
+      assert.equal(window.trimmed, false, label);
+      assert.equal(window.coverageRatio, 1, label);
+      assert.equal(window.takeoff.timeUs, null, `${label}: a takeoff was found with no collective`);
+      assert.equal(window.landing.timeUs, null, `${label}: a landing was found with no collective`);
+      assert.equal(window.sampleCount, session.samples.length, label);
+      assert.equal(window.resolved.collective, null, label);
+      assert.equal(window.resolved.headspeed, intact.resolved.headspeed, label);
+
+      // And it says why. Where the rotor gate passed, the missing collective is
+      // the reason; where an earlier gate already declined, removing a column
+      // that gate never read must not change its answer.
+      if (DECIDED_BY_COLLECTIVE.has(intact.basis)) {
+        assert.equal(window.basis, FlightWindowBasis.NO_COLLECTIVE, label);
+        reachedNoCollective += 1;
+      } else {
+        assert.equal(window.basis, intact.basis, label);
+        declinedEarlier += 1;
+      }
+    }
+  }
+
+  t.diagnostic(
+    `${sessionsSeen} firmware sessions: ${reachedNoCollective} fell back to ` +
+    `${FlightWindowBasis.NO_COLLECTIVE}, ${declinedEarlier} were declined by an earlier ` +
+    `gate, ${loggedWithoutCollective} were logged without a collective`
+  );
+  // A sweep in which nothing got past the rotor gate never reached the branch
+  // this test is named for, however many sessions it read.
+  assert.ok(
+    reachedNoCollective > 0,
+    `no configured session reached the collective step (${sessionsSeen} read), ` +
+      `so ${FlightWindowBasis.NO_COLLECTIVE} was never exercised`
+  );
 });
+
+test('the reference flight without its collective keeps the whole recording, from the session and from records',
+  {skip: realLogSkip}, async () => {
+    const decoded = await decodeFile(REAL_LOG);
+    // With its collective it is trimmed, so the whole-recording answer below is
+    // the missing column's doing and not a log that was never trimmed anyway.
+    assert.equal(resolveFlightWindow(decoded).trimmed, true);
+
+    const {session, removed} = withoutCollective(decoded);
+    assert.equal(removed, true);
+    const fromSession = resolveFlightWindow(session);
+    assert.equal(fromSession.basis, FlightWindowBasis.NO_COLLECTIVE);
+    assert.equal(fromSession.resolved.headspeed, 'headspeed');
+    assert.equal(fromSession.startUs, fromSession.logStartUs);
+    assert.equal(fromSession.endUs, fromSession.logEndUs);
+
+    const {records, usable} = buildAnalysisRecords(session, {axis: 'roll'});
+    assert.equal(usable, true);
+    const fromRecords = detectFlightWindow({records});
+    assert.equal(fromRecords.basis, FlightWindowBasis.NO_COLLECTIVE);
+    assert.equal(fromRecords.startUs, fromSession.startUs);
+    assert.equal(fromRecords.endUs, fromSession.endUs);
+    assert.equal(fromRecords.resolved.collective, null);
+  });
 
 test('the stop fixture is not trimmed, so no stop can be lost to the window', async () => {
   // The fixture opens with the head already at speed, which is the shape that

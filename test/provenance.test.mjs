@@ -203,9 +203,11 @@ test('nothing third-party is bundled without a notice', async () => {
 
 test('every artifact the APK carries is recorded in the notices', async () => {
   // The declared list is not the shipped list. One `implementation` line pulls in
-  // twenty-seven other artifacts from three further copyright holders, and
-  // Apache-2.0 attribution attaches to what is distributed. So this checks the
-  // resolved classpath, recorded by `gradlew :app:recordShippingDependencies`.
+  // every other artifact the snapshot lists, from three further copyright
+  // holders, and Apache-2.0 attribution attaches to what is distributed. So this
+  // checks the resolved classpath, recorded by
+  // `gradlew :app:recordShippingDependencies`. (How many is not restated here;
+  // the test below derives it from the snapshot.)
   const snapshot = await readJson('android/shipping-dependencies.json');
   const notices = await readFile(path.join(projectRoot, 'THIRD_PARTY_NOTICES.md'), 'utf8');
 
@@ -224,6 +226,71 @@ test('every artifact the APK carries is recorded in the notices', async () => {
       listed.has(component),
       `${component} ships in the APK but has no entry in THIRD_PARTY_NOTICES.md`
     );
+  }
+});
+
+/**
+ * A count as prose writes it: digits, or English words up to ninety-nine.
+ * Anything else is null, so "Maven artifacts" or "GPL artifacts" is skipped
+ * rather than misread as a number.
+ */
+function proseNumber(word) {
+  if (/^\d+$/.test(word)) {
+    return Number(word);
+  }
+  const units = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight',
+    'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
+    'seventeen', 'eighteen', 'nineteen'];
+  const tens = {twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70,
+    eighty: 80, ninety: 90};
+  const lower = word.toLowerCase();
+  if (units.includes(lower)) {
+    return units.indexOf(lower);
+  }
+  const [ten, unit, extra] = lower.split('-');
+  if (extra !== undefined || !Object.hasOwn(tens, ten)) {
+    return null;
+  }
+  if (unit === undefined) {
+    return tens[ten];
+  }
+  const digit = units.indexOf(unit);
+  return digit >= 1 && digit <= 9 ? tens[ten] + digit : null;
+}
+
+test('every sentence that counts the shipped artifacts agrees with the snapshot', async () => {
+  // These were all written by hand and went stale together when the Kotlin pin
+  // dropped kotlin-stdlib-common: the snapshot said 27 while two headers still
+  // said twenty-eight, and nothing failed. The count is derived here from the
+  // same snapshot the notices are checked against, so the next change to the
+  // shipped set fails on every sentence it falsifies.
+  const shipped = (await readJson('android/shipping-dependencies.json')).components.length;
+  assert.ok(shipped > 0, 'an empty snapshot would make every count below trivially wrong');
+  assert.equal(proseNumber('twenty-seven'), 27, 'the number reader must read the words used');
+  assert.equal(proseNumber('Maven'), null);
+
+  for (const file of [
+    'THIRD_PARTY_NOTICES.md',
+    'android/README.md',
+    'ui/legal.mjs',
+    'tools/generate-legal.mjs'
+  ]) {
+    // A wrapped sentence is joined back up, comment gutters and all.
+    const text = (await readFile(path.join(projectRoot, file), 'utf8'))
+      .replace(/[ \t]*\r?\n[ \t]*(?:\*[ \t]+|\/\/[ \t]*)?/g, ' ');
+    const counts = [...text.matchAll(/\b([A-Za-z]+(?:-[a-z]+)?|\d+)\s+(other\s+)?artifacts\b/g)]
+      .map(match => ({phrase: match[0], value: proseNumber(match[1]), other: Boolean(match[2])}))
+      .filter(count => count.value !== null);
+
+    assert.ok(counts.length > 0,
+      `${file} no longer states how many artifacts ship; if that was deliberate, `
+      + 'take it off this list rather than leave the check reading nothing');
+    for (const count of counts) {
+      // "N other artifacts" is what the one declared dependency brings with it.
+      assert.equal(count.value + (count.other ? 1 : 0), shipped,
+        `${file} says "${count.phrase}", but android/shipping-dependencies.json `
+        + `lists ${shipped} artifacts`);
+    }
   }
 });
 
