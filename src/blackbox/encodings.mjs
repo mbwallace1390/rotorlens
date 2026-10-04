@@ -69,11 +69,14 @@ function decodeTag8_8SVB(reader, count) {
     // This encoding is in the silent-permutation class too, which is not
     // obvious and was initially got wrong in the other direction. Reversing the
     // bits *within the group* preserves their popcount, so exactly the same
-    // number of varints is read and the stream stays aligned: on the real 4.6
-    // log a reversed order still gives 134,429 samples, 1 error and 525 resync
-    // bytes — bit-identical. Only continuity separates them (altitude becomes
-    // infinite and rssi 29.6x; on a third-party log axisI[0] hits 158.9x),
-    // against a worst case of 1.16x in this order.
+    // number of varints is read and the stream stays aligned: measured on the
+    // real 4.6 log on 12 August 2026, a reversed order still gave 134,429
+    // samples, 1 error and 525 resync bytes — bit-identical to this order as it
+    // decoded then (that error was the cut final frame, reported as `truncated`
+    // with no resync since 3 October 2026). Only continuity separates them
+    // (altitude becomes infinite and rssi 29.6x; on a simulator file the decoder
+    // now refuses, axisI[0] read 158.9x), against a worst case of 1.16x in this
+    // order.
     values[index] = (present & (1 << index)) === 0 ? 0 : reader.signedVB();
   }
   return values;
@@ -121,9 +124,11 @@ function decodeTag2_3S32(reader, count) {
       //
       // Permuting the three widths leaves their sum unchanged, so the group
       // consumed the right number of bytes either way: sample count (134,429),
-      // error count (1) and resync bytes (525) on the real 4.6 log were
-      // bit-identical, and our writer packed it the same wrong way so round-trip
-      // agreed with itself. No round-trip test can ever settle a slot order.
+      // error count (1) and resync bytes (525) on the real 4.6 log, as it decoded
+      // on 12 August 2026, were bit-identical (that one error, the cut final
+      // frame, has been reported as `truncated` with no resync since 3 October
+      // 2026), and our writer packed it the same wrong way so round-trip agreed
+      // with itself. No round-trip test can ever settle a slot order.
       //
       // WHAT IS MEASURED, AND WHAT IS NOT. Of the six possible width-slot
       // permutations, the logs we hold separate this order from FOUR of them:

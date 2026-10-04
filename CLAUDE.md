@@ -70,8 +70,10 @@ transfer is indistinguishable from a violation.
 ## The decoder
 
 `src/blackbox/` is ours, written from the log format. Verified against a real
-Rotorflight 4.6.0 flight: 134,429 samples, zero errors, 993 µs median interval
-with no outliers.
+Rotorflight 4.6.0 flight: 134,429 samples, no errors in the body of the log,
+993 µs median interval with no outliers. The capture stops part-way through its
+last frame, with erased flash after it; since 3 October 2026 that is reported as
+one `truncated` error, not as damage.
 
 **Understand exactly what that sentence does and does not claim.** Every number
 in it is about the frame stream staying aligned, and TAG8_4S16 was decoded from
@@ -92,9 +94,9 @@ carries a delta, so a field decoded wrongly drifts and snaps back on a fixed
 README or store copy without a log for each version claimed.
 `docs/BLACKBOX_FORMAT_NOTES.md` records exactly which encodings and predictors
 real firmware has exercised and which are still round-trip only, plus event type
-51, deliberately left unimplemented because no log we hold contains one — an
-unknown event resyncs loudly, a known one with the wrong length silently
-misreads every frame after it.
+51, which no log we hold contains, so its payload is taken from the pinned 4.6
+firmware serializer rather than measured — an unknown event resyncs loudly, a
+known one with the wrong length silently misreads every frame after it.
 
 Check any log with `npm run verify:log -- <path>`.
 
@@ -210,13 +212,21 @@ class rather than treating one private handset model as the supported matrix.
 
 ## Where this actually stands
 
-Read this before believing any plan. Written 2026-08-13.
+Read this before believing any plan. Written 2026-08-13; figures re-measured
+and corrected 2026-10-03.
 
-**The engine has never produced a gain verdict on a real flight.** Across 110
-real sessions on three boards and two aircraft: zero roll or pitch stop events,
-nine yaw stops over six sessions, and not one gain finding of any kind. Every
-gain card that has ever rendered came from a synthetic fixture. The blocking
-item is not code — it is one deliberate sortie, described in
+**The engine has never told a pilot to change a gain on a real flight.** Across
+110 real sessions: zero roll or pitch stop events, nine yaw stops over six
+sessions, and not one adjustment of any kind. Exactly what was counted: the
+headers carry three craft-name-and-board combinations (1, 36 and 73 sessions)
+on two board models, which `corpus:report` counts as three aircraft. This file
+has said "three boards and two aircraft" since it was written; a header carries
+no serial number, so whether two of those combinations are one airframe with a
+replaced board cannot be read from the logs — owner to confirm. The only
+gain-rung findings are on the I term, one flight-axis each: an I-term
+all-clear (`I_TERM_WITHIN_TOLERANCE`) and `SLOW_WANDER_NOT_FROM_THE_I_TERM`.
+Every gain adjustment card that has ever rendered came from a synthetic fixture.
+The blocking item is not code — it is one deliberate sortie, described in
 `docs/PILOT_GUIDE.md`, flown with `gyroRAW` enabled and one governor setting.
 
 **Two shipped gates could never open, and both were found by volume rather than
@@ -225,7 +235,15 @@ ever observed on a flight-axis is 4, so all 310 same-aircraft pairs returned
 not-enough-evidence and the comparison had never once fired. And the 0.39 deg/s
 noise floor is a POOLED statistic applied per axis: measured per-axis it is roll
 0.915, pitch 1.390, yaw 0.0966, so it is ~4x too loose on yaw and 2.4-3.6x too
-tight on roll and pitch. Neither is fixed.
+tight on roll and pitch. The floor is fixed where the app gates a comparison: no
+per-axis gate in the app uses the pooled 0.39 any more — `compareFlightRecords`
+gates each axis on its own `SENSITIVITY_FLOOR_DPS` value (roll 0.92, pitch 1.39,
+yaw 0.1). The pooled 0.39 survives as a gate only in `compareHoldEvidence`, which
+only the GPL fork's bundle calls. Until 3 October 2026 the app also printed it,
+as the floor sentence under a comparison where no gain changed or that was
+refused; `describeNoiseFloor` now quotes each axis's own floor there instead.
+The hold gate is not fixed: re-measured 2026-10-03, the most holds on any
+flight-axis is still 4, and 0 of 93 flight-axes reach 5.
 
 **The Android memory cap is not solved.** Lazy decoding cut opening a 125 MiB
 dump from 6.2 s to 40 ms, but the file's own bytes must now stay resident, so

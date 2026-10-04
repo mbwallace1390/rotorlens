@@ -31,21 +31,28 @@
  * A field must move at least this much per I frame before a ratio means anything.
  *
  * A ratio is a quotient of two tiny numbers when a field barely moves, and then
- * it says nothing: a monotonic ESC capacity counter that ticks 28 times in a
- * whole flight reads 1.59x, and a field whose entire range is 0..5 and which
- * moves five times in 30,000 samples reads 7.75x. Both are arithmetic, not
- * evidence. 0.05 counts per I frame excludes those while keeping every field
- * that carried a real defect: the smallest was axisP[1] at 0.165.
+ * it says nothing. Measured on real logs, 2026-10-03: the reference flight's ESC
+ * capacity counter (EscCap) moves 0.0067 counts per I frame and reads 1.59x, and
+ * in one session of a real dump the MCU temperature (Tmcu), whose whole range is
+ * 36..39 and which changes five times in 91,850 samples, reads 7.75x. Both are
+ * arithmetic, not evidence. 0.05 counts per I frame excludes those while keeping
+ * every field that carried a real defect: the smallest was axisP[1] at 0.165.
+ * (The 7.75x example used to be a 0..5 field in 30,000 samples, measured on a
+ * simulator file the decoder now refuses; see docs/BLACKBOX_FORMAT_NOTES.md.)
  */
 const DEFAULT_MOVEMENT_FLOOR = 0.05;
 
 /**
  * Ratio at or above which a field is called out. Correct decoding sits near 1.
  *
- * Measured margin: across the real 4.6 log and three third-party logs — 224,429
- * samples in total — the worst correctly decoded field above the movement floor
- * reads 1.16x. The defects read 33x, 17.9x, 5.0x and 2.2x. 2.0 sits in the empty
- * band between those two populations.
+ * Measured margin on the real 4.6 reference log (134,429 samples): the worst
+ * correctly decoded field above the movement floor reads 1.16x. The defects read
+ * 33x, 17.9x, 5.0x and 2.2x. 2.0 sits in the empty band between those two
+ * populations on that log. (This said 224,429 samples across four logs until
+ * 2026-10-03; the other three were simulator files, not firmware output.) The
+ * two real dumps do not show the same empty band: 32 of their 109 sessions have
+ * a field above the movement floor at 2x or more, not yet investigated — see
+ * docs/BLACKBOX_FORMAT_NOTES.md.
  */
 const DEFAULT_RATIO_THRESHOLD = 2;
 

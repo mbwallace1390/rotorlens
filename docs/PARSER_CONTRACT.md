@@ -35,16 +35,29 @@ Minimum `ParserReport` shape:
 }
 ```
 
-The runtime validator requires only the version, engine identity/license,
-sessions, firmware type, and field names. Duration, units, sample counts,
-events, time series, spectra, and diagnostics are optional future extensions.
+The runtime validator (`validateParserReport` in `src/parser-contract.mjs`)
+requires only the contract version, the engine's name, version and license, a
+sessions array, each session's non-negative integer `index`, a `firmware` object
+with a `type`, and a `fields` array whose entries have a `name`. Everything else
+is optional.
+
+The shipped adapter, `blackboxAdapter` in `src/blackbox/decode.mjs`, also
+returns each session's `firmware.version` where the revision contains one,
+`craftName`, each field's `index`, `signed` and `sampleCount`, and the session's
+decode `errors`. Duration, units, events, time series, spectra, and other
+diagnostics are optional future extensions.
 
 ## Rules
 
 - Inputs are immutable bytes; an adapter must not receive filesystem authority.
 - Decode errors are data, not crashes. The adapter should return typed error
   codes for unsupported firmware, corrupt headers, truncated frames, and memory
-  limits.
+  limits. The shipped adapter uses the codes in `src/blackbox/errors.mjs`:
+  `unsupported-firmware`, `corrupt-header`, `corrupt-frame`, `truncated`,
+  `unsupported-encoding`, `unsupported-predictor` and `limit-exceeded`. A
+  `limit-exceeded` error names its `resource`, including `cell` for the
+  decoded-value budget; a `truncated` error whose capture ran into erased flash
+  carries `erasedBytes`.
 - Raw personal metadata must not leave the device without explicit user action.
 - UI code must not depend directly on Rust/WASM object layouts.
 - Contract changes require fixtures and a version bump.

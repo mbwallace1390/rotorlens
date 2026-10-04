@@ -131,10 +131,18 @@ function draw(LEGAL, platform = resolvePlatform()) {
     <p class="muted" id="legal-source-status" style="font-size:12.5px;margin:0 0 4px">
       ${esc(LEGAL.project.sourceStatus)}
     </p>
-    <p class="muted" style="font-size:12.5px;margin:0 0 14px">
+    <p class="muted" style="font-size:12.5px;margin:0 0 4px">
       Official repository:
       <a id="legal-repository" href="${esc(LEGAL.project.repository)}" target="_blank"
          rel="noreferrer noopener">${esc(LEGAL.project.repository)}</a>
+    </p>
+    <p class="muted" style="font-size:12.5px;margin:0 0 4px">
+      ${esc(LEGAL.privacyPolicy.label)}:
+      <a id="legal-privacy-policy" href="${esc(LEGAL.privacyPolicy.url)}" target="_blank"
+         rel="noreferrer noopener">${esc(LEGAL.privacyPolicy.url)}</a>
+    </p>
+    <p class="muted" id="legal-links-note" style="font-size:12.5px;margin:0 0 14px">
+      ${esc(LEGAL.linksNote)}
     </p>
 
     <h3 style="margin-top:0">${esc(LEGAL.disclaimer.title)}</h3>

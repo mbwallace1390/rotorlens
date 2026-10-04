@@ -38,7 +38,7 @@ import {fileURLToPath} from 'node:url';
 const APP_PATH = fileURLToPath(new URL('../ui/app.mjs', import.meta.url));
 
 /**
- * The relationships measured on the reference log, `sample-bell-222ut.bbl`
+ * The relationships measured on the private reference log
  * (Rotorflight 4.6.0, 134429 samples). Recorded here as numbers so the
  * derivation below runs on measurements rather than on prose.
  *

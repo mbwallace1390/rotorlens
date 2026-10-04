@@ -38,8 +38,8 @@
  * CANDIDATES THAT WERE MEASURED AND REJECTED
  * ---------------------------------------------------------------------------
  *
- * Recorded so nobody re-derives them. All figures from
- * `sample-bell-222ut.bbl`, whose detected liftoff is 22.762 s.
+ * Recorded so nobody re-derives them. All figures from the reference log,
+ * whose detected liftoff is 22.762 s.
  *
  * - **The log's own airborne event (type 52) as the window.** It is real
  *   firmware ground truth and it is not usable as a boundary. On the reference
@@ -57,15 +57,19 @@
  *
  * - **Barometric altitude.** Separates in the median (on-ground −138, in-flight
  *   +55) but its in-flight standard deviation is 20x its on-ground one and it
- *   swings 450 cm in the first two seconds of flight from rotor wash. Absent
- *   from three of the four logs we hold.
+ *   swings 450 cm in the first two seconds of flight from rotor wash. Every
+ *   one of the 110 real sessions we hold logs an `altitude` column, so the
+ *   noise is the objection, not absence. (This said "absent from three of the
+ *   four logs we hold" until 3 October 2026; those three were simulator files
+ *   that the decoder refuses, not firmware logs.)
  *
  * - **GPS.** The decoder now publishes satellite count, ground speed and GPS
  *   altitude (never coordinates), and on the reference log they cannot support
  *   a takeoff threshold: ground speed reads 53–75 cm/s while the machine sits
  *   on its skids at 14–21 s, `numSat` drops to 0 for a fourteen-fix stretch
  *   straddling the real liftoff, and GPS altitude drifts from 79 406 cm to
- *   4 321 cm as the fix converges. Three of the four logs carry no G frames.
+ *   4 321 cm as the fix converges. Of the 110 real sessions we hold, only the
+ *   reference log carries G frames.
  *
  * - **Throttle (`rcCommand[4]`).** Marks arming, not takeoff: 0 → 708 at s4 and
  *   1000 from s5, against a liftoff at 22.762 s.
@@ -79,11 +83,16 @@
  * WHAT THIS IS NOT
  * ---------------------------------------------------------------------------
  *
- * It is not a stationarity window. Three of the four logs we hold have no
- * collective column at all and correctly return the whole log; the tempting
- * fallback of "trim to where headspeed goes stationary" would delete two of
- * their eight injected manoeuvres, which all happen during the ramp. Keep the
- * per-range stationarity measurement where it lives.
+ * It is not a stationarity window. A log with no collective column, once the
+ * rotor gates have passed, returns the whole log as COLLECTIVE_NOT_LOGGED
+ * rather than falling back to "trim to where headspeed goes stationary", which
+ * would delete any manoeuvre flown while the head is still coming up to speed.
+ * The evidence first cited here — three logs with no collective, two of whose
+ * eight injected manoeuvres sat in the ramp — came from simulator files that
+ * the decoder now refuses. None of the 110 real sessions we hold lacks a
+ * collective, so `test/flight-window.test.mjs` exercises this path by removing
+ * the column from real sessions. Keep the per-range stationarity measurement
+ * where it lives.
  *
  * It also does not replace `sessionTimeBounds`, which means the whole recording
  * and must keep meaning that.

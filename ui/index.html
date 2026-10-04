@@ -864,23 +864,42 @@
   <div class="consent-card">
     <h2 id="consent-title">Help RotorLens get better at this?</h2>
 
-    <p>RotorLens can send the measurements from this flight &mdash; about 4 kB of numbers
-      &mdash; to help work out what normal looks like across many helicopters. It is how the
-      thresholds this app judges your aircraft against stop being guesses.</p>
+    <!-- "A future version", and "each real flight": this build cannot send, and
+         since 2 October 2026 the dialog opens from the sharing panel, where there
+         may be no flight on screen for "this flight" to name. "Real flight, not
+         bench runs or spool-ups" is the designed scope (docs/SHARED_CORPUS_DESIGN.md
+         section 3): only flights that pass checkFlightAdmissible would be sent,
+         so "each flight you open" overstated it. "About 2.5 kB" is the
+         figure the panel prints beside the payload (compact, as it would be
+         sent): 2,560 bytes for the shared record of a real 4.6 flight, and 2,617
+         with every empty field filled. This said 4 kB, which disagreed with the
+         panel; only the indented copy on screen (about 3.7 kB) comes near it. -->
+    <p>A future version of RotorLens could send the measurements from each real flight you
+      open (never a bench run or a spool-up) &mdash; about 2.5 kB of numbers &mdash; to help
+      work out what normal looks like across many helicopters. It is how the thresholds this
+      app judges your aircraft against stop being guesses.</p>
 
     <p><b>Your log never leaves your phone.</b> What would be sent is the same handful of
       numbers the app already keeps: your gains, how well each axis tracked, head speed, and
       how much vibration was measured. Never the log, never your location, never a date, never
       a file name, and never your helicopter&rsquo;s name.</p>
 
-    <p>You can see everything that has been sent, and delete all of it, at any time.</p>
+    <!-- The design's promise, kept for the day sending exists rather than stated
+         in the present tense: in this build nothing has been sent, so "you can
+         see everything that has been sent" described a view of nothing. -->
+    <p>The Shared measurements panel shows exactly what would be sent, and can erase your
+      choice and the identities at any time. If a future version ever sends anything, you
+      will be able to see everything that has been sent, and delete all of it.</p>
 
     <!-- The honest state of the thing being agreed to. Not in the design's
          wording, because that document describes the world after the transport
          exists; this build has none, and a dialog that let somebody believe
-         otherwise would be the one lie this whole feature cannot afford. -->
+         otherwise would be the one lie this whole feature cannot afford.
+         Worded for every platform: the missing INTERNET permission is an
+         Android fact, and iOS has no such permission to be missing. -->
     <p class="consent-nothing"><b>Nothing is sent yet, and this version cannot send.</b>
-      RotorLens has no INTERNET or sensitive platform permission. Saying yes records your choice and
+      There is no upload code in this app. On Android, the missing INTERNET permission is an
+      additional operating-system barrier. Saying yes records your choice and
       creates a random local identity for each saved helicopter; nothing is sent.</p>
 
     <!-- Visually separated, deliberately. Two agreements are being made and they

@@ -1818,6 +1818,225 @@ test('a flight whose header is damaged says so instead of showing another flight
   });
 });
 
+test('a log from firmware the decoder does not open says which firmware it does, not "damaged"', {
+  skip: browserSkip
+}, async () => {
+  // The release audit of 2 October 2026 (public-claims #0): a healthy log from
+  // Rotorflight 4.7 — or 2.x, or Betaflight — is refused by the decoder as
+  // `unsupported-firmware`, correctly, and the screen then said its header block
+  // was DAMAGED and never said which firmware RotorLens reads. The day a newer
+  // Rotorflight ships, every pilot who updates would be told his log is broken.
+  //
+  // Two halves, and the first is what makes the second mean anything:
+  //
+  //   1. The range the page states is `READABLE_FIRMWARE`, exported by ui/app.mjs
+  //      because src/blackbox/decode.mjs does not export its own. So it is
+  //      checked against the REAL decoder here: a committed fixture is relabelled
+  //      across revisions in memory and decoded, and the minors decodeLog accepts
+  //      must be exactly the range the page will print. Widen either without the
+  //      other and this fails.
+  //   2. A relabelled log opened through the real file input must say "firmware
+  //      not supported", name its own revision and that range, and must not say
+  //      the header is damaged.
+  //
+  // Nothing is written to disk; every log here is the committed fixture with
+  // header bytes swapped in memory.
+  await withViewer({}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      const $ = id => document.getElementById(id);
+      const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+      const app = await import('/ui/app.mjs');
+      const {decodeLog} = await import('/src/blackbox/decode.mjs');
+      const {LEGAL} = await import('/ui/legal-data.mjs');
+      const {state} = app;
+
+      const good = new Uint8Array(await (await fetch('${TWO_SESSIONS}')).arrayBuffer());
+
+      // Every occurrence of one byte string swapped for another. The fixture's
+      // header lines are ASCII; the frames between them are left byte-for-byte.
+      const swap = (bytes, from, to) => {
+        const needle = new TextEncoder().encode(from);
+        const replacement = new TextEncoder().encode(to);
+        const out = [];
+        let hits = 0;
+        for (let index = 0; index < bytes.length;) {
+          let match = index + needle.length <= bytes.length;
+          for (let offset = 0; match && offset < needle.length; offset += 1) {
+            match = bytes[index + offset] === needle[offset];
+          }
+          if (match) {
+            for (const byte of replacement) out.push(byte);
+            index += needle.length;
+            hits += 1;
+          } else {
+            out.push(bytes[index]);
+            index += 1;
+          }
+        }
+        return {bytes: new Uint8Array(out), hits};
+      };
+      const REVISION = 'Rotorflight 4.6.0 (synthetic)';
+      const relabel = version => swap(good, REVISION, 'Rotorflight ' + version + ' (synthetic)');
+
+      // 1. What the real decoder opens, swept rather than assumed.
+      const probes = ['2.2.0', '3.9.0', '4.0.0', '4.1.0', '4.2.0', '4.3.0', '4.4.0', '4.5.0',
+        '4.6.0', '4.6.0-RC1', '4.7.0', '4.8.0', '4.9.0', '4.10.0', '5.0.0'];
+      const sweep = probes.map(version => {
+        const {bytes, hits} = relabel(version);
+        const session = decodeLog(bytes, {lazy: true}).sessions[0];
+        return {
+          version,
+          hits,
+          opened: session.fields.length > 0,
+          refused: (session.errors ?? []).some(error => error.code === 'unsupported-firmware')
+        };
+      });
+      const betaflight = swap(
+        swap(good, 'H Firmware type:Rotorflight', 'H Firmware type:Betaflight').bytes,
+        REVISION, 'Betaflight 4.5.1 (synthetic)').bytes;
+      const betaflightSession = decodeLog(betaflight, {lazy: true}).sessions[0];
+
+      // 2. A 4.7 log through the real file input, the way a pilot opens one.
+      const open = async (bytes, name) => {
+        // Each log below is told apart from the one before it by what its panel
+        // says, so waiting for a change cannot be satisfied by the previous one.
+        const before = $('session-issues').textContent;
+        const transfer = new DataTransfer();
+        transfer.items.add(new File([bytes], name));
+        const input = $('file');
+        input.files = transfer.files;
+        input.dispatchEvent(new Event('change'));
+        let opened = false;
+        for (let attempt = 0; attempt < 400; attempt += 1) {
+          const now = $('session-issues').textContent;
+          if (state.result && state.fileName === name && now.length > 0 && now !== before) {
+            opened = true;
+            break;
+          }
+          await sleep(25);
+        }
+        await sleep(200);
+        return {
+          opened,
+          listed: [...$('session').options].map(option => option.textContent),
+          issues: $('session-issues').textContent,
+          stats: $('session-stats').textContent,
+          sessionPanelUp: !$('session-panel').classList.contains('hidden'),
+          plotUp: !$('plot-panel').classList.contains('hidden')
+        };
+      };
+      const newer = await open(relabel('4.7.0').bytes, 'NEWER.BBL');
+
+      // A data version the decoder does not implement, on firmware it does: the
+      // sentence must not call Rotorflight 4.6.0 out of range.
+      const format = await open(swap(good, 'H Data version:2', 'H Data version:3').bytes,
+        'FORMAT.BBL');
+
+      // A dump holding a readable flight AFTER a refused one: the refused one is
+      // shown first, and the page says the other can still be opened.
+      const mixedBytes = relabel('4.7.0').bytes;
+      const mixed = new Uint8Array(mixedBytes.length + good.length);
+      mixed.set(mixedBytes, 0);
+      mixed.set(good, mixedBytes.length);
+      const dump = await open(mixed, 'MIXED.BBL');
+
+      return JSON.stringify({
+        readable: app.READABLE_FIRMWARE,
+        nonAffiliation: LEGAL.nonAffiliation,
+        sweep,
+        betaflightOpened: betaflightSession.fields.length > 0,
+        betaflightRefused: (betaflightSession.errors ?? [])
+          .some(error => error.code === 'unsupported-firmware'),
+        newer,
+        format,
+        dump
+      });
+    })()`);
+
+    // 1. The page's range against the decoder's behaviour.
+    const {firmware, major, firstMinor, lastMinor} = run.readable ?? {};
+    assert.equal(firmware, 'Rotorflight', 'ui/app.mjs must export READABLE_FIRMWARE');
+    for (const probe of run.sweep) {
+      assert.ok(probe.hits >= 1, `the fixture's revision line was not found for ${probe.version}`);
+      const [probeMajor, probeMinor] = probe.version.split('.').map(Number);
+      const inRange = probeMajor === major && probeMinor >= firstMinor && probeMinor <= lastMinor;
+      assert.equal(probe.opened, inRange,
+        `the decoder ${probe.opened ? 'opens' : 'refuses'} Rotorflight ${probe.version}, but the `
+        + `page tells pilots it opens ${major}.${firstMinor} to ${major}.${lastMinor}. Change both `
+        + 'together.');
+      assert.equal(probe.refused, !inRange,
+        `Rotorflight ${probe.version} must be refused as unsupported-firmware exactly when it is `
+        + 'outside the stated range');
+    }
+    assert.equal(run.betaflightOpened, false, 'a Betaflight log is not something RotorLens opens');
+    assert.equal(run.betaflightRefused, true);
+
+    const range = `${firmware} ${major}.${firstMinor} to ${major}.${lastMinor}`;
+
+    // Accepting a range is not verifying it. The minors a real log has been
+    // decoded from must sit inside the range, and both places that state the
+    // range must say how little of it real logs have checked.
+    const {checkedMinors} = run.readable;
+    assert.ok(Array.isArray(checkedMinors) && checkedMinors.length > 0,
+      'READABLE_FIRMWARE must say which minors real logs have verified');
+    for (const minor of checkedMinors) {
+      assert.ok(minor >= firstMinor && minor <= lastMinor,
+        `${major}.${minor} is called verified but the decoder does not open it`);
+    }
+    const checked = `${firmware} ${checkedMinors.map(minor => `${major}.${minor}`).join(', ')}`;
+    const qualifier = `only ${checked} has been checked against real logs`;
+
+    // About & Legal says which logs RotorLens opens too (tools/generate-legal.mjs),
+    // and it may not say a different range from the one checked above.
+    assert.ok(run.nonAffiliation.includes(`opens Blackbox logs written by ${range}`),
+      `About & Legal states a different range from the decoder's: "${run.nonAffiliation}"`);
+    assert.ok(run.nonAffiliation.includes(qualifier),
+      `About & Legal must not present the accepted range as verified: "${run.nonAffiliation}"`);
+
+    // 2. The 4.7 log.
+    assert.equal(run.newer.opened, true, 'the relabelled log never opened');
+    assert.match(run.newer.listed[0], /firmware not supported/,
+      `the picker offers a refused flight as "${run.newer.listed[0]}"`);
+    assert.doesNotMatch(run.newer.listed[0], /cannot be read/);
+    assert.match(run.newer.issues, /firmware not supported/);
+    assert.ok(run.newer.issues.includes(`opens logs from ${range} only`),
+      `the panel must state the range it opens: "${run.newer.issues}"`);
+    assert.ok(run.newer.issues.includes(qualifier),
+      `the panel must not present the accepted range as verified: "${run.newer.issues}"`);
+    assert.ok(run.newer.issues.includes('recorded by Rotorflight 4.7.0'),
+      `the panel must name this log's own firmware: "${run.newer.issues}"`);
+    assert.doesNotMatch(run.newer.issues, /header block is damaged/i,
+      'a healthy log from newer firmware is told its header is damaged');
+    assert.match(run.newer.issues, /not necessarily damaged/);
+    assert.doesNotMatch(run.newer.issues, /can still be opened/,
+      'both flights in this file are refused, so there is no other flight to open');
+    assert.equal(run.newer.sessionPanelUp, true);
+    assert.equal(run.newer.plotUp, false, 'a refused flight has nothing to plot');
+
+    // The data-version refusal names the format, not the firmware.
+    assert.equal(run.format.opened, true, 'the data-version log never opened');
+    assert.match(run.format.issues, /firmware not supported/);
+    assert.match(run.format.issues, /Blackbox format RotorLens does not read/);
+    assert.match(run.format.issues, /data version/,
+      'the decoder\'s own reason must be quoted for a format refusal');
+    assert.doesNotMatch(run.format.issues, /recorded by Rotorflight 4\.6\.0/,
+      'Rotorflight 4.6.0 is inside the range; the refusal was the data version');
+    assert.ok(run.format.issues.includes(`opens logs from ${range} only`));
+
+    // The mixed dump: one refused, one readable after it.
+    assert.equal(run.dump.opened, true, 'the mixed dump never opened');
+    assert.equal(run.dump.listed.length, 4, `the mixed dump lists ${run.dump.listed.length} flights`);
+    assert.match(run.dump.listed[0], /firmware not supported/);
+    assert.match(run.dump.listed[2], /not opened yet/,
+      'the readable flight after a refused one must still be offered');
+    assert.match(run.dump.issues, /can still be opened from the list above/);
+
+    // The damaged-header wording stays for a damaged header; see the test above.
+    assert.deepEqual(pageErrors, [],
+      `opening a refused flight threw in the page: ${JSON.stringify(pageErrors)}`);
+  });
+});
+
 /**
  * In-page helpers shared by the tests below. Plain text spliced into each
  * `evaluate` body, so every test drives the same real controls the same way.

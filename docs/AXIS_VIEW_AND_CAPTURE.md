@@ -11,7 +11,8 @@ Axis and Tune evidence panels in `ui/`.
 Every conclusion the tune evidence can reach is gated behind a manoeuvre. Stop
 evidence needs a command released cleanly to centre; hold evidence needs a steady
 segment. Most flights contain neither, and the reference flight —
-a scale Bell 222UT, 133.5 s, 134,429 samples, decoded with zero errors — contains
+a scale Bell 222UT, 133.5 s, 134,429 samples, decoded with no errors in the body
+of the log (the capture ends part-way through its last frame) — contains
 **no qualifying stop on roll or pitch at all**, because the largest roll command
 in it is 56 °/s and the largest pitch command is 32 °/s against an 80 °/s
 threshold.
@@ -82,7 +83,13 @@ which is uncapped, rather than from `candidates`, which stops at
 `maximumEvents * 8`.
 
 `describeHoldCapture` does the same for hold evidence, from
-`rejectedHoldCounts`.
+`rejectedHoldCounts`. The number of holds it asks for is
+`HOLDS_FOR_A_FULL_READING` in `src/analysis/pid-evidence.mjs`: three since
+3 October 2026, the larger of the two holds a capture needs and the three a
+standing error needs before the I rung will read one
+(`EVIDENCE_LIMITS.minimumHoldsForStandingError`). Every count of holds the copy
+asks a pilot to fly comes from that one constant, so the brief cannot ask for
+fewer than the recommendation will use.
 
 Every refusal code becomes a sentence about the signal —
 `RELEASE_DWELL` reads "the command paused part-way back to centre instead of
@@ -207,18 +214,28 @@ and only where the gates pass.
   one stop per direction there is no within-direction spread to compare the
   between-direction gap against, so a single noisy release *is* the result.
 - It does not write to a flight controller. Nothing else does either: there is no
-  write path anywhere in the product, and the Android shell declares no
-  permissions at all, so it could not if it tried.
+  write path anywhere in the product. No module under `src/` reaches for a
+  serial, USB, Bluetooth or HID transport (`test/axis-report.test.mjs`), and the
+  Android shell's Java contains no USB connection code (`test/provenance.test.mjs`).
+  That absence is the guarantee, not a missing permission: the shell requests no
+  `INTERNET` or sensitive runtime permission, but its USB-attach filter would let
+  it talk to the device that launched it, and it never does.
 
-### The pending copy fix on this panel
+### The copy fix on this panel, and what is left of it
 
-Every brief still renders *"…RotorLens does not tell you what to change, and
-never writes to a flight controller."* The second clause is permanent. **The
-first clause is now false as a statement about the product** and has to become a
-statement about this panel — something to the effect that the numbers above are
-measurements, and that what to change, when the evidence supports saying so,
-appears in the recommendation panel with its basis attached. The same sentence
-exists twice in `src/analysis/axis-report.mjs` (stop and hold briefs) and twice
-in `ui/app.mjs`. The test asserts the never-writes half and the panel-scoping
-half, and deliberately does not pin the stale clause, so fixing it will not fail
-the build.
+Every brief used to render *"…RotorLens does not tell you what to change, and
+never writes to a flight controller."* The second clause is permanent. The first
+stopped being true of the product on 12 August 2026, and **the panel no longer
+prints it**: `ui/app.mjs` renders its own `MEASUREMENT_BOUNDARY` in place of
+`brief.boundary` — the numbers are measurements of the flight window, the
+recommendation is at the top of the page, and RotorLens never writes to a flight
+controller — and `test/ui-browser.test.mjs` fails if any panel on the page still
+denies advising.
+
+On 3 October 2026 the engine string was corrected too. `describeStopCapture` and
+`describeHoldCapture` in `src/analysis/axis-report.mjs` now end their `boundary`
+string by saying the panel is a measurement and that advice appears in the
+"What to change" panel; nothing in `ui/` renders that field.
+`test/blackbox-stop-fixture.test.mjs` pins the new wording and asserts the old
+"does not tell you what to change" clause is gone, and `test/axis-report.test.mjs`
+still keeps the module free of instruction words.

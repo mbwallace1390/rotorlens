@@ -176,11 +176,13 @@ export function buildAnalysisRecords(session, options = {}) {
 //
 // Every threshold below is a physical claim about how a helicopter's command
 // signal behaves, and each one names the measurement it came from. They were
-// calibrated against ONE flight: `sample-bell-222ut.bbl`, a scale Bell 222UT on
+// calibrated against ONE flight: the reference log, a scale Bell 222UT on
 // Rotorflight 4.6.0 (FRSK VANTAC_RF007, STM32F7X2), 134,429 samples spanning
 // 80.98 s to 214.51 s of log time at a 993 µs median interval (min 987, max
-// 1000). Decode is clean: 4,201 I frames, 130,228 P frames, 0 rejected frames,
-// and a single corrupt-frame error at the end of the file.
+// 1000). Decode is clean through the body: 4,201 I frames, 130,228 P frames, 0
+// rejected frames, 0 resync bytes, and one `truncated` error at the end of the
+// file, where the capture stops mid-frame and erased flash follows (reported as
+// a corrupt-frame error until 3 October 2026).
 //
 // RE-MEASURED against the fixed decoder. Before commit 1fca05f the TAG8_4S16
 // per-field width selectors were read from the wrong end of the lead byte,
@@ -209,8 +211,9 @@ export function buildAnalysisRecords(session, options = {}) {
 //
 // Two concatenated dumps were measured against every constant in this file: 36
 // sessions from an M4Max on an RDMS NEXUS_XR and 73 from an OMP4MAX on a FRSK
-// VANTAC_RF007, plus the reference flight. All 110 sessions decode, with one
-// trailing corrupt frame and one truncated session between them.
+// VANTAC_RF007, plus the reference flight. All 110 sessions decode, with two
+// truncated endings between them and no other error (the reference flight's
+// was reported as a trailing corrupt frame until 3 October 2026).
 //
 // 110 SESSIONS ARE NOT 110 FLIGHTS, and every figure below depends on the
 // difference. 77 of them carry a setpoint that is identically 0 on all three

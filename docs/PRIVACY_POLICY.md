@@ -1,16 +1,25 @@
 # RotorLens privacy policy
 
-**Effective 11 August 2026. Revised 15 August 2026** to distinguish the privacy
-protections supplied by each platform — see **Changes** at the end. This is the
-canonical text. The hosted copy at the URL given to the app stores is generated
-from this file, and the two must not drift — see
-`docs/STORE_PRIVACY_ANSWERS.md`.
+**Effective 11 August 2026. Revised 3 October 2026** to disclose the links on
+the About & Legal screen, and that the sharing question is no longer asked by
+itself — see **Changes** at the end. This is the canonical text, published at
+https://mbwallace1390.github.io/rotorlens/privacy-policy.html.
+
+<!--
+For maintainers, not published: that page is docs/privacy-policy.html, generated
+from this file by `npm run privacy:generate` and served by GitHub Pages from the
+docs folder on main. Never edit the HTML by hand; test/privacy-claims.test.mjs
+fails if the two drift. The store declarations resting on this policy are in
+docs/STORE_PRIVACY_ANSWERS.md.
+-->
 
 ## The short version
 
 **RotorLens collects nothing.** It has no account, no analytics, no advertising,
 no crash reporting, no upload transport, and makes no network requests. Your
-flight logs are read on your device, and they stay there.
+flight logs are read on your device, and they stay there. On Android, tapping a
+link on the About & Legal screen opens that page in your web browser; see
+**Links on the About & Legal screen**.
 
 RotorLens can remember a short summary of a flight so that a later flight can be
 compared against it. That summary is a few dozen numbers. It never includes the
@@ -123,11 +132,12 @@ history**. The separate sharing file is described next.
 
 ## The sharing preference and random aircraft identities
 
-After RotorLens has enough information to analyse a flight, it may ask whether
-you want to contribute small, privacy-filtered measurements in a future version.
-Answering either **Share** or **Not now** stores a separate `sharing.json` file in
-the app's private storage so the same question is not shown every time. This can
-happen before you save a flight.
+RotorLens does not ask about sharing by itself. The question appears only when
+you press **Share measurements** on the **Shared measurements** panel: it shows
+the terms and asks whether you want to contribute small, privacy-filtered
+measurements in a future version. Answering either **Share measurements** or
+**Not now** stores a separate `sharing.json` file in the app's private storage,
+so your answer is remembered. This can happen before you save a flight.
 
 That file contains:
 
@@ -142,16 +152,17 @@ That file contains:
 
 Turning sharing off does not erase an aircraft key or its random identity. Those
 mappings remain local so the same helicopter keeps the same identity if sharing
-is enabled again. They remain until you use **Erase identity**, **Forget
-helicopter**, or **Forget everything**. Uninstalling the app also removes them;
-on Android, **Clear storage** does too.
+is enabled again. They remain until you use **Erase the sharing identity**,
+**Forget this helicopter**, or **Forget everything**. Uninstalling the app also
+removes them; on Android, **Clear storage** does too.
 
 The random identity identifies one helicopter's records to RotorLens. It is not
 derived from the craft name, phone, advertising ID, account, email address, or
 anything about you. This version has no server or upload transport, so the
 preference and identities remain local even when sharing is enabled. On Android,
 the missing `INTERNET` permission is an additional operating-system barrier. The
-Sharing panel shows the state and can erase the identities and preference.
+**Shared measurements** panel shows the state and can erase the identities and
+preference.
 **Forget everything** erases this file as well as the flight history.
 
 ## How long the flight history is kept
@@ -191,13 +202,25 @@ distrust:
 
 ## Who your data is shared with
 
-Nobody. There is no server, no third-party service, and no transmission of any
-kind, so there is nothing to share, sell, or disclose.
+Nobody. There is no server, no third-party service, and RotorLens transmits
+nothing, so there is nothing to share, sell, or disclose.
+
+## Links on the About & Legal screen
+
+The About & Legal screen links to the RotorLens source repository, to this
+privacy policy at https://mbwallace1390.github.io/rotorlens/privacy-policy.html,
+and to the project page of each open-source component the app bundles. On
+Android, tapping any of those links hands that fixed `https` address to your web
+browser, which opens it as it would any other link. Only the addresses that
+screen shows can be opened this way, only when you tap one, and RotorLens adds
+nothing to the address and makes no request itself: the visit is your browser's,
+and the site you open sees it under that site's own privacy policy. The
+experimental iOS shell does not open these links.
 
 ## Third-party components
 
 The app bundles open-source libraries from the Android Open Source Project,
-JetBrains, and Google, listed in full on the app's **Legal** screen. They are
+JetBrains, and Google, listed in full on the app's **About & Legal** screen. They are
 software components inside the app, not services: none of them contacts a network
 on RotorLens' behalf, and the absence of the `INTERNET` permission would prevent
 it if one tried.
@@ -219,8 +242,9 @@ the same rights over them directly rather than through us:
   which you can copy. RotorLens writes no export file.
 - **Deletion** — forget one flight, one helicopter, or everything. There is no
   copy elsewhere to survive it.
-- **Sharing identity control** — the Sharing panel can erase its local identities
-  and preference without deleting flight history; Forget everything removes both.
+- **Sharing identity control** — the **Shared measurements** panel can erase its
+  local identities and preference without deleting flight history; Forget
+  everything removes both.
 
 If you are in the EU or UK, note that this means there is no controller holding
 your data and no international transfer, because the data never leaves your
@@ -240,6 +264,14 @@ version is released, and the store listings' data declarations will be updated
 with it. On Android, network transmission would additionally require adding a
 permission the app has deliberately never had. An iOS release must independently
 prove the same no-transmission outcome because iOS has no equivalent permission.
+
+**3 October 2026 — links you tap, and the sharing question.** On Android, a link
+tapped on the About & Legal screen now opens in your web browser; before, the tap
+did nothing. That screen now also links to this policy. RotorLens makes no
+request and adds nothing to the address, so nothing is collected and the store
+declarations are unchanged. RotorLens also no longer
+asks the sharing question by itself after analysing a flight; it appears only
+when you press **Share measurements**. Nothing about what is stored changed.
 
 **15 August 2026 — platform-specific network protection.** The policy now
 distinguishes the shared no-upload implementation from Android's stronger

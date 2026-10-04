@@ -31,8 +31,8 @@ that cannot.
 1. Plug the flight controller into the phone.
 2. Open the Rotorflight configurator, connect, go to the **Blackbox** tab.
 3. Tap **activate mass storage device mode**. The board reboots and appears as a
-   drive — and your phone should offer to open RotorLens. Tick the box on that
-   dialog and it will happen automatically from then on.
+   drive — and an Android phone should offer to open RotorLens. Tick the box on
+   that dialog and it will happen automatically from then on.
 4. Pick the `.bbl` file.
 5. **Before you unplug**, turn mass storage mode off again, or eject the drive
    from your phone's storage notification. Pulling the cable while it is mounted
@@ -46,14 +46,23 @@ an 85 MB dump is around two minutes. The bar is real; let it run.
 If your controller logs to a removable SD card instead, a USB card reader skips
 all of this.
 
+**Which logs it opens.** This version of RotorLens opens Blackbox logs from
+Rotorflight 4.3 to 4.6, and has been checked against real logs from 4.6 only. A
+log from any other firmware — a newer Rotorflight, or Betaflight — is refused,
+and the app says which firmware the log came from and which range it reads,
+rather than calling the file damaged.
+
 ---
 
 ## The flight that produces answers
 
-Most flying produces no tuning evidence at all, and that is not a fault in the
-app or in you. Across 110 real flights from three different boards, there was
-**not one usable roll or pitch stop**. People simply do not fly that way unless
-they are deliberately collecting data.
+Most flying produces too little tuning evidence to act on, and that is not a
+fault in the app or in you. Across 110 recorded sessions, logged under three
+craft-name-and-board combinations (the app's own way of telling aircraft apart)
+— 31 of them real flights, the rest bench runs and spool-ups — there was **not one
+roll or pitch stop**, and the app advised no gain change on any of them
+(re-measured 3 October 2026). People simply do not fly that way unless they are
+deliberately collecting data.
 
 So fly one sortie on purpose. It takes about four minutes.
 
@@ -72,17 +81,21 @@ flight that moves around cannot be compared against itself.
    not re-command. That second is the measurement.
 5. Do it **twice each way** — two left and two right.
 
-Then **at least five long steady holds per axis**: five seconds or more of a
-constant command each — a heading held, or a steady turn — with the other two
-axes quiet. That is what the I term is measured on.
+Then **at least five long steady holds per axis**: a constant command each — a
+heading held, or a steady turn — with the other two axes quiet (under 30°/s).
+Five seconds is the shortest hold the app accepts, and its first second is
+discarded, so aim for six to eight. That is what the I term is measured on.
 
 Five is not a round number picked for the sake of it. Comparing one flight
 directly against the one before it needs five holds **on each side**, and in the
-reference corpus 59% of otherwise comparable flights carried exactly one. Two
-holds produce a flight the direct comparison will then refuse, which is the most
-frustrating way to waste a sortie. (The learning model asks less of a single
-flight — two holds — because it estimates its own scatter across many flights
-instead of trusting two. Fly five and you feed both.)
+reference corpus no flight has ever carried more than four on one axis (31
+flights, re-measured 3 October 2026). Two holds produce a flight the direct
+comparison will then refuse, which is the most frustrating way to waste a
+sortie. (The other readings ask less of a single flight. The learning model
+takes a flight with two holds, because it estimates its own scatter across many
+flights instead of trusting two; reading a standing error inside one flight
+needs three, which is why the app's own hold brief asks for three. Fly five and
+you feed all of them.)
 
 Leave at least a second and a half of calm between stops so they do not run into
 each other.
@@ -151,10 +164,13 @@ log. RotorLens will show what moved.
 
 It will also, very often, say the movement is too small to call — and that is
 the feature working. Two flights with nothing changed between them usually
-differ by less than 0.39°/s on the hold measurement, and have differed by as
-much as 1.39°/s. A change smaller than that is weather, not tuning, and an app
-that called it an improvement would be lying to you in a way you could not
-check.
+differ on the hold measurement by less than 0.92°/s on roll, 1.39°/s on pitch
+and 0.1°/s on yaw, and the worst such pair measured differed by 1.39°/s. The
+comparison prints the figure for the axis you changed beside the result, and
+when nothing was changed it quotes each axis's own floor (0.92°/s roll, 1.39°/s
+pitch, 0.1°/s yaw). A change smaller than that is
+weather, not tuning, and an app that called it an improvement would be lying to
+you in a way you could not check.
 
 Several changes at once make the result unreadable, for you and for the app.
 
@@ -274,7 +290,9 @@ else's machine, and it will not put an amount on anything at all.
   requests.** On Android, RotorLens additionally requests no `INTERNET`
   permission, so the operating system prevents the app itself from opening a
   network connection. iOS has no equivalent permission switch; its release gate
-  verifies the same no-network behavior directly.
+  verifies the same no-network behavior directly. On Android, tapping one of the
+  links on the About & Legal screen opens that fixed address in your own
+  browser; nothing about your flights goes with it.
 - **It never connects to or writes to your flight controller.** Every change is
   one you make yourself, in your own configurator.
 
@@ -283,20 +301,22 @@ else's machine, and it will not put an amount on anything at all.
 ## If you send a log to somebody, read this first
 
 Some of the thresholds RotorLens judges your aircraft against are measured on two
-helicopters, both belonging to the person who wrote it. More machines is the only
-thing that fixes that, so donated logs are genuinely wanted — and the flights
-worth sending are not the ones you would expect. **Two ordinary flights with
-nothing changed between them are the most useful thing you can send.** That pair
-is how the noise floor gets measured, and without it nothing else can be told
-apart from the weather.
+helicopters, both belonging to the person who wrote it (their logs carry the three
+craft-name-and-board combinations counted above). More machines is the only
+thing that fixes that, but **this project has no way to take in a log yet, and
+this guide is not asking you for one.** Sharing is designed, not built: current
+builds contain no upload transport, and there is no private channel, no terms
+and no receipt for a raw log. Until there are, **never attach a log to a GitHub
+issue, a pull request or any other public place** —
+[SUPPORT.md](../SUPPORT.md) says the same, and a bug report needs a synthetic
+reproduction instead.
 
-Send the `.bbl`, and four lines with it: what the aircraft is, what headspeed you
-fly, what you changed since the flight before (*"nothing" is an answer, and a good
-one*), and whether `gyroRAW` was in the field set.
+Pilots do still hand logs to each other — a club mate, someone helping on a
+forum — so the rest of this section is for that.
 
-**Now the part that is about you rather than about the data.** The line above —
-no upload transport in current builds, plus Android's missing network permission
-— is a property of the app.
+**Now the part that is about you rather than about the data.** The no-upload
+line above — no upload transport in current builds, plus Android's missing
+network permission — is a property of the app.
 **It protects you from the app. It does not protect you from yourself.** A `.bbl`
 you attach to a message is the whole file, and if GPS was logged it contains the
 coordinates of where you flew, which for most people is a home field and for some

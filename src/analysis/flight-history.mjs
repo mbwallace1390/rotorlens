@@ -2139,13 +2139,43 @@ function compareAxisStop(before, after, axis) {
 }
 
 /**
- * The largest difference ever measured between two nominally identical flights.
+ * The identical-gain pairs behind each axis's floor: how many, and the largest
+ * difference any of them showed.
  *
- * From the same 47 identical-gain pairs the floor is derived over — see
- * EVIDENCE_LIMITS.holdErrorNoiseFloorDps in pid-evidence.mjs, which records
- * median 0.044, p90 0.309, p95 0.354, max 1.390.
+ * From section 4 of `npm run corpus:report` over the 110 real sessions,
+ * re-run 3 October 2026: roll 5 pairs, max 0.9150; pitch 4 pairs, max 1.3896;
+ * yaw 18 pairs, p90 0.0966, max 0.1006. Rounded to three significant figures.
+ * On roll and pitch the worst pair IS the p90, because four or five pairs
+ * cannot separate the two; only yaw has enough pairs for its worst case to sit
+ * above its floor.
+ *
+ * Per axis, because the pooled worst case (1.390, from the 47 pooled pairs in
+ * EVIDENCE_LIMITS.holdErrorNoiseFloorDps) matches pitch's worst pair, 1.3896, to
+ * three decimals; roll's is 0.915 and yaw's 0.1006. Quoting it beside a yaw
+ * floor told a pilot yaw had once wandered by fourteen times its real worst.
  */
-const OBSERVED_FLOOR_MAX_DPS = 1.39;
+const OBSERVED_NULL_PAIRS = Object.freeze({
+  roll: Object.freeze({pairs: 5, maximumDps: 0.915}),
+  pitch: Object.freeze({pairs: 4, maximumDps: 1.39}),
+  yaw: Object.freeze({pairs: 18, maximumDps: 0.101})
+});
+
+const FLOOR_AXES = Object.freeze(['roll', 'pitch', 'yaw']);
+
+/** One axis's floor sentence, from the same numbers its gate uses. */
+function corpusAxisSentence(axis) {
+  const floor = SENSITIVITY_FLOOR_DPS[axis];
+  const {pairs, maximumDps} = OBSERVED_NULL_PAIRS[axis];
+  // Yaw's floor is a p90 with a worst case above it, so both are named. On roll
+  // and pitch the floor is the worst case rounded up, and "usually less than
+  // 0.92, at most 0.915" would read as a contradiction.
+  const spread = maximumDps > floor
+    ? `usually by less than ${floor}°/s and at most by ${maximumDps}°/s`
+    : `by at most ${maximumDps}°/s`;
+  return `Across ${pairs} pairs of real flights with nothing changed between them, ${axis} `
+    + `differed on this measurement ${spread}. A ${axis} change smaller than ${floor}°/s `
+    + 'cannot be told apart from a different day.';
+}
 
 /**
  * The sentence a pilot is shown about the floor, beside the numbers.
@@ -2159,10 +2189,18 @@ const OBSERVED_FLOOR_MAX_DPS = 1.39;
  * sentence whose entire job is to let a pilot tell a result from weather, and a
  * bound it does not have is exactly the wrong thing for it to claim.
  *
- * The gate itself is unchanged: 0.39 is still where a verdict is withheld, and
- * that remains a defensible place to draw it. What changed is that the sentence
- * now describes the figure honestly — a usual case, with the worst case named
- * beside it rather than left out.
+ * THEN IT SAID 0.39 AND 1.39 FOR EVERY AXIS, AND THAT WAS NOT TRUE EITHER. The
+ * gates moved to SENSITIVITY_FLOOR_DPS per axis (roll 0.92, pitch 1.39, yaw 0.1),
+ * so a comparison with no gain changed judged each axis on its own floor while
+ * the sentence beneath it quoted the pooled 0.39 that gated nothing, and quoted
+ * pitch's 1.39 worst case for yaw, whose worst pair is 0.1006. Now:
+ *
+ *   - with an axis, the sentence names that axis's floor, its worst pair and how
+ *     many pairs it rests on;
+ *   - with no axis — a comparison where no gain changed, or a refusal before
+ *     anything was measured — it names all three, because that is what each
+ *     axis is gated on. The pooled 0.39 is not quoted: every axis
+ *     `compareFlightRecords` compares is gated on its own floor instead.
  *
  * THE OPTIONAL ARGUMENT is a floor entry from `buildSensitivityModel`, measured
  * on the pilot's OWN aircraft. When one is passed the sentence changes, because
@@ -2173,25 +2211,51 @@ const OBSERVED_FLOOR_MAX_DPS = 1.39;
  * the learned one says.
  *
  * @param {object} [learned] a `model.floors[axis]` entry, or null
+ * @param {string|null} [axis] the axis whose gate this sentence sits beside
  */
 export function describeNoiseFloor(learned = null, axis = null) {
   const own = learned?.source === 'own-aircraft' && Number.isFinite(learned.appliedDps)
     ? learned
     : null;
 
-  if (own === null) {
-    const floor = SENSITIVITY_FLOOR_DPS[axis] ?? SENSITIVITY_FLOOR_DPS.pooled;
+  if (own === null && FLOOR_AXES.includes(axis)) {
     return Object.freeze({
-      absoluteDps: floor,
-      observedMaximumDps: OBSERVED_FLOOR_MAX_DPS,
+      absoluteDps: SENSITIVITY_FLOOR_DPS[axis],
+      observedMaximumDps: OBSERVED_NULL_PAIRS[axis].maximumDps,
+      nullPairCount: OBSERVED_NULL_PAIRS[axis].pairs,
       relativeRatio: HISTORY_LIMITS.comparisonToleranceRatio,
       minimumHoldsPerSide: HISTORY_LIMITS.minimumComparisonHolds,
       source: 'corpus',
       axis,
-      sentence: `Two flights with nothing changed between them usually differ by less than `
-        + `${floor}°/s on this measurement, and have differed by as much as `
-        + `${OBSERVED_FLOOR_MAX_DPS}°/s. A change smaller than that cannot be told apart `
-        + `from a different day.`
+      sentence: corpusAxisSentence(axis)
+    });
+  }
+
+  if (own === null) {
+    // No single floor applies, so none is reported as `absoluteDps`; each axis's
+    // own is in `perAxis`, and the sentence quotes all three.
+    const perAxis = Object.freeze(Object.fromEntries(FLOOR_AXES.map(name => [name,
+      Object.freeze({
+        absoluteDps: SENSITIVITY_FLOOR_DPS[name],
+        observedMaximumDps: OBSERVED_NULL_PAIRS[name].maximumDps,
+        nullPairCount: OBSERVED_NULL_PAIRS[name].pairs
+      })])));
+    const {roll, pitch, yaw} = perAxis;
+    return Object.freeze({
+      absoluteDps: null,
+      observedMaximumDps: null,
+      perAxis,
+      relativeRatio: HISTORY_LIMITS.comparisonToleranceRatio,
+      minimumHoldsPerSide: HISTORY_LIMITS.minimumComparisonHolds,
+      source: 'corpus',
+      axis: null,
+      sentence: 'Each axis is judged against its own noise. Two real flights with nothing '
+        + 'changed between them have differed on this measurement by at most '
+        + `${roll.observedMaximumDps}°/s on roll (${roll.nullPairCount} pairs), `
+        + `${pitch.observedMaximumDps}°/s on pitch (${pitch.nullPairCount} pairs) and `
+        + `${yaw.observedMaximumDps}°/s on yaw (${yaw.nullPairCount} pairs). A change smaller `
+        + `than ${roll.absoluteDps}°/s on roll, ${pitch.absoluteDps}°/s on pitch or `
+        + `${yaw.absoluteDps}°/s on yaw cannot be told apart from a different day.`
     });
   }
 

@@ -8,8 +8,9 @@ import java.util.Set;
 /**
  * The links that leave the viewer, and only those, for the user's own browser.
  *
- * About & Legal links to the source repository and to each bundled component's
- * project. Inside the WebView those taps did nothing: the shell refuses every
+ * About & Legal links to the source repository, to the published privacy policy,
+ * and to each bundled component's project. Inside the WebView those taps did
+ * nothing: the shell refuses every
  * navigation off the app's origin, and nothing else opened them. A pilot reading
  * where the source is could not follow the link to it.
  *
@@ -34,6 +35,7 @@ final class ExternalLinks {
     /** Exactly what About & Legal renders as a link, on any platform. */
     static final Set<String> ALLOWED = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
             "https://github.com/mbwallace1390/rotorlens",
+            "https://mbwallace1390.github.io/rotorlens/privacy-policy.html",
             "https://developer.android.com/jetpack/androidx/releases",
             "https://github.com/JetBrains/kotlin",
             "https://github.com/Kotlin/kotlinx.coroutines",

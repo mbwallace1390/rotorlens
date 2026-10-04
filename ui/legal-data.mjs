@@ -24,7 +24,7 @@ export const LEGAL = {
       },
       {
         "heading": "What it keeps, and how to erase it",
-        "body": "If you choose to save a flight, RotorLens keeps a small set of numbers about it on this device so it can tell you next time whether a change helped — about 4.4 kB per flight, measured on a handset. Answering the optional future-sharing question stores your answer. Turning sharing on also records the accepted wording version and creates a random 100-bit identity for each saved helicopter and associates it with that helicopter’s local craft-name and board key. This release has no upload transport. RotorLens never keeps the log itself, a position, a flight date, or a file name. The History and Sharing screens show the applicable stored state and let you erase one flight, one helicopter, the sharing preference and identities, or everything."
+        "body": "If you choose to save a flight, RotorLens keeps a small set of numbers about it on this device so it can tell you next time whether a change helped — about 4.4 kB per flight, measured on a handset. Answering the optional future-sharing question stores your answer. Turning sharing on also records the accepted wording version and creates a random 100-bit identity for each saved helicopter and associates it with that helicopter’s local craft-name and board key. This release has no upload transport. RotorLens never keeps the log itself, a position, a flight date, or a file name. The Flight history and Shared measurements panels show the applicable stored state and let you erase one flight, one helicopter, the sharing preference and identities, or everything."
       },
       {
         "heading": "Change one thing at a time",
@@ -44,11 +44,16 @@ export const LEGAL = {
       },
       {
         "heading": "Independent product",
-        "body": "RotorLens is not affiliated with, endorsed by, or sponsored by the Rotorflight or Betaflight projects, or by any transmitter or flight-controller manufacturer. Those names are used only to describe log compatibility, and are trademarks of their respective owners."
+        "body": "RotorLens is not affiliated with, endorsed by, or sponsored by the Rotorflight or Betaflight projects, or by any transmitter or flight-controller manufacturer. The Rotorflight name is used only to refer to that firmware and its project — for example, to say which logs RotorLens reads and how to get them off the aircraft — and never as the name of this app. Both names are trademarks of their respective owners."
       }
     ]
   },
-  "nonAffiliation": "RotorLens is not affiliated with, endorsed by, or sponsored by the Rotorflight or Betaflight projects. It reads their Blackbox log format, which is a published interoperability format, and contains none of their code.",
+  "nonAffiliation": "RotorLens is not affiliated with, endorsed by, or sponsored by the Rotorflight or Betaflight projects, and contains none of their code. It opens Blackbox logs written by Rotorflight 4.3 to 4.6, reading the log format as a published interoperability format. Of that range, only Rotorflight 4.6 has been checked against real logs.",
+  "privacyPolicy": {
+    "label": "Privacy policy",
+    "url": "https://mbwallace1390.github.io/rotorlens/privacy-policy.html"
+  },
+  "linksNote": "On Android, tapping a link on this page hands that fixed address to your web browser. RotorLens adds nothing to it and makes no request itself.",
   "project": {
     "name": "RotorLens",
     "creator": "Michael Wallace",

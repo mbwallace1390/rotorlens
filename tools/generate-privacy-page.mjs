@@ -1,5 +1,8 @@
 /**
- * Renders `docs/PRIVACY_POLICY.md` into the page the app stores link to.
+ * Renders `docs/PRIVACY_POLICY.md` into `docs/privacy-policy.html`, which GitHub
+ * Pages publishes from `main` at
+ * https://mbwallace1390.github.io/rotorlens/privacy-policy.html — the URL for
+ * the app stores' privacy-policy fields.
  *
  * Both stores require a privacy policy at a URL that is live before submission.
  * That page and the policy in this repository are the same document, and the
@@ -33,23 +36,38 @@ function escapeHtml(text) {
     .replace(/"/g, '&quot;');
 }
 
-/** Bold, inline code, and links — applied after escaping, never before. */
+/**
+ * Bold, italics, inline code, and links — applied after escaping, never before.
+ *
+ * Italics were once unsupported and passed through untouched, so the published
+ * page showed literal asterisks around two section names. An asterisk left over
+ * after conversion now refuses the build instead of reaching the page.
+ */
 function inline(text) {
   const escaped = escapeHtml(text);
 
   if (/!\[/.test(escaped)) {
     throw new Error('images are not supported in the policy page');
   }
+  if (escaped.includes('&lt;!--')) {
+    throw new Error(`a comment must start its own line in the policy: ${text}`);
+  }
 
-  return escaped
+  const html = escaped
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*\s](?:[^*]*[^*\s])?)\*/g, '<em>$1</em>')
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (whole, label, href) => {
       if (!/^(https?:|mailto:|#)/.test(href)) {
         throw new Error(`unsupported link target in the policy: ${href}`);
       }
       return `<a href="${href}">${label}</a>`;
     });
+
+  if (html.includes('*')) {
+    throw new Error(`unconverted emphasis in the policy: ${text}`);
+  }
+  return html;
 }
 
 function isTableRow(line) {
@@ -58,6 +76,10 @@ function isTableRow(line) {
 
 function tableCells(line) {
   return line.slice(1, -1).split('|').map(cell => cell.trim());
+}
+
+function isTableSeparator(cells) {
+  return cells.every(cell => /^:?-{3,}:?$/.test(cell));
 }
 
 /** Converts the restricted markdown subset the policy is written in. */
@@ -99,6 +121,26 @@ export function renderPolicyHtml(markdown) {
       continue;
     }
 
+    // A comment is for maintainers reading the markdown — an internal file path,
+    // for instance — and is never published. It must start its own line and end
+    // on a line with nothing after it; anything else is refused, not guessed at.
+    if (line.startsWith('<!--')) {
+      flush();
+      let closing = index;
+      while (closing < lines.length && !lines[closing].includes('-->')) {
+        closing += 1;
+      }
+      if (closing === lines.length) {
+        throw new Error(`unterminated comment in the policy: ${line}`);
+      }
+      const after = lines[closing].slice(lines[closing].indexOf('-->') + 3).trim();
+      if (after !== '') {
+        throw new Error(`text after a comment in the policy: ${after}`);
+      }
+      index = closing;
+      continue;
+    }
+
     // A wrapped list item continues on an indented line. Judging that after
     // trimming reads the continuation as a new paragraph and cuts the sentence
     // in half — which this converter exists to refuse, not to do quietly.
@@ -132,13 +174,24 @@ export function renderPolicyHtml(markdown) {
       }
       index -= 1;
 
-      // A separator row of dashes, and a header row that is entirely empty, are
-      // both layout rather than content.
-      const body = rows.filter(cells => !cells.every(cell => /^-*$/.test(cell)));
-      const header = body[0] && body[0].some(cell => cell !== '') ? body.shift() : null;
+      // The first row is the header and the second the separator, always. An
+      // entirely empty header is layout rather than content and renders no
+      // header row at all. It must never promote the first DATA row into the
+      // header: that is what this once did, by discarding the empty header
+      // together with the separator, and "Accounts or email" was published in
+      // bold as if it were a column heading.
+      if (rows.length < 2 || !isTableSeparator(rows[1])) {
+        throw new Error(`a policy table needs a header row then a separator row: ${line}`);
+      }
+      const [header, , ...body] = rows;
+      for (const cells of body) {
+        if (isTableSeparator(cells) || cells.length !== header.length) {
+          throw new Error(`malformed table row in the policy: | ${cells.join(' | ')} |`);
+        }
+      }
 
       out.push('<table>');
-      if (header) {
+      if (header.some(cell => cell !== '')) {
         out.push(`  <tr>${header.map(cell => `<th>${inline(cell)}</th>`).join('')}</tr>`);
       }
       for (const cells of body) {

@@ -855,8 +855,9 @@ export function describeStopCapture(diagnostics, context = {}) {
     // Fly-this guidance is never a tuning change, and this is the sentence that
     // keeps that line visible on screen rather than only in this comment.
     boundary: 'Everything above is a measurement of the flight you opened. The manoeuvre ' +
-      'below is how to record a flight that can be measured further — RotorLens does ' +
-      'not tell you what to change, and never writes to a flight controller.'
+      'below is how to record a flight that can be measured further. Neither is advice: ' +
+      'advice appears in the “What to change” panel, where the evidence supports it, and ' +
+      'RotorLens never writes to a flight controller.'
   });
 }
 
@@ -899,8 +900,9 @@ export function describeHoldCapture(holdEvidence, context = {}) {
     headline,
     manoeuvre: holdManoeuvre(axis),
     boundary: 'Everything above is a measurement of the flight you opened. The manoeuvre ' +
-      'below is how to record a flight that can be measured further — RotorLens does ' +
-      'not tell you what to change, and never writes to a flight controller.'
+      'below is how to record a flight that can be measured further. Neither is advice: ' +
+      'advice appears in the “What to change” panel, where the evidence supports it, and ' +
+      'RotorLens never writes to a flight controller.'
   });
 }
 

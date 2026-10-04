@@ -359,7 +359,11 @@ test('declaring uiMode loses nothing, because nothing here follows dark mode', a
 
 /** Every URL About & Legal can render as a link, on any platform. */
 function legalLinks() {
-  const links = new Set([LEGAL.project.sourceUrl, LEGAL.project.repository]);
+  const links = new Set([
+    LEGAL.project.sourceUrl,
+    LEGAL.project.repository,
+    LEGAL.privacyPolicy.url
+  ]);
   for (const components of Object.values(LEGAL.componentsByPlatform)) {
     for (const component of components) {
       links.add(component.url);
@@ -374,6 +378,22 @@ async function shellAllowlist() {
   assert.ok(body, 'ExternalLinks.ALLOWED must stay readable to this test');
   return new Set([...body.matchAll(/"([^"]*)"/g)].map(match => match[1]));
 }
+
+test('About & Legal renders a link only from the fields legalLinks() collects', async () => {
+  // legalLinks() reads the data; the page is drawn by ui/legal.mjs. Without this,
+  // a link the renderer added from some other field would be dead on Android and
+  // invisible to the allowlist check below.
+  const renderer = await read('ui/legal.mjs');
+  const hrefs = [...renderer.matchAll(/href="\$\{esc\(([^)]*)\)\}"/g)].map(match => match[1]);
+  assert.deepEqual([...new Set(hrefs)].sort(), [
+    'LEGAL.privacyPolicy.url',
+    'LEGAL.project.repository',
+    'LEGAL.project.sourceUrl',
+    'component.url'
+  ]);
+  assert.equal((renderer.match(/href=/g) ?? []).length, hrefs.length,
+    'every href in ui/legal.mjs must be one of the interpolated LEGAL fields above');
+});
 
 test('the shell opens exactly the links About & Legal shows, and nothing else', async () => {
   const shown = legalLinks();
