@@ -109,6 +109,7 @@ import {
   weightedMean,
   zeroCrossingRateHz
 } from './pid-evidence.mjs';
+import {coherenceNullLevel, effectiveCorrelation, welchCoherence} from './low-frequency.mjs';
 import {STOP_DETECTION_DEFAULTS, detectStopEvents} from './records.mjs';
 import {describeStopCapture, stopManoeuvre, holdManoeuvre} from './axis-report.mjs';
 import {
@@ -315,11 +316,110 @@ export const SHAPE_SWEEP = Object.freeze({
  * Both are bracketed here, so that verdict cannot be emitted. `huntingSmoothingUs`
  * changes the MEASUREMENT (the crossing rate is counted on a box average of that
  * length), so hold evidence is rebuilt at each value rather than reinterpreted.
+ *
+ * EXTENDED IN STAGE 5b (4 October 2026) with the settings of the two guards in
+ * `assessHoldIndication`, which a reading must survive at every point too:
+ *
+ *   stickCoherenceAlpha   the false-alarm rate of the stick-coherence test. A
+ *                         "Lower I" survives only where the coherence between
+ *                         stick and error at the hunt's frequency stays under
+ *                         the level two UNRELATED signals exceed with this
+ *                         probability. 0.01 and 0.05 are the two conventional
+ *                         significance levels, not values fitted to any flight.
+ *   welchSegmentUs        the Welch segment length that coherence is measured
+ *                         over: 2.56 s, and 5.12 s as the Stage 5 hover study
+ *                         used. A longer segment resolves slower hunts, a
+ *                         shorter one fits more segments into short holds; a
+ *                         length that cannot see the hunt's frequency, or fits
+ *                         fewer than two segments, abstains rather than voting.
+ *   collectiveCorrelationAlpha  the false-alarm rate of the yaw collective test,
+ *                         on the same two conventional levels.
+ *
+ * These are NULL-HYPOTHESIS LEVELS, not tuned thresholds: each cut-off they
+ * produce is the value a measurement reaches by chance, at that rate, when the
+ * two signals have nothing to do with each other, computed from alpha and the
+ * evidence count in src/analysis/low-frequency.mjs. The guard refuses wherever
+ * any point says the relationship is there, so a reading survives only where it
+ * survives at alpha 0.05 — the stricter of the two for the reading.
  */
 export const HOLD_SWEEP = Object.freeze({
   huntingSmoothingUs: Object.freeze([74_000, 100_000, 148_000, 222_000, 300_000]),
-  huntingRippleDps: Object.freeze([1, 1.5, 2, 3, 4])
+  huntingRippleDps: Object.freeze([1, 1.5, 2, 3, 4]),
+  stickCoherenceAlpha: Object.freeze([0.01, 0.05]),
+  welchSegmentUs: Object.freeze([2_560_000, 5_120_000]),
+  collectiveCorrelationAlpha: Object.freeze([0.01, 0.05])
 });
+
+/**
+ * THE WEAKEST STICK-COHERENCE VOTE THAT COUNTS (review of round one, 4 October
+ * 2026).
+ *
+ * A vote compares the stick-to-error coherence with the level two unrelated
+ * signals reach by chance, and that level falls as segments are added:
+ * 1 - alpha^(1 / (n - 1)) is 0.95 from two segments at alpha 0.05, 0.63 from
+ * four, 0.28 from ten. A coherence UNDER it is a failure to show the stick in
+ * the wobble, which from few segments is no evidence at all — two segments
+ * pass all but the most stick-driven wobble — and round one counted it as the
+ * wobble not being the stick. So a vote that does not reach its chance level
+ * counts only where that level is low enough to have seen the stick:
+ *
+ *   lowestCorpusStickCoherence  0.29. MEASURED, not chosen: the least
+ *                  stick-to-error coherence at which this guard found the stick
+ *                  in the hover wobble on the 31 corpus flights (one pitch
+ *                  axis, from about fourteen effective segments, re-measured
+ *                  after the review of round one). It found it on 17 roll and
+ *                  pitch axes,
+ *                  at 0.29 to 0.90 (0.33 the next least); the Stage 5 study put
+ *                  the per-flight share of cyclic hover wobble coherent with the
+ *                  stick at 0.40 to 0.87 (66-76 % typically). The least, not
+ *                  the typical, because a pilot's wobble as faint as the
+ *                  faintest seen is still the pilot.
+ *   requiredPower  0.80. CONVENTION: the usual least power a test is designed
+ *                  with. It is the share of wobbles exactly that coherent a
+ *                  vote at the limit reads as following the stick.
+ *   maximumNullLevel  0.20. DERIVED from the two above, for independent
+ *                  segments of complex Gaussian spectra — the model the chance
+ *                  level itself rests on. At alpha 0.05 a coherence of 0.29
+ *                  reads at or over its null 80 % of the time from 14 segments
+ *                  (null 0.206; 79.7 %) or 15 (null 0.193; 82 %), so the limit
+ *                  sits between those two. At alpha 0.01 it is a little
+ *                  stricter than it need be: 22 segments (null 0.197, 85 %)
+ *                  where 21 would do (null 0.206, 82 %). A vote therefore needs
+ *                  about 15 effective segments at alpha 0.05 and 22 at 0.01.
+ *                  For the alpha 0.05 vote with 2.56 s segments, that is three
+ *                  holds measuring 9 s or more, or two of 12 s; at 5.12 s,
+ *                  about twice that.
+ *                  `test/recommendations.test.mjs` re-derives it, and checks it
+ *                  through `welchCoherence` itself.
+ *
+ * Only a failure to reject abstains. A coherence that reaches its chance level
+ * is a detection at the stated alpha from any number of segments, and refuses
+ * as it always did; a stick that did not move at that frequency at all is no
+ * failure to reject either. What it costs: holds as short as the brief allows
+ * — three of 6 s — no longer pass a "Lower I" unless the stick was still at the
+ * hunt's frequency. That is the side to err on, and the limit is a calibration
+ * the owner may relax: designed instead for the Stage 5 study's least, 0.40,
+ * it would be 0.30, about 10 effective segments at alpha 0.05.
+ */
+export const STICK_COHERENCE_VOTE = Object.freeze({
+  lowestCorpusStickCoherence: 0.29,
+  requiredPower: 0.8,
+  maximumNullLevel: 0.2
+});
+
+/**
+ * HOW OFTEN THE COLLECTIVE GUARD FIRES ON UNRELATED SIGNALS (review of round
+ * one, 4 October 2026). MEASURED, not assumed to be alpha: on pairs of
+ * unrelated first-order series shaped like the yaw holds it reads (three
+ * stretches of 5-17 s in 148 ms blocks), `effectiveCorrelation` called them
+ * related at alpha 0.05 in 6-7 % of draws at time constants of 0.3-0.5 s,
+ * 9-11 % at 1-2 s and 13-15 % at 3-5 s (4,000 draws each; 17 % at 8 s). The
+ * signals the guard reads move about as slowly as the holds are long, so the
+ * card quotes the upper part of that range rather than the nominal 5 %: the
+ * guard refuses on any alpha in HOLD_SWEEP, so alpha 0.05 is the rate it has.
+ * `test/low-frequency.test.mjs` sweeps it, and holds this figure to it.
+ */
+export const COLLECTIVE_GUARD_FALSE_ALARM = Object.freeze({alpha: 0.05, low: 0.1, high: 0.15});
 
 /**
  * Bind detection: a standing error the I term is fighting and losing.
@@ -2225,10 +2325,17 @@ function integratorHeldAgainst(holds, meanITermDriftPerSecond, bindLimits = BIND
  */
 export function assessHoldIndication(records, axis, options = {}) {
   const baseLimits = {...EVIDENCE_LIMITS, ...options.limits};
-  const grid = options.grid ?? HOLD_SWEEP;
+  // A caller's grid may narrow a dimension; it cannot drop one.
+  const grid = {...HOLD_SWEEP, ...(options.grid ?? {})};
 
   const evidence = buildHoldEvidence(records, {axis, term: 'I'}, {limits: baseLimits});
   const shipped = interpretHoldEvidence(evidence, options.interpretOptions);
+
+  // THE HOLDS THE READING CAME FROM (Stage 5b). Each kind of hold is read on
+  // its own, so every measurement below that explains or refuses that reading
+  // is taken over the same holds: one kind's, or all of them when both kinds
+  // agreed. A flight with one kind — every flight in the corpus — is unchanged.
+  const judged = judgedHoldEvidence(evidence, shipped);
 
   const codes = [...shipped.codes];
   const indications = new Set();
@@ -2240,7 +2347,7 @@ export function assessHoldIndication(records, axis, options = {}) {
 
   // What the aircraft actually did, measured once at the shipped filter. Used
   // below to decide which filter lengths are even capable of seeing it.
-  const observedCrossingRateHz = evidence.summary?.meanErrorCrossingRateHz ?? null;
+  const observedCrossingRateHz = judged.summary?.meanErrorCrossingRateHz ?? null;
 
   if (evidence.status === 'captured') {
     for (const huntingSmoothingUs of grid.huntingSmoothingUs) {
@@ -2307,86 +2414,37 @@ export function assessHoldIndication(records, axis, options = {}) {
   // Is the I term oscillating too? Reported always so its absence is visible,
   // gated on only when the verdict is "the I term is causing an oscillation".
   const smoothingUs = evidence.measurement?.huntingSmoothingUs ?? baseLimits.huntingSmoothingUs;
-  const iTermCoupling = measureITermCoupling(records, axis, evidence, smoothingUs);
+  const iTermCoupling = measureITermCoupling(records, axis, judged, smoothingUs);
 
   // How much of the output the integrator actually is. See the docstring on
   // `measureITermAuthority` and on AUTHORITY_LIMITS.
   const authorityLimits = {...AUTHORITY_LIMITS, ...options.authorityLimits};
-  const authority = measureITermAuthority(records, axis, evidence, smoothingUs);
+  const authority = measureITermAuthority(records, axis, judged, smoothingUs);
 
   // The bind discriminator, applied before any direction is read.
-  const summary = evidence.summary;
+  //
+  // OVER EVERY SET OF HOLDS THE FLIGHT OFFERS (review of round one, 4 October
+  // 2026). Round one read it over the holds the I-term reading came from, and
+  // switched it off where hovers and turns disagreed; three clean turns added to
+  // three bound hovers then removed the blocker that pooled holds raised before
+  // Stage 5b, and let a gain change through. Disagreement may stop the I-term
+  // reading; it may not remove a mechanical blocker. So the bind is read over
+  // the reading's own holds, over each readable kind on its own, and over all
+  // the holds pooled as before Stage 5b, and a bind that any of them shows
+  // stands. On a flight with one kind of hold — every real flight so far — the
+  // three are the same holds and nothing changes.
   const bindLimits = {...BIND_LIMITS, ...options.bindLimits};
-  let bind = null;
-  if (summary) {
-    const error = summary.meanAbsoluteSteadyStateErrorDps ?? 0;
-    const iRms = Math.abs(summary.meanITermRms ?? 0);
-    const iDrift = Math.abs(summary.meanITermDriftPerSecond ?? 0);
-    const growing = iDrift >= bindLimits.minimumITermDriftPerSecond;
-    const woundUp = iDrift > 0 && iRms >= iDrift * bindLimits.windUpToDriftRatio;
-    // ONLY WHERE THE ERROR WAS READ AS STANDING (3 October 2026, the re-review of
-    // round three). `error` is the |mean| over the holds, and a slow wander
-    // leaves a slice of its cycle in each hold's mean: a healthy integrator under
-    // a 0.03-0.035 Hz torque, flown as three ordinary holds, read 10-17 deg/s of
-    // "standing" error with the I term following the torque — winding, by the
-    // numbers above — and was called a bind, a blocker on every gain on the axis,
-    // although the per-hold test had already refused that error as a standing
-    // one (10 of the review's 192 cells). A bind is a standing error the
-    // integrator cannot beat, so it is read only where that test did not refuse
-    // the error; otherwise the hold findings say what moved. Too few holds is not
-    // such a refusal: it says nothing about whether the error moved.
-    //
-    // ...BUT A REFUSAL ALONE NEVER SWITCHES A BIND OFF (re-review of 3 October
-    // 2026). A genuine bind with anything else moving the aircraft too — a
-    // governor hunting, wind — has its error refused hold by hold exactly as a
-    // wander's is, and the gate above then dropped the blocker and let a gain
-    // change on another axis become the one instruction while the linkage bound:
-    // 12 of 12 such flights in the review, and 36 of 60 binds in moving air lost
-    // on one axis. Mechanical faults outrank gains, so the bind stays unless the
-    // integrator ALSO behaved like one following the movement rather than one
-    // held against something; see `integratorHeldAgainst`.
-    const notStanding = STANDING_ERROR_REFUSALS.find(code => shipped.codes.includes(code)) ?? null;
-    const held = integratorHeldAgainst(evidence.holds ?? [], summary.meanITermDriftPerSecond,
-      bindLimits);
-    const standingError = error > bindLimits.errorDpsThreshold
-      && (notStanding === null || held !== null);
-
-    // SECOND SIGNATURE, added 13 August 2026. The one above needs the I term to
-    // be still WINDING, and every real flight controller clamps its integrator,
-    // so it switches itself off at precisely the moment the loop has finished
-    // losing. A large integrator that has stopped moving while an error stands
-    // is arithmetically impossible unless it is pinned: dI/dt = ki * error.
-    const pinned = standingError
-      && authority.available
-      && Number.isFinite(authority.meanITermTravelShare)
-      && authority.meanITermTravelShare <= authorityLimits.iTermTravelShare
-      && Number.isFinite(authority.meanITermToPTermRatio)
-      && authority.meanITermToPTermRatio >= authorityLimits.iTermToPTermRatio;
-
-    const winding = standingError && growing && woundUp;
-    bind = frozen({
-      suspected: winding || pinned,
-      pattern: winding ? 'winding' : (pinned ? 'pinned' : null),
-      meanAbsoluteSteadyStateErrorDps: error,
-      meanITermRms: summary.meanITermRms ?? null,
-      meanITermDriftPerSecond: summary.meanITermDriftPerSecond ?? null,
-      meanITermTravelShare: authority.meanITermTravelShare,
-      meanITermToPTermRatio: authority.meanITermToPTermRatio,
-      errorDpsThreshold: bindLimits.errorDpsThreshold,
-      // The per-hold refusal that kept the error from being read as a standing
-      // one, when there was one: the reason a winding I term was not a bind,
-      // unless the integrator held against the error anyway (below), in which
-      // case the bind was read through the movement and the card says so.
-      standingErrorRefusal: notStanding,
-      integratorHeldAgainstTheError: held
-    });
-    if (winding) {
-      codes.push('STANDING_ERROR_WITH_WOUND_UP_I_TERM');
-    }
-    if (pinned) {
-      codes.push('STANDING_ERROR_WITH_A_PINNED_I_TERM');
-    }
-  }
+  const bindReadings = holdSetsForTheBind(evidence, shipped, judged).map(set => readBind(set, {
+    // Measured over the same holds as the rest of the set; the reading's own
+    // were measured once, above.
+    authority: set.holds === judged.holds ? authority
+      : measureITermAuthority(records, axis, set, smoothingUs),
+    authorityLimits,
+    bindLimits
+  }));
+  const bindReading = bindReadings.find(reading => reading.bind.suspected) ?? bindReadings[0] ?? null;
+  const bind = bindReading?.bind ?? null;
+  codes.push(...(bindReading?.codes ?? []));
 
   const swept = evidence.status === 'captured' && stable && sweepRuns > 0;
   let indication = swept ? shipped.indication : 'hold';
@@ -2434,6 +2492,68 @@ export function assessHoldIndication(records, axis, options = {}) {
     confidence = 'none';
   }
 
+  // GUARD A, STAGE 5b: IS THE HUNTING THE PILOT? Everything above can be true of
+  // a pilot making small, steady corrections: the error swings in band, the I
+  // term — the integral of that error — swings at the same rate, and on a loop
+  // where the integrator is most of the output it is most of the output's
+  // movement. On the 31 real flights 66-76 % of the cyclic hover wobble was
+  // coherent with the stick, and the two tests above passed on 94 and 107 of
+  // 108 quiet windows. A wobble the integrator makes on its own is not coherent
+  // with the stick; so before "Lower I" survives, the coherence between stick
+  // and error at the hunt's own frequency, pooled over the holds read, must sit
+  // under the level two unrelated signals reach by chance — at every alpha and
+  // every Welch segment length in HOLD_SWEEP that can measure it, from enough
+  // segments to have seen the stick (STICK_COHERENCE_VOTE; review of round
+  // one). If none can, the reading is refused too: an untested guard passes
+  // nothing.
+  const huntWasRead = evidence.status === 'captured'
+    && (shipped.indication === 'decrease' || indications.has('decrease'));
+  const stickCoherence = huntWasRead
+    ? measureStickCoherence(records, axis, judged.holds ?? [],
+      Number.isFinite(observedCrossingRateHz) ? observedCrossingRateHz / CROSSINGS_PER_CYCLE : null,
+      grid)
+    : null;
+  if (indication === 'decrease') {
+    if (stickCoherence.state === 'follows-the-stick') {
+      codes.push('HUNTING_FOLLOWS_THE_STICK');
+      indication = 'hold';
+      confidence = 'none';
+    } else if (stickCoherence.state !== 'below-null') {
+      codes.push('STICK_COHERENCE_NOT_MEASURED');
+      indication = 'hold';
+      confidence = 'none';
+    }
+  }
+
+  // GUARD B, STAGE 5b: IS THE YAW INTEGRATOR CARRYING THE COLLECTIVE? Main-
+  // rotor torque moves with collective, and where the collective
+  // precompensation does not cover it the tail's integrator does. Inside 26 of
+  // the 28 yaw holds the Stage 5 study accepted, the collective moved 25 units
+  // or more, and the integrator moved with it (median r -0.24; -0.58 on one
+  // aircraft). An integrator doing that work is not telling anyone what the I
+  // GAIN should be, whichever way the error reads. So on yaw, a reading of the
+  // I term — "Raise I", "Lower I", or the all-clear that no standing error was
+  // seen — survives only where the integrator's correlation with collective
+  // inside the holds read, judged on an effective sample count, is not
+  // significant at any alpha in HOLD_SWEEP. An integrator that never moved, or
+  // a collective that never moved, cannot be carrying it; a correlation that
+  // could not be tested refuses the reading.
+  const collectiveCorrelation = axis === 'yaw' && evidence.status === 'captured'
+    ? measureCollectiveCorrelation(records, judged.holds ?? [], smoothingUs, grid)
+    : null;
+  if (collectiveCorrelation
+      && (indication === 'increase' || indication === 'decrease' || earnsITermAllClear(codes))) {
+    if (collectiveCorrelation.points.some(point => point.significant === true)) {
+      codes.push('YAW_HOLD_MOVES_WITH_COLLECTIVE');
+      indication = 'hold';
+      confidence = 'none';
+    } else if (collectiveCorrelation.points.some(point => point.significant === null)) {
+      codes.push('COLLECTIVE_CORRELATION_NOT_MEASURED');
+      indication = 'hold';
+      confidence = 'none';
+    }
+  }
+
   return frozen({
     axis,
     evidence,
@@ -2452,7 +2572,301 @@ export function assessHoldIndication(records, axis, options = {}) {
     iTermCoupling,
     iTermAuthority: authority,
     holdCount: evidence.holds.length,
-    minimumHolds: baseLimits.minimumHolds
+    minimumHolds: baseLimits.minimumHolds,
+    // Stage 5b: which kind of hold the reading came from ('zero', 'sustained',
+    // 'both', or null when none could be read or the kinds disagreed), each
+    // kind's own reading, the holds the reading rests on, and both guards.
+    kind: shipped.kind ?? null,
+    kinds: shipped.kinds ?? null,
+    judged: frozen({
+      kind: shipped.kind ?? null,
+      holdCount: (judged.holds ?? []).length,
+      holds: judged.holds ?? [],
+      summary: judged.summary ?? null
+    }),
+    stickCoherence,
+    collectiveCorrelation
+  });
+}
+
+/**
+ * The capture narrowed to the holds a reading came from: one kind's, when
+ * `interpretHoldEvidence` read one kind; otherwise the whole capture.
+ */
+function judgedHoldEvidence(evidence, reading) {
+  const kind = reading?.kind;
+  const entry = (kind === 'zero' || kind === 'sustained') ? evidence.kinds?.[kind] : null;
+  if (!entry?.summary) {
+    return evidence;
+  }
+  return {
+    ...evidence,
+    holds: (evidence.holds ?? []).filter(hold => hold.holdKind === kind),
+    summary: entry.summary
+  };
+}
+
+/**
+ * The sets of holds the bind is read over (review of round one, 4 October
+ * 2026), the first being the one whose numbers stand when none shows a bind:
+ *
+ *  - the holds the I-term reading came from, with that reading's codes;
+ *  - where the capture holds both kinds, each kind that could be read, on its
+ *    own, with its own reading's codes;
+ *  - and all the holds pooled, with only the capture's own codes — as before
+ *    Stage 5b, when no reading ran over a capture of both kinds, so no per-hold
+ *    refusal sat under its bind.
+ *
+ * Where the reading came from all the holds of a capture with both kinds (the
+ * kinds agreed, disagreed, or neither could be read), the pooled set is the
+ * first, read as before Stage 5b.
+ */
+function holdSetsForTheBind(evidence, shipped, judged) {
+  const all = evidence.holds ?? [];
+  const judgedKind = judged !== evidence && (shipped.kind === 'zero' || shipped.kind === 'sustained')
+    ? shipped.kind : 'all';
+  const sets = [];
+  const add = (readFrom, holds, summary, codes) => {
+    if (summary && holds.length > 0) {
+      sets.push({readFrom, holds, summary, codes});
+    }
+  };
+  if (new Set(all.map(hold => hold.holdKind)).size < 2) {
+    add(judgedKind, judged.holds ?? [], judged.summary, shipped.codes);
+    return sets;
+  }
+  if (judgedKind === 'all') {
+    add('all', all, evidence.summary, evidence.codes ?? []);
+  } else {
+    add(judgedKind, judged.holds ?? [], judged.summary, shipped.codes);
+  }
+  for (const kind of ['zero', 'sustained']) {
+    const reading = shipped.kinds?.[kind];
+    const entry = evidence.kinds?.[kind];
+    if (kind !== judgedKind && reading && entry?.summary) {
+      add(kind, all.filter(hold => hold.holdKind === kind), entry.summary, reading.codes ?? []);
+    }
+  }
+  if (judgedKind !== 'all') {
+    add('all', all, evidence.summary, evidence.codes ?? []);
+  }
+  return sets;
+}
+
+/**
+ * The bind discriminator over one set of holds (see `holdSetsForTheBind`):
+ * whether the I term behaved like one held against something it cannot beat —
+ * still winding, or pinned at its limit — over a standing error. Returns the
+ * frozen `bind` and the codes it adds.
+ */
+function readBind(set, {authority, authorityLimits, bindLimits}) {
+  const {summary} = set;
+  const codes = [];
+  const error = summary.meanAbsoluteSteadyStateErrorDps ?? 0;
+  const iRms = Math.abs(summary.meanITermRms ?? 0);
+  const iDrift = Math.abs(summary.meanITermDriftPerSecond ?? 0);
+  const growing = iDrift >= bindLimits.minimumITermDriftPerSecond;
+  const woundUp = iDrift > 0 && iRms >= iDrift * bindLimits.windUpToDriftRatio;
+  // ONLY WHERE THE ERROR WAS READ AS STANDING (3 October 2026, the re-review of
+  // round three). `error` is the |mean| over the holds, and a slow wander
+  // leaves a slice of its cycle in each hold's mean: a healthy integrator under
+  // a 0.03-0.035 Hz torque, flown as three ordinary holds, read 10-17 deg/s of
+  // "standing" error with the I term following the torque — winding, by the
+  // numbers above — and was called a bind, a blocker on every gain on the axis,
+  // although the per-hold test had already refused that error as a standing
+  // one (10 of the review's 192 cells). A bind is a standing error the
+  // integrator cannot beat, so it is read only where that test did not refuse
+  // the error; otherwise the hold findings say what moved. Too few holds is not
+  // such a refusal: it says nothing about whether the error moved.
+  //
+  // ...BUT A REFUSAL ALONE NEVER SWITCHES A BIND OFF (re-review of 3 October
+  // 2026). A genuine bind with anything else moving the aircraft too — a
+  // governor hunting, wind — has its error refused hold by hold exactly as a
+  // wander's is, and the gate above then dropped the blocker and let a gain
+  // change on another axis become the one instruction while the linkage bound:
+  // 12 of 12 such flights in the review, and 36 of 60 binds in moving air lost
+  // on one axis. Mechanical faults outrank gains, so the bind stays unless the
+  // integrator ALSO behaved like one following the movement rather than one
+  // held against something; see `integratorHeldAgainst`.
+  const notStanding = STANDING_ERROR_REFUSALS.find(code => set.codes.includes(code)) ?? null;
+  const held = integratorHeldAgainst(set.holds, summary.meanITermDriftPerSecond, bindLimits);
+  const standingError = error > bindLimits.errorDpsThreshold
+    && (notStanding === null || held !== null);
+
+  // SECOND SIGNATURE, added 13 August 2026. The one above needs the I term to
+  // be still WINDING, and every real flight controller clamps its integrator,
+  // so it switches itself off at precisely the moment the loop has finished
+  // losing. A large integrator that has stopped moving while an error stands
+  // is arithmetically impossible unless it is pinned: dI/dt = ki * error.
+  const pinned = standingError
+    && authority.available
+    && Number.isFinite(authority.meanITermTravelShare)
+    && authority.meanITermTravelShare <= authorityLimits.iTermTravelShare
+    && Number.isFinite(authority.meanITermToPTermRatio)
+    && authority.meanITermToPTermRatio >= authorityLimits.iTermToPTermRatio;
+
+  const winding = standingError && growing && woundUp;
+  if (winding) {
+    codes.push('STANDING_ERROR_WITH_WOUND_UP_I_TERM');
+  }
+  if (pinned) {
+    codes.push('STANDING_ERROR_WITH_A_PINNED_I_TERM');
+  }
+  return {
+    codes,
+    bind: frozen({
+      suspected: winding || pinned,
+      pattern: winding ? 'winding' : (pinned ? 'pinned' : null),
+      // Which holds it was read from — 'zero', 'sustained' or 'all' — and how
+      // many: on a flight with both kinds, not necessarily the holds the I-term
+      // reading came from.
+      readFrom: set.readFrom,
+      holdCount: set.holds.length,
+      meanAbsoluteSteadyStateErrorDps: error,
+      meanITermRms: summary.meanITermRms ?? null,
+      meanITermDriftPerSecond: summary.meanITermDriftPerSecond ?? null,
+      meanITermTravelShare: authority.meanITermTravelShare,
+      meanITermToPTermRatio: authority.meanITermToPTermRatio,
+      errorDpsThreshold: bindLimits.errorDpsThreshold,
+      // The per-hold refusal that kept the error from being read as a standing
+      // one, when there was one: the reason a winding I term was not a bind,
+      // unless the integrator held against the error anyway (below), in which
+      // case the bind was read through the movement and the card says so.
+      standingErrorRefusal: notStanding,
+      integratorHeldAgainstTheError: held
+    })
+  };
+}
+
+/**
+ * The measured window of each hold — after its settle, as the hold verdict read
+ * it — as time-aligned pairs `pick(record)` returns, or skips with null.
+ */
+function holdStretches(records, holds, pick) {
+  const stretches = [];
+  for (const hold of holds) {
+    const from = firstAtOrAfter(records, hold.measureStartTimeUs);
+    const to = lastAtOrBefore(records, hold.endTimeUs);
+    if (!(to > from)) {
+      continue;
+    }
+    const stretch = {timesUs: [], x: [], y: []};
+    for (let step = from; step <= to; step += 1) {
+      const pair = pick(records[step]);
+      if (pair !== null) {
+        stretch.timesUs.push(records[step].timeUs);
+        stretch.x.push(pair[0]);
+        stretch.y.push(pair[1]);
+      }
+    }
+    stretches.push(stretch);
+  }
+  return stretches;
+}
+
+/**
+ * Coherence between the stick and the rate error at `frequencyHz`, pooled over
+ * the holds, at every Welch segment length and alpha in `grid` (Stage 5b).
+ *
+ * Each point reads 'follows-the-stick' when the coherence reaches the level two
+ * unrelated signals exceed with probability alpha (`coherenceNullLevel`),
+ * 'below-null' when it does not — including a stick that did not move at that
+ * frequency at all — and 'abstained' when that segment length cannot measure
+ * it (the frequency is under two cycles a segment, or fewer than two segments
+ * fit in the holds) or when the coherence stayed under a chance level too high
+ * to have seen the stick (`abstainedBecause: 'null-level-too-high'`; see
+ * STICK_COHERENCE_VOTE). `state` is 'follows-the-stick' if any point says so,
+ * 'below-null' if every point that voted says so, and 'not-measured' if none
+ * voted.
+ */
+function measureStickCoherence(records, axis, holds, frequencyHz, grid) {
+  const index = axisIndexOf(axis);
+  const stretches = index === -1 ? [] : holdStretches(records, holds, record => {
+    const setpoint = record?.setpoint?.[index];
+    const gyro = record?.gyro?.[index];
+    return Number.isFinite(setpoint) && Number.isFinite(gyro) ? [setpoint, setpoint - gyro] : null;
+  });
+  const points = [];
+  for (const segmentUs of grid.welchSegmentUs) {
+    const measured = Number.isFinite(frequencyHz) && frequencyHz > 0
+      ? welchCoherence(stretches, {segmentUs, frequencyHz})
+      : {state: 'frequency-below-resolution', coherence: null, segmentCount: 0, effectiveSegments: 0};
+    const voted = ['measured', 'x-still', 'y-still'].includes(measured.state);
+    for (const alpha of grid.stickCoherenceAlpha) {
+      const threshold = voted ? round(coherenceNullLevel(alpha, measured.effectiveSegments), 4) : null;
+      const follows = voted && measured.coherence >= threshold;
+      // A failure to reject counts only from a vote able to have seen the
+      // stick; see STICK_COHERENCE_VOTE. A signal with nothing at all at that
+      // frequency ('x-still', 'y-still') is no failure to reject: nothing there
+      // can be common to both, from any number of segments.
+      const tooWeak = voted && !follows && measured.state === 'measured'
+        && threshold > STICK_COHERENCE_VOTE.maximumNullLevel;
+      points.push(frozen({
+        segmentUs,
+        alpha,
+        state: measured.state,
+        coherence: measured.coherence,
+        threshold,
+        segmentCount: measured.segmentCount,
+        effectiveSegments: measured.effectiveSegments,
+        verdict: !voted || tooWeak
+          ? 'abstained'
+          : (follows ? 'follows-the-stick' : 'below-null'),
+        abstainedBecause: !voted ? measured.state : (tooWeak ? 'null-level-too-high' : null)
+      }));
+    }
+  }
+  const voting = points.filter(point => point.verdict !== 'abstained');
+  return frozen({
+    frequencyHz: round(frequencyHz, 4),
+    state: voting.length === 0
+      ? 'not-measured'
+      : (voting.some(point => point.verdict === 'follows-the-stick') ? 'follows-the-stick' : 'below-null'),
+    points: frozen(points)
+  });
+}
+
+/**
+ * Correlation of the I term with the collective inside the holds (Stage 5b),
+ * judged on an effective sample count at every alpha in `grid`.
+ *
+ * Both are averaged into blocks as long as the hold smoothing window (148 ms by
+ * default) before anything is computed: the I-term band tops out at 3 Hz, and
+ * that window is the one whose corner sits there, so nothing the I term can do
+ * is averaged away. Each point's `significant` is true or false, or null where
+ * the correlation could not be tested.
+ */
+function measureCollectiveCorrelation(records, holds, smoothingUs, grid) {
+  const stretches = holdStretches(records, holds, record => {
+    const iTerm = record?.terms?.[1];
+    const collective = record?.collective;
+    return Number.isFinite(iTerm) && Number.isFinite(collective) ? [iTerm, collective] : null;
+  });
+  const intervals = [];
+  for (const stretch of stretches) {
+    for (let at = 1; at < stretch.timesUs.length; at += 1) {
+      intervals.push(stretch.timesUs[at] - stretch.timesUs[at - 1]);
+    }
+  }
+  const medianInterval = quantile(intervals, 0.5);
+  const blockSize = Number.isFinite(medianInterval) && medianInterval > 0
+    ? Math.max(1, Math.round(smoothingUs / medianInterval))
+    : 1;
+  const measured = effectiveCorrelation(
+    stretches.map(stretch => ({x: stretch.x, y: stretch.y})), {blockSize});
+  const testable = measured.state === 'measured';
+  const unmoved = measured.state === 'x-still' || measured.state === 'y-still';
+  return frozen({
+    state: measured.state,
+    correlation: measured.correlation,
+    sampleCount: measured.sampleCount,
+    effectiveCount: measured.effectiveCount,
+    pValue: measured.pValue,
+    blockSize,
+    points: frozen(grid.collectiveCorrelationAlpha.map(alpha => frozen({
+      alpha,
+      significant: testable ? measured.pValue < alpha : (unmoved ? false : null)
+    })))
   });
 }
 
@@ -5321,7 +5735,18 @@ const I_TERM_ALL_CLEAR_EXCLUDED = Object.freeze(new Set([
   // a cover hid, and the side a turn-following error was on.
   'STANDING_ERROR_WITH_UNMEASURED_BAND',
   'RATE_SHORT_OF_COMMAND_IN_EVERY_TURN',
-  'RATE_PAST_COMMAND_IN_EVERY_TURN'
+  'RATE_PAST_COMMAND_IN_EVERY_TURN',
+  // Stage 5b, 4 October 2026: the two kinds of hold read apart and disagreeing,
+  // or neither with enough holds to read; the hunt that followed the stick, or
+  // could not be checked against it; the yaw integrator carrying the
+  // collective, or not checked for it; and a standing error read from one kind.
+  'I_TERM_HOLDS_KINDS_DISAGREE',
+  'TOO_FEW_HOLDS_OF_EITHER_KIND',
+  'HUNTING_FOLLOWS_THE_STICK',
+  'STICK_COHERENCE_NOT_MEASURED',
+  'YAW_HOLD_MOVES_WITH_COLLECTIVE',
+  'COLLECTIVE_CORRELATION_NOT_MEASURED',
+  'OTHER_KIND_TOO_FEW_FOR_A_STANDING_ERROR'
 ]));
 
 /**
@@ -5351,7 +5776,7 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
   oscillationHz, errorList, onEachSide}) {
   const codes = hold.codes;
   const has = code => codes.includes(code);
-  const holdCount = hold.holdCount;
+  const holdCount = hold.judged?.holdCount ?? hold.holdCount;
   const needed = HOLDS_FOR_A_FULL_READING;
   const seconds = round(EVIDENCE_LIMITS.minimumHoldDurationUs / 1e6, 1);
   const noise = round(summary?.meanErrorNoiseRmsDps, 1);
@@ -5385,6 +5810,43 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
   let headline = `The ${axis} holds were measured, but not in a way that answers the I-term `
     + 'question either way.';
   let confirm = holdManoeuvre(axis).steps.join(' ');
+
+  // THE TWO STAGE 5b GUARDS, WHERE THEY COULD NOT BE TESTED. Each refuses a
+  // reading it could not check rather than passing it, and the card says which
+  // check, and what to fly so it can be made.
+  const control = axis === 'yaw' ? 'pedals' : 'cyclic';
+  if (has('STICK_COHERENCE_NOT_MEASURED')) {
+    headline = `${axis} wobbled during the holds at a rate an integrator can cause, but whether `
+      + 'the wobble followed the stick could not be checked, so the I term was not judged.';
+    // How many segments a vote needs (review of round one): the fewest whose
+    // chance level at the sweep's largest alpha is at or under the limit in
+    // STICK_COHERENCE_VOTE, so that not finding the stick would mean something.
+    const segmentsNeeded = Math.ceil(1 + Math.log(Math.max(...HOLD_SWEEP.stickCoherenceAlpha))
+      / Math.log(1 - STICK_COHERENCE_VOTE.maximumNullLevel));
+    sentences.push(`The error's slow part swung ${ripple} deg/s RMS ${rate} — ${where} — and the `
+      + 'I term swung with it. A pilot\'s own small, steady corrections make that same picture, '
+      + 'and telling the two apart means comparing the stick with the error at the wobble\'s '
+      + `rate over enough of the holds — about ${segmentsNeeded} Welch segments — that not `
+      + 'finding the stick in it would have meant something; at this rate, these holds were too '
+      + 'short or too few for that.');
+    candidates.push('too much I term on this axis',
+      'your own small corrections on the stick, at the wobble\'s rate');
+    confirm = `Fly ${needed} or more still holds of ${seconds} s or more — longer is better — `
+      + `with the ${control} left alone.`;
+  }
+  if (has('COLLECTIVE_CORRELATION_NOT_MEASURED')) {
+    headline = 'Whether the yaw I term was carrying the collective during the holds could not be '
+      + 'checked, so the I term was not judged.';
+    sentences.push('Main-rotor torque changes with collective, and where the collective '
+      + 'precompensation does not cover it the tail\'s integrator does; an integrator doing that '
+      + 'work says nothing about whether the I gain is right. Checking for it needs the I term '
+      + 'and the collective logged through holds long enough to compare them, and these were '
+      + 'not.');
+    candidates.push('the collective precompensation leaving main-rotor torque for the integrator '
+      + 'to carry', 'an I term that is right, too small or too large');
+    confirm = `Fly ${needed} or more still hovers of ${seconds} s or more with the pedals left `
+      + 'alone and the collective held steady, with axisI and the collective both logged.';
+  }
 
   if (has('OSCILLATION_ABOVE_I_TERM_BAND')) {
     headline = `${axis} shook faster than an integrator works during the holds, and that hid `
@@ -5425,7 +5887,7 @@ function iTermNotJudged({axis, hold, basis, summary, ripple, rate, meanError, ba
     // is what a feedforward set too high does.
     const past = has('RATE_PAST_COMMAND_IN_EVERY_TURN');
     const short = has('RATE_SHORT_OF_COMMAND_IN_EVERY_TURN');
-    const turnByTurn = (hold.evidence.holds ?? [])
+    const turnByTurn = (hold.judged?.holds ?? hold.evidence.holds ?? [])
       .map(entry => round(Math.abs(entry.steadyStateErrorDps), 1)).join(', ');
     const wanderInStep = 'a slow wander in step with the turns — the governor, the drive or the wind';
     if (past) {
@@ -5643,12 +6105,38 @@ function describeSweepFlips(points) {
   };
 }
 
+/**
+ * The kind of hold a reading came from, as a pilot would say it (Stage 5b):
+ * the words after "holds" in a sentence, or '' where it was not one kind.
+ */
+function holdKindWords(kind, axis) {
+  if (kind === 'zero') {
+    return axis === 'yaw' ? ' (still hovers and straight flight, holding a heading)'
+      : ' (still hovers and level flight)';
+  }
+  if (kind === 'sustained') {
+    return axis === 'yaw' ? ' (steady pirouettes and turns)' : ' (steady turns)';
+  }
+  if (kind === 'both') {
+    return ' (still hovers and steady turns, read apart and agreeing)';
+  }
+  return '';
+}
+
 function holdFindings({axis, hold, airframe, headspeed}) {
   const out = [];
-  const summary = hold.evidence.summary;
+  // The holds the reading came from (Stage 5b): one kind's, or all of them. On
+  // a flight with one kind of hold, which is every real flight so far, this is
+  // the whole capture and every number below is what it always was.
+  const summary = hold.judged?.summary ?? hold.evidence.summary;
+  const judgedHolds = hold.judged?.holds ?? hold.evidence.holds ?? [];
+  const judgedCount = hold.judged?.holdCount ?? hold.holdCount;
+  const kindWords = holdKindWords(hold.kind, axis);
 
   const basis = [
     basisEntry('holds measured', hold.holdCount, 'count', 'buildHoldEvidence'),
+    basisEntry('holds the reading rests on', judgedCount, 'count',
+      'interpretHoldEvidence, each kind of hold read on its own'),
     basisEntry('steady-state error, mean over the holds',
       summary?.meanAbsoluteSteadyStateErrorDps ?? null, 'deg/s', 'measureHold'),
     basisEntry('slow ripple in the error', summary?.meanErrorRippleRmsDps ?? null, 'deg/s',
@@ -5701,6 +6189,30 @@ function holdFindings({axis, hold, airframe, headspeed}) {
         + 'as a slow wander rather than a bind. But '
         + heldHow
       : '';
+    // WHICH HOLDS (review of round one, 4 October 2026). On a flight with both
+    // kinds of hold the bind is read over each kind and over all of them, and
+    // stands if any shows it, so the holds it came from need not be the ones
+    // the I-term reading did. The card names them and shows their own numbers.
+    const kindsFlown = new Set((hold.evidence.holds ?? []).map(entry => entry.holdKind));
+    const readOverWords = {
+      zero: 'still holds (hovering or flying straight) on their own',
+      sustained: 'steady-rate holds on their own',
+      all: 'holds, both kinds together'
+    }[hold.bind.readFrom];
+    const readOver = kindsFlown.size > 1 && readOverWords
+      ? ` This was read over the ${hold.bind.holdCount} ${readOverWords}, where the error `
+        + `averaged ${round(hold.bind.meanAbsoluteSteadyStateErrorDps, 1)} deg/s off the command; `
+        + 'a bind any set of holds shows stands, whatever the others read.'
+      : '';
+    const bindBasis = kindsFlown.size > 1
+      ? [basisEntry('holds the bind was read over', hold.bind.holdCount, 'count',
+        `assessHoldIndication, ${hold.bind.readFrom === 'all' ? 'every hold' : `holdKind ${hold.bind.readFrom}`}`),
+      basisEntry('steady-state error over those holds',
+        round(hold.bind.meanAbsoluteSteadyStateErrorDps, 2), 'deg/s', 'measureHold'),
+      basisEntry('I-term size over those holds', hold.bind.meanITermRms, null, 'measureHold'),
+      basisEntry('I-term drift over those holds', hold.bind.meanITermDriftPerSecond, 'per second',
+        'measureHold')]
+      : [];
     out.push(makeFinding({
       id: 'SUSPECTED_MECHANICAL_BIND',
       rung: 'axis-mechanical',
@@ -5731,8 +6243,8 @@ function holdFindings({axis, hold, airframe, headspeed}) {
           + 'cannot beat. That is what a binding linkage, a tight ball link or a servo hitting '
           + 'a limit looks like from inside the log. An error alone would have read as too '
           + 'little I, and adding I to an aircraft that is binding winds the term further into '
-          + 'a fight it still loses.'),
-      basis,
+          + 'a fight it still loses.') + readOver,
+      basis: [...basis, ...bindBasis],
       confirm: 'With the motor disconnected, move that control through its full travel by '
         + 'hand and feel for a tight spot. Check the ball links, the servo arm and that '
         + 'nothing is fouling. Then fly the same hold again — if the I term stops winding, '
@@ -5784,41 +6296,53 @@ function holdFindings({axis, hold, airframe, headspeed}) {
     return out;
   }
 
-  // HOLDS OF TWO KINDS, NEITHER JUDGED (2 October 2026). A hold at zero rate and
-  // a hold at a steady rate test the I term in different regimes, and
-  // `interpretHoldEvidence` rightly refuses to read them pooled: it returns
-  // `hold` with HOLD_KIND_MISMATCH and judges nothing. That refusal used to fall
-  // through to I_TERM_WITHIN_TOLERANCE — "nothing in the holds calls for an
-  // I-term change" — on exactly the flights ordinary pilots fly, hovers and
-  // steady turns. On an aircraft with NO integrator against a standing torque,
-  // either kind alone earns "raise I"; mixed, it was told all was well. Nothing
-  // was judged, so nothing is cleared: the pilot is told what to fly instead.
-  // Reading each kind on its own is a later stage, deliberately not built here.
-  if (hold.codes.includes('HOLD_KIND_MISMATCH')) {
-    const holds = hold.evidence.holds ?? [];
-    const zeroRate = holds.filter(entry => entry.holdKind === 'zero');
-    const steadyRate = holds.filter(entry => entry.holdKind === 'sustained');
-    const meanErrorOf = entries => (entries.length === 0 ? null : round(weightedMean(
-      entries.map(entry => entry.absoluteSteadyStateErrorDps),
-      entries.map(entry => entry.measuredDurationUs)
-    ), 2));
-    // Enough of one kind for every reading, a standing error's included (re-review
-    // of 3 October 2026).
-    const needed = Math.max(hold.minimumHolds ?? EVIDENCE_LIMITS.minimumHolds,
-      HOLDS_FOR_A_FULL_READING);
-    const seconds = round(EVIDENCE_LIMITS.minimumHoldDurationUs / 1e6, 1);
-    const offAxis = EVIDENCE_LIMITS.offAxisCommandLimitDps;
-    const rateKind = {yaw: 'pirouettes or turns', pitch: 'turns', roll: 'rolls'}[axis]
-      ?? 'manoeuvres';
-    const still = axis === 'yaw'
-      ? 'still hovers, or straight flight, holding a heading with the pedals centred'
-      : `still hovers, or level flight, with the ${axis} stick centred`;
-    const turning = {
-      yaw: 'steady pirouettes or turns at a constant rate',
-      pitch: 'steady turns or loops held at a constant pitch rate',
-      roll: 'continuous rolls held at a constant roll rate'
-    }[axis] ?? `steady ${axis} rates`;
+  // HOLDS OF TWO KINDS (2 October 2026; read apart since Stage 5b, 4 October
+  // 2026). A hold at zero rate and a hold at a steady rate test the I term in
+  // different regimes. Until Stage 5b a flight with both was refused whole
+  // (HOLD_KIND_MISMATCH); that refusal had once fallen through to "nothing in
+  // the holds calls for an I-term change" on exactly the flights ordinary
+  // pilots fly. Each kind is now read on its own, so this card is reached only
+  // where NEITHER kind had enough holds to be read (TOO_FEW_HOLDS_OF_EITHER_KIND)
+  // — or from a capture made before the split (HOLD_KIND_MISMATCH) — and the
+  // next one where both were read and disagreed. Nothing was judged, so nothing
+  // is cleared: the pilot is told what to fly instead.
+  const zeroRate = (hold.evidence.holds ?? []).filter(entry => entry.holdKind === 'zero');
+  const steadyRate = (hold.evidence.holds ?? []).filter(entry => entry.holdKind === 'sustained');
+  const meanErrorOf = entries => (entries.length === 0 ? null : round(weightedMean(
+    entries.map(entry => entry.absoluteSteadyStateErrorDps),
+    entries.map(entry => entry.measuredDurationUs)
+  ), 2));
+  const kindBasis = () => [
+    basisEntry('holds at zero rate (hovering or flying straight)', zeroRate.length, 'count',
+      'buildHoldEvidence, holdKind zero'),
+    basisEntry('holds at a steady rate (turning)', steadyRate.length, 'count',
+      'buildHoldEvidence, holdKind sustained'),
+    basisEntry('steady-state error, mean over the zero-rate holds', meanErrorOf(zeroRate),
+      'deg/s', 'measureHold, weighted by measured duration'),
+    basisEntry('steady-state error, mean over the steady-rate holds', meanErrorOf(steadyRate),
+      'deg/s', 'measureHold, weighted by measured duration'),
+    basisEntry('a hold counts as zero rate when its command is under',
+      EVIDENCE_LIMITS.zeroHoldThresholdDps, 'deg/s', 'EVIDENCE_LIMITS.zeroHoldThresholdDps')
+  ];
+  // Enough of one kind for every reading, a standing error's included (re-review
+  // of 3 October 2026).
+  const neededOfAKind = Math.max(hold.minimumHolds ?? EVIDENCE_LIMITS.minimumHolds,
+    HOLDS_FOR_A_FULL_READING);
+  const holdSeconds = round(EVIDENCE_LIMITS.minimumHoldDurationUs / 1e6, 1);
+  const offAxisLimit = EVIDENCE_LIMITS.offAxisCommandLimitDps;
+  const rateKind = {yaw: 'pirouettes or turns', pitch: 'turns', roll: 'rolls'}[axis]
+    ?? 'manoeuvres';
+  const stillKind = axis === 'yaw'
+    ? 'still hovers, or straight flight, holding a heading with the pedals centred'
+    : `still hovers, or level flight, with the ${axis} stick centred`;
+  const turningKind = {
+    yaw: 'steady pirouettes or turns at a constant rate',
+    pitch: 'steady turns or loops held at a constant pitch rate',
+    roll: 'continuous rolls held at a constant roll rate'
+  }[axis] ?? `steady ${axis} rates`;
 
+  if (hold.codes.includes('TOO_FEW_HOLDS_OF_EITHER_KIND') || hold.codes.includes('HOLD_KIND_MISMATCH')) {
+    const before = hold.codes.includes('HOLD_KIND_MISMATCH');
     out.push(makeFinding({
       id: 'I_TERM_HOLDS_MIXED',
       rung: 'evidence',
@@ -5826,38 +6350,70 @@ function holdFindings({axis, hold, airframe, headspeed}) {
       kind: 'next-flight',
       confidence: 'low',
       headline: `The steady ${axis} segments in this flight were a mix of holds at zero rate `
-        + `(hovering or flying straight) and holds at a steady rate (${rateKind}), so the I `
-        + 'term was not judged from either.',
+        + `(hovering or flying straight) and holds at a steady rate (${rateKind}), with too few `
+        + 'of either to judge the I term from.',
       reasoning: 'A hold at zero rate and a hold at a steady rate test the I term in two '
         + 'different regimes — holding still against torque and trim, and holding a rate '
-        + 'against a changing load — and averaging them together describes neither. This '
-        + `flight had ${zeroRate.length} of the first and ${steadyRate.length} of the second, `
-        + 'and the two are not yet read separately, so nothing about the I term was judged '
-        + 'here. This is not an all-clear: the I term may be right, too small or too large, '
-        + 'and this flight cannot say which.',
-      basis: [
-        ...basis,
-        basisEntry('holds at zero rate (hovering or flying straight)', zeroRate.length, 'count',
-          'buildHoldEvidence, holdKind zero'),
-        basisEntry('holds at a steady rate (turning)', steadyRate.length, 'count',
-          'buildHoldEvidence, holdKind sustained'),
-        basisEntry('steady-state error, mean over the zero-rate holds', meanErrorOf(zeroRate),
-          'deg/s', 'measureHold, weighted by measured duration'),
-        basisEntry('steady-state error, mean over the steady-rate holds', meanErrorOf(steadyRate),
-          'deg/s', 'measureHold, weighted by measured duration'),
-        basisEntry('a hold counts as zero rate when its command is under',
-          EVIDENCE_LIMITS.zeroHoldThresholdDps, 'deg/s', 'EVIDENCE_LIMITS.zeroHoldThresholdDps')
-      ],
+        + 'against a changing load — and averaging them together describes neither, so '
+        + `each kind is read on its own. This flight had ${zeroRate.length} of the first and `
+        + `${steadyRate.length} of the second, `
+        + (before
+          ? 'measured in a way that does not keep the two apart, '
+          : `and a kind needs ${hold.minimumHolds ?? EVIDENCE_LIMITS.minimumHolds} holds before it `
+            + 'can be read at all, ')
+        + 'so nothing about the I term was judged here. This is not an all-clear: the I term '
+        + 'may be right, too small or too large, and this flight cannot say which.',
+      basis: [...basis, ...kindBasis()],
       candidates: [
         'the I term is right for this aircraft',
         'too little I term on this axis',
         'too much I term on this axis'
       ],
-      confirm: `Fly ${needed} or more steady ${axis} segments of ONE kind, each held for `
-        + `${seconds} s or more with the other two axes under ${offAxis}°/s: either ${still}, `
-        + `or ${turning}. Keep any steady stretch of the other kind shorter than ${seconds} s `
-        + 'in that flight, or outside the window you select — the two kinds are not yet read '
-        + 'separately, so a mix is not judged at all.',
+      confirm: `Fly ${neededOfAKind} or more steady ${axis} segments of ONE kind, each held for `
+        + `${holdSeconds} s or more with the other two axes under ${offAxisLimit}°/s: either `
+        + `${stillKind}, or ${turningKind}. Each kind is read on its own, so a few of the `
+        + 'other kind in the same flight do no harm.',
+      codes: [...hold.codes]
+    }));
+    return out;
+  }
+
+  // BOTH KINDS READ, AND THEY DISAGREE (Stage 5b). The hovers say one thing
+  // about the integrator and the turns another, and one integrator cannot be
+  // both. Something differs between the two regimes — a load that turns change,
+  // a feedforward that adds nothing in a hover — and this flight cannot say
+  // what. Refused as what to fly next; the disagreement itself points at no
+  // linkage, so this card names none. A bind is a different matter: it is read
+  // over each kind and over all the holds before this card is reached, and
+  // where any of them shows one, the bind card above is what the pilot gets
+  // (review of round one, 4 October 2026).
+  if (hold.codes.includes('I_TERM_HOLDS_KINDS_DISAGREE')) {
+    const readingWords = reading => SWEEP_READING_WORDS[reading?.indication] ?? 'nothing';
+    out.push(makeFinding({
+      id: 'I_TERM_HOLDS_KINDS_DISAGREE',
+      rung: 'evidence',
+      axis,
+      kind: 'next-flight',
+      confidence: 'none',
+      headline: `The ${axis} hovers and the ${axis} turns read the I term differently, so it `
+        + 'was not judged from either.',
+      reasoning: `Read on their own, the ${zeroRate.length} still holds (hovering or flying `
+        + `straight) showed "${readingWords(hold.kinds?.zero)}", and the ${steadyRate.length} `
+        + `steady-rate holds (${rateKind}) showed "${readingWords(hold.kinds?.sustained)}". One I `
+        + 'term cannot be both, so something differs between holding still and holding a turn '
+        + '— a load the turns change, or feedforward, which adds nothing while nothing is '
+        + 'commanded — and this flight cannot say what. This is not an all-clear, and it is '
+        + 'not a finding about the aircraft either: the I term may be right, too small or too '
+        + 'large.',
+      basis: [...basis, ...kindBasis()],
+      candidates: [
+        'the I term is right, and something that changes with turning moves the turns',
+        'too little I term on this axis',
+        'too much I term on this axis'
+      ],
+      confirm: `Fly ${neededOfAKind} or more ${stillKind}, each held for ${holdSeconds} s or `
+        + `more with the other two axes under ${offAxisLimit}°/s, in one flight; and the same `
+        + `number of ${turningKind} in another. Each flight is then read from one kind alone.`,
       codes: [...hold.codes]
     }));
     return out;
@@ -5883,7 +6439,7 @@ function holdFindings({axis, hold, airframe, headspeed}) {
     // an aircraft whose hover ripple sits among the sweep's own thresholds is
     // more of the very evidence that just flipped.
     const flips = describeSweepFlips(hold.sweepPoints ?? []);
-    const ripple = hold.evidence?.summary?.meanErrorRippleRmsDps;
+    const ripple = summary?.meanErrorRippleRmsDps;
     const rippleAmongThresholds = Number.isFinite(ripple) && flips.rippleLowDps !== null
       && ripple >= flips.rippleLowDps && ripple <= flips.rippleHighDps;
 
@@ -6011,6 +6567,111 @@ function holdFindings({axis, hold, airframe, headspeed}) {
     return out;
   }
 
+  // GUARD B REFUSED (Stage 5b): the yaw integrator moved with the collective
+  // inside the holds, significantly at an alpha in HOLD_SWEEP. Said as what was
+  // measured (review of round one, 4 October 2026): a correlation, from a test
+  // measured to fire on unrelated slow signals more often than its nominal
+  // alpha (COLLECTIVE_GUARD_FALSE_ALARM), with the precompensation as one
+  // possible cause — as the candidates list it — and not as a finding. How much
+  // of the tail's correction rides on collective is its own measurement, which
+  // this version does not yet show.
+  if (hold.codes.includes('YAW_HOLD_MOVES_WITH_COLLECTIVE')) {
+    const coupling = hold.collectiveCorrelation;
+    const falseAlarm = COLLECTIVE_GUARD_FALSE_ALARM;
+    const percent = value => Math.round(value * 100);
+    out.push(makeFinding({
+      id: 'YAW_HOLD_MOVES_WITH_COLLECTIVE',
+      rung: 'gain-I',
+      axis,
+      kind: 'next-flight',
+      confidence: 'none',
+      headline: 'The yaw I term moved with the collective during the holds, so it was not '
+        + 'judged from them.',
+      reasoning: `Inside the ${judgedCount} yaw holds the I term moved with the collective `
+        + `(correlation ${round(coupling?.correlation, 2)} over about `
+        + `${round(coupling?.effectiveCount, 0)} independent points, p ${coupling?.pValue}). That is `
+        + 'a correlation, and the test behind it, run on unrelated signals as slow as these, was '
+        + `measured to find one in about ${percent(falseAlarm.low)}-${percent(falseAlarm.high)} % `
+        + `of draws at alpha ${falseAlarm.alpha} rather than ${percent(falseAlarm.alpha)} %, so it `
+        + 'can be chance. Either way, an I term that moved with the collective during the holds is '
+        + 'not a clean reading of the I gain, so neither a change nor an all-clear is read from '
+        + 'these holds. One possible cause is main-rotor torque, which changes with collective, '
+        + 'reaching the tail where the collective precompensation does not cover it; these holds '
+        + 'cannot say whether that is what happened. How much of the tail\'s correction follows '
+        + 'the collective is a separate measurement, which RotorLens does not show yet.',
+      basis: [...basis,
+        basisEntry('correlation of the yaw I term with collective inside the holds',
+          coupling?.correlation ?? null, 'r', 'effectiveCorrelation, 148 ms blocks'),
+        basisEntry('independent points that correlation rests on', coupling?.effectiveCount ?? null,
+          'count', 'effectiveCorrelation, lag-one effective count'),
+        basisEntry('chance of a correlation that size between unrelated collective and I term',
+          coupling?.pValue ?? null, 'p', 'Fisher z on the effective count'),
+        basisEntry('significance levels tried', HOLD_SWEEP.collectiveCorrelationAlpha.join(', '),
+          'alpha', 'HOLD_SWEEP.collectiveCorrelationAlpha'),
+        basisEntry('how often this test finds a correlation between unrelated signals this slow',
+          `${falseAlarm.low}-${falseAlarm.high}`, 'share',
+          `COLLECTIVE_GUARD_FALSE_ALARM, measured at alpha ${falseAlarm.alpha}`)],
+      candidates: [
+        'the collective precompensation leaving main-rotor torque for the integrator to carry',
+        'two unrelated slow signals moving together by chance',
+        'under either, an I term that is right, too small or too large — these holds cannot say'
+      ],
+      confirm: `Fly ${HOLDS_FOR_A_FULL_READING} or more still hovers of ${holdSeconds} s or more `
+        + 'with the pedals left alone AND the collective held steady through each one; the I term '
+        + 'is then read with nothing for it to carry.',
+      codes: [...hold.codes]
+    }));
+    return out;
+  }
+
+  // GUARD A REFUSED (Stage 5b): the slow wobble that read as the I term hunting
+  // was coherent with the stick — the pilot's own corrections, at the hunt's
+  // frequency, beyond what chance gives at the evidence count.
+  if (hold.codes.includes('HUNTING_FOLLOWS_THE_STICK')) {
+    const stick = hold.stickCoherence;
+    const voting = (stick?.points ?? []).filter(point => point.verdict !== 'abstained');
+    const following = voting.filter(point => point.verdict === 'follows-the-stick');
+    const strongest = following.reduce((best, point) =>
+      (best === null || point.coherence > best.coherence ? point : best), null);
+    const control = axis === 'yaw' ? 'pedals' : 'cyclic';
+    out.push(makeFinding({
+      id: 'HUNTING_FOLLOWS_THE_STICK',
+      rung: 'gain-I',
+      axis,
+      kind: 'next-flight',
+      confidence: 'none',
+      headline: `The slow ${axis} wobble during the holds followed the stick, so it was read as `
+        + 'your own corrections, not the I term.',
+      reasoning: `The error swung ${round(summary?.meanErrorRippleRmsDps, 1)} deg/s RMS at about `
+        + `${round(stick?.frequencyHz, 2)} Hz, inside the band an integrator can cause, and the I `
+        + 'term swung with it. But the stick moved with it too: at that frequency the error was '
+        + `coherent with the ${control} input (up to ${round(strongest?.coherence, 2)}, against a `
+        + `chance level of ${round(strongest?.threshold, 2)}) at ${following.length} of the `
+        + `${voting.length} settings that could measure it. A pilot making small, steady `
+        + 'corrections makes exactly this picture, and an integrator hunting on its own does not '
+        + 'follow the stick. This is not an all-clear on the I term.',
+      basis: [...basis,
+        basisEntry('frequency the wobble was read at', stick?.frequencyHz ?? null, 'Hz',
+          'measureHold crossing rate, halved'),
+        basisEntry('largest stick-to-error coherence at that frequency', strongest?.coherence ?? null,
+          'share', 'welchCoherence, pooled over the holds'),
+        basisEntry('coherence two unrelated signals reach by chance at that setting',
+          strongest?.threshold ?? null, 'share', 'coherenceNullLevel'),
+        basisEntry('settings that found the wobble following the stick',
+          `${following.length} of ${voting.length}`, null,
+          'HOLD_SWEEP.stickCoherenceAlpha x HOLD_SWEEP.welchSegmentUs')],
+      candidates: [
+        'your own small corrections on the stick, at the wobble\'s rate',
+        'under them, an I term that is right, too small or too large — these holds cannot say'
+      ],
+      confirm: `Fly ${HOLDS_FOR_A_FULL_READING} or more still holds of ${holdSeconds} s or more with `
+        + `the ${control} left alone — hands off, if the aircraft allows it — so that whatever `
+        + 'still wobbles is the aircraft and not the stick.',
+      codes: [...hold.codes]
+    }));
+    return out;
+  }
+
   // The aircraft IS wandering slowly and the integrator is not big enough to be
   // doing it. Saying nothing here would be worse than the wrong answer: the
   // pilot can see the wander, and silence invites him to go looking for a gain.
@@ -6049,6 +6710,29 @@ function holdFindings({axis, hold, airframe, headspeed}) {
   }
 
   if (hold.indication === 'decrease') {
+    // WHAT THE STICK TEST MEASURED, AND NO MORE (review of round one, 4 October
+    // 2026). This said "the wobble did not follow the stick", and all a
+    // coherence under its chance level shows is that the stick was not found in
+    // it from that many segments. Quoted instead: the setting that came closest
+    // to its chance level, with the coherence, the level and the segments.
+    const stickVotes = (hold.stickCoherence?.points ?? [])
+      .filter(point => point.verdict === 'below-null');
+    const closest = stickVotes.reduce((best, point) => (best === null
+      || point.coherence / point.threshold > best.coherence / best.threshold ? point : best), null);
+    const control = axis === 'yaw' ? 'pedal' : 'cyclic';
+    const stickHz = round(hold.stickCoherence?.frequencyHz, 2);
+    let stickSentence = '';
+    if (closest?.state === 'x-still') {
+      stickSentence = ` The ${control} input did not move at ${stickHz} Hz over the holds at all, `
+        + 'so nothing in the wobble at that frequency came from it.';
+    } else if (closest) {
+      stickSentence = ` At ${stickHz} Hz the error's coherence with the ${control} input was `
+        + `${round(closest.coherence, 2)} over ${closest.segmentCount} Welch segments of `
+        + `${round(closest.segmentUs / 1e6, 2)} s, under the ${round(closest.threshold, 2)} that two `
+        + `unrelated signals reach by chance at alpha ${closest.alpha}; that was the closest any of `
+        + `the ${stickVotes.length} settings able to test it came to its chance level. That is the `
+        + 'stick not found in the wobble from that many segments, not proof that none of it was there.';
+    }
     out.push(makeFinding({
       id: 'I_TOO_HIGH',
       rung: 'gain-I',
@@ -6058,14 +6742,23 @@ function holdFindings({axis, hold, airframe, headspeed}) {
       direction: 'decrease',
       confidence: hold.confidence,
       headline: `Lower ${axis} I.`,
-      reasoning: 'During the steady holds the error kept crossing zero at a slow rate — '
-        + 'inside the band an integrator can cause and below what the measurement filter can '
-        + 'be fooled by — with the slow component standing clearly above the noise that was '
+      reasoning: `During the steady holds${kindWords} the error kept crossing zero at a slow `
+        + 'rate — inside the band an integrator can cause and below what the measurement filter '
+        + 'can be fooled by — with the slow component standing clearly above the noise that was '
         + 'filtered out, and the I TERM ITSELF crossing its own mean at the same rate. That '
         + 'last part is what says the integrator is carrying the oscillation rather than '
         + 'sitting still while something else moves the aircraft. The reading held at every '
-        + 'filter length that could see it, and at every ripple threshold tried.',
-      basis,
+        + 'filter length that could see it, and at every ripple threshold tried.' + stickSentence,
+      basis: [...basis,
+        basisEntry('stick-to-error coherence at the wobble\'s frequency', closest?.coherence ?? null,
+          'share', 'welchCoherence, pooled over the holds; the setting closest to its chance level'),
+        basisEntry('coherence two unrelated signals reach by chance at that setting',
+          closest?.threshold ?? null, 'share', 'coherenceNullLevel'),
+        basisEntry('Welch segments that coherence rests on', closest?.segmentCount ?? null, 'count',
+          'welchCoherence'),
+        basisEntry('settings able to test the stick', stickVotes.length, 'count',
+          'HOLD_SWEEP.stickCoherenceAlpha x HOLD_SWEEP.welchSegmentUs, within '
+            + 'STICK_COHERENCE_VOTE.maximumNullLevel')],
       // Three or more since round three: a standing error appearing after the
       // change is read only from that many (re-review of 3 October 2026).
       confirm: `Lower ${axis} I one step, change nothing else, and fly ${HOLDS_FOR_A_FULL_READING} `
@@ -6090,14 +6783,14 @@ function holdFindings({axis, hold, airframe, headspeed}) {
       // side was kept "which a slow wander does not do"; a wander slow enough
       // keeps its side through three holds, and what refuses it is the per-hold
       // clearance — the error larger than its own movement in every hold.
-      reasoning: 'During the steady holds the aircraft sat off the commanded rate and stayed '
-        + `there — on the same side in every one of the ${hold.holdCount} holds, and larger than `
-        + 'its own movement in each — and the I term, the one whose job is exactly that error, '
+      reasoning: `During the steady holds${kindWords} the aircraft sat off the commanded rate and `
+        + `stayed there — on the same side in every one of the ${judgedCount} holds, and larger `
+        + 'than its own movement in each — and the I term, the one whose job is exactly that error, '
         + 'is small and is not winding up against it. That is an integrator that is not doing '
         + 'enough, and it is specifically NOT the pattern a binding linkage makes, which is the '
         + 'same error with the I term wound large and still growing.',
       basis: [...basis, basisEntry('average error in each hold',
-        (hold.evidence.holds ?? []).map(entry => round(entry.steadyStateErrorDps, 1)).join(', '),
+        judgedHolds.map(entry => round(entry.steadyStateErrorDps, 1)).join(', '),
         'deg/s', 'measureHold, signed')],
       // Three or more, or the re-fly cannot read a standing error that is still
       // there (re-review of 3 October 2026).
@@ -6204,7 +6897,7 @@ function holdFindings({axis, hold, airframe, headspeed}) {
   // I_TERM_NOT_JUDGED, which does not claim to know what moved the aircraft.
   const oscillationHz = Number.isFinite(crossings) ? crossings / CROSSINGS_PER_CYCLE : 0;
   const belowBand = oscillationHz < bandLow;
-  const heldErrors = (hold.evidence.holds ?? []).map(entry => entry.steadyStateErrorDps);
+  const heldErrors = judgedHolds.map(entry => entry.steadyStateErrorDps);
   const onEachSide = [heldErrors.filter(value => value > 0).length,
     heldErrors.filter(value => value < 0).length];
   const errorList = heldErrors.map(value => round(value, 1)).join(', ');
@@ -6273,13 +6966,28 @@ function holdFindings({axis, hold, airframe, headspeed}) {
   // part under the movement threshold, which a slow movement at any frequency the
   // band admits would have crossed. Since round three a fast oscillation never
   // reaches here — it hides whatever moved more slowly under it.
-  const reasoning = 'Across the measured holds the aircraft neither sat off the commanded rate '
-    + 'nor wandered slowly either side of it: the average error was '
+  //
+  // WORDED AS WHAT THE HOLDS SHOWED, NEVER AS "THE I TERM IS RIGHT" (Stage 5b,
+  // 4 October 2026). This card has no positive control: across the 31 real
+  // flights not one hold carried a standing error (the largest flight mean was
+  // 2.2 deg/s against the 3 it takes), so the reading behind it has never been
+  // shown catching the thing it rules out. It says what was not seen, and in how
+  // many holds, and nothing about the gain.
+  const reasoning = `Across the ${judgedCount} holds${kindWords} the aircraft neither sat off the `
+    + 'commanded rate nor wandered slowly either side of it: the average error was '
     + `${meanError} deg/s, under the ${HOLD_READING_THRESHOLDS.errorDps} deg/s that would be read `
     + `as a standing error, and its slow part moved ${ripple} deg/s RMS, under the `
     + `${HOLD_READING_THRESHOLDS.huntingRippleDps} deg/s that would have been read as movement. `
-    + 'A confident negative is worth as much as a change here: it is what stops a pilot moving '
-    + 'a gain that was never the problem.';
+    + 'That is what these holds showed, not a test of whether the I gain is right: no flight '
+    + 'these thresholds have been checked on so far had a standing error to find, so this '
+    + 'reading has never been seen catching one.'
+    + (hold.codes.includes('HOLDS_OF_ONE_KIND_TOO_FEW_TO_READ')
+      ? (hold.holdCount - judgedCount === 1
+        ? ' One hold of the other kind — still against steady-rate — was too few to read on its '
+          + 'own and is not part of this.'
+        : ` ${hold.holdCount - judgedCount} holds of the other kind — still against steady-rate — `
+          + 'were too few to read on their own and are not part of this.')
+      : '');
 
   out.push(makeFinding({
     id: 'I_TERM_WITHIN_TOLERANCE',
@@ -6287,7 +6995,7 @@ function holdFindings({axis, hold, airframe, headspeed}) {
     axis,
     kind: 'observation',
     confidence: hold.confidence === 'none' ? 'low' : hold.confidence,
-    headline: `Nothing in the ${axis} holds calls for an I-term change.`,
+    headline: `No standing error seen in ${judgedCount} ${axis} holds${kindWords}.`,
     reasoning,
     basis,
     confirm: null,

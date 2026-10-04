@@ -33,10 +33,15 @@ export const SHIPPED_FIGURES = Object.freeze({
   /**
    * Per-axis identical-gain p90s that flight-history.mjs's SENSITIVITY_FLOOR_DPS
    * was rounded up from, at n = 5, 4 and 18. Comments, not constants: nothing in
-   * `src/` reads these. Measured over whole flight windows; over the governor
-   * span (4 October 2026) the same corpus measures roll 0.8096, pitch 0.3636,
-   * yaw 0.0880 at n = 8, 12 and 19, with worst pairs 0.8096, 1.2472 and 0.1115 —
-   * the counts and worst pairs OBSERVED_NULL_PAIRS quotes to a pilot.
+   * `src/` reads these. Measured over whole flight windows, with the hold
+   * detector of that time (an input on another axis voided a hold); reproduce
+   * them with `createCorpusScan({cutToGovernorSpan: false, offAxisInputEndsHold:
+   * false})`. Over the governor span (4 October 2026) the same corpus measured
+   * roll 0.8096, pitch 0.3636, yaw 0.0880 at n = 8, 12 and 19; and with an input
+   * on another axis ending a hold (Stage 5b, the same day, as revised after its
+   * review) roll 0.3218, pitch 0.8307, yaw 0.0621 at n = 21, 20 and 21, with
+   * worst pairs 0.3875, 1.2472 and 0.0825 — the counts and worst pairs
+   * OBSERVED_NULL_PAIRS quotes to a pilot.
    */
   perAxisNoiseFloorP90Dps: Object.freeze({roll: 0.915, pitch: 1.390, yaw: 0.0966}),
   /**
@@ -546,7 +551,8 @@ export function renderCorpusReport(summary, options = {}) {
   say('   A floor is only as good as the number of pairs behind it. Read the pair');
   say('   count first: a p90 over three pairs is a sentence about three flights.');
   say('   "Previously reported" was measured over whole flight windows, before the');
-  say('   4 October 2026 cut to the governor span; "here" is over the span.');
+  say('   4 October 2026 cut to the governor span and with holds an input on another');
+  say('   axis voided; "here" is over the span, with such an input ending a hold.');
 
   say('');
   say('='.repeat(72));

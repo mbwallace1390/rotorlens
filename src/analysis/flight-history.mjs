@@ -2016,10 +2016,24 @@ function compareAxisHold(before, after, axis, changedTerm = null) {
     return inconclusive('INSUFFICIENT_HOLD_SEGMENTS_FOR_COMPARISON');
   }
 
-  // A heading hold and a constant-rate turn are different tests. Mixed evidence
-  // is not one kind and cannot be compared as though it were.
+  // A heading hold and a constant-rate turn are different tests, so a kind is
+  // compared only with itself (per kind since Stage 5b, 4 October 2026: hovers
+  // against hovers, turns against turns, and `measured.holdKind` says which).
+  //
+  // WHAT A SAVED RECORD ALLOWS. The engine now reads each kind of hold on its
+  // own, but a record keeps ONE set of numbers over all of a flight's holds,
+  // with the count of each kind beside it. A side that held one kind only is a
+  // measurement of that kind. A side that mixed both is an average of two
+  // different tests, and nothing stored can separate them, so it is refused as
+  // that (HOLD_KINDS_MIXED_IN_RECORD) rather than as the other kind. Storing
+  // each kind's numbers would let it be read; that is a record-shape change
+  // with the privacy documents, left for the stage that changes the record.
   const fromKind = holdKindOf(from);
   const toKind = holdKindOf(to);
+  const mixed = hold => hold?.zeroHoldCount > 0 && hold?.sustainedHoldCount > 0;
+  if (mixed(from) || mixed(to)) {
+    return inconclusive('HOLD_KINDS_MIXED_IN_RECORD');
+  }
   if (fromKind === null || toKind === null || fromKind !== toKind) {
     return inconclusive('HOLD_KIND_MISMATCH');
   }
@@ -2045,6 +2059,8 @@ function compareAxisHold(before, after, axis, changedTerm = null) {
 
   const measured = Object.freeze({
     metric: 'meanAbsoluteSteadyStateErrorDps',
+    /** The kind of hold compared: 'zero' (hovers) or 'sustained' (turns). */
+    holdKind: fromKind,
     before: round(baseline, 4),
     after: round(test, 4),
     differenceDps: round(difference, 4),
@@ -2142,14 +2158,27 @@ function compareAxisStop(before, after, axis) {
  * The identical-gain pairs behind each axis's floor: how many, and the largest
  * difference any of them showed.
  *
- * MEASURED OVER THE GOVERNOR SPAN, the seconds every hold the app measures now
- * comes from (Stage 5a): section 4 of `npm run corpus:report` over the two
- * reference dumps, re-run 4 October 2026 — roll 8 pairs, p90 = max 0.8096;
- * pitch 12 pairs, p90 0.3636, max 1.2472; yaw 19 pairs, p90 0.0880, max 0.1115.
- * Each maximum is rounded UP to three significant figures, because this is the
- * bound a pilot is told no pair of unchanged flights exceeded, and rounding a
- * bound down makes it false. `test/corpus-report.test.mjs` re-measures them
- * when ROTORLENS_CORPUS_LOGS is set and fails if a span pair exceeds one.
+ * MEASURED THE WAY THE APP NOW MEASURES HOLDS: over the governor span (Stage
+ * 5a), with an input on another axis ending a hold rather than voiding it
+ * (Stage 5b). Section 4 of `npm run corpus:report` over the two reference
+ * dumps, re-run 4 October 2026 after the review of Stage 5b's round one — roll
+ * 21 pairs, p90 0.3218, max 0.3875; pitch 20 pairs, p90 0.8307, max 1.2472; yaw
+ * 21 pairs, p90 0.0621, max 0.0825. Each maximum is rounded UP to three
+ * significant figures, because this is the bound a pilot is told no pair of
+ * unchanged flights exceeded, and rounding a bound down makes it false.
+ * `test/corpus-report.test.mjs` re-measures them when ROTORLENS_CORPUS_LOGS is
+ * set and fails if a pair exceeds one.
+ *
+ * RE-QUOTED AGAIN IN STAGE 5b, for the same reason as in 5a below: the prefix
+ * rule changed which holds are measured, so it changed which flights carry a
+ * captured hold on each axis and what each one's mean error is. More flights
+ * qualify on every axis (the pair counts went 8/12/19 to 17/20/21), and the
+ * span-only figures — roll 8 pairs, max 0.8096; pitch 12, max 1.2472; yaw 19,
+ * max 0.1115 — no longer described the measurement a comparison is made from.
+ * The review of round one moved them once more (17/20/21 to 21/20/21; round
+ * one's maxima were 0.3948, 1.2472 and 0.0997): an input inside a hold's settle
+ * second no longer ends it, and records that begin during an input keep their
+ * first stretch dropped, so again which holds are measured changed.
  *
  * WHY THEY WERE RE-QUOTED (Stage 5a review). Until then these were the window
  * figures of 3 October 2026 — roll 5 pairs, max 0.915; pitch 4, max 1.3896; yaw
@@ -2159,20 +2188,22 @@ function compareAxisStop(before, after, axis) {
  * error again, one decimal place smaller.
  *
  * The GATES did not move with them. SENSITIVITY_FLOOR_DPS is rounded up from
- * the window-era p90s, and every span p90 sits below it (roll 0.81 under 0.92,
- * pitch 0.36 under 1.39, yaw 0.088 under 0.1), so the cut made no gate looser;
- * lowering one is a calibration decision, not a re-quote. On roll and pitch
- * the gate now sits above the worst pair as well, so their sentence names only
- * the worst pair; yaw's worst pair sits above its gate, and both are named.
+ * the window-era p90s, and every p90 measured since sits below it (after Stage
+ * 5b's review: roll 0.32 under 0.92, pitch 0.83 under 1.39, yaw 0.062 under
+ * 0.1), so
+ * neither change made a gate looser; lowering one is a calibration decision,
+ * not a re-quote. Every axis's gate now sits above its worst pair as well, so
+ * each sentence names only the worst pair (until Stage 5b yaw's worst pair,
+ * 0.1115, sat above its 0.1 gate, and both were named).
  *
  * Per axis, because the pooled worst case (1.390, from the 47 pooled pairs in
  * EVIDENCE_LIMITS.holdErrorNoiseFloorDps) quoted beside a yaw floor told a pilot
  * yaw had once wandered by more than ten times its real worst.
  */
 const OBSERVED_NULL_PAIRS = Object.freeze({
-  roll: Object.freeze({pairs: 8, maximumDps: 0.81}),
-  pitch: Object.freeze({pairs: 12, maximumDps: 1.25}),
-  yaw: Object.freeze({pairs: 19, maximumDps: 0.112})
+  roll: Object.freeze({pairs: 21, maximumDps: 0.388}),
+  pitch: Object.freeze({pairs: 20, maximumDps: 1.25}),
+  yaw: Object.freeze({pairs: 21, maximumDps: 0.0825})
 });
 
 const FLOOR_AXES = Object.freeze(['roll', 'pitch', 'yaw']);
@@ -2533,10 +2564,12 @@ export function compareFlightRecords(before, after) {
  * roll and pitch. The scale separation is corroborated independently at better n
  * by per-segment spread: roll sd 0.348 (n=28), pitch 0.445 (n=21), yaw 0.0355
  * (n=25). Those pair figures are over whole flight windows (3 October 2026);
- * over the governor span the holds are now measured on, the same corpus gives
- * roll p90 0.8096 (n=8), pitch 0.3636 (n=12), yaw 0.0880 (n=19) — yaw's scale
- * still four to nine times below the others' (4 October 2026; see
- * OBSERVED_NULL_PAIRS).
+ * over the governor span the holds are now measured on, the same corpus gave
+ * roll p90 0.8096 (n=8), pitch 0.3636 (n=12), yaw 0.0880 (n=19), and with an
+ * input on another axis ending a hold rather than voiding it (Stage 5b, as
+ * revised after its review) roll 0.3218 (n=21), pitch 0.8307 (n=20), yaw
+ * 0.0621 (n=21) — yaw's scale still five to thirteen times below the others'
+ * (4 October 2026; see OBSERVED_NULL_PAIRS).
  *
  * The same cut dissolves the "heavy tail" that motivated so much of the caution
  * here. Half-normal sigmas fitted to the pooled null quantiles span 8.3x
@@ -2634,10 +2667,13 @@ export const SENSITIVITY_RESPONSE_METRIC = 'meanAbsoluteSteadyStateErrorDps';
  * yaw 0.0966, over whole flight windows, 3 October 2026), because rounding a
  * floor up only ever refuses more. Over the governor span the holds are now
  * measured on, the same corpus gives p90s of roll 0.8096, pitch 0.3636 and yaw
- * 0.0880 (4 October 2026): every one is below its floor, so the floors were
- * left as they are — still conservative, and lowering one is a calibration
- * decision for its own change. The pair counts and worst pairs the pilot is
- * shown are the span's (OBSERVED_NULL_PAIRS). `pooled` is
+ * 0.0880, and with an input on another axis ending a hold (Stage 5b, as revised
+ * after its review) roll 0.3218, pitch 0.8307 and yaw 0.0621 (4 October 2026):
+ * every one is below its
+ * floor, so the floors were left as they are — still conservative, and
+ * lowering one is a calibration decision for its own change. The pair counts
+ * and worst pairs the pilot is shown are measured the way holds now are
+ * (OBSERVED_NULL_PAIRS). `pooled` is
  * the shipped figure, kept as the fallback for an axis with no per-axis
  * measurement and named `pooled` so it can never again be mistaken for one.
  *

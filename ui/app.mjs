@@ -2856,8 +2856,18 @@ const PLAIN_ENGLISH = {
   STOPS_SETTLE_CLEANLY: finding =>
     `Your ${AXIS_THING[finding.axis] ?? finding.axis} stops cleanly. That is a measurement, `
     + 'not silence — it was looked at and there was nothing to fix.',
-  I_TERM_WITHIN_TOLERANCE: finding =>
-    `Nothing in the way you held ${finding.axis} calls for an I change.`,
+  // Reworded 4 October 2026 (Stage 5b), with the engine's card: it said
+  // "Nothing ... calls for an I change", which reads as "your I is right". No
+  // flight behind this reading has had a standing error for it to find, so it
+  // says only what was not seen, and in how many holds.
+  I_TERM_WITHIN_TOLERANCE: finding => {
+    const thing = AXIS_THING[finding.axis] ?? finding.axis;
+    const count = (finding.basis ?? [])
+      .find(entry => entry.label === 'holds the reading rests on')?.value;
+    return Number.isFinite(count)
+      ? `No standing error was seen in the ${count} times you held your ${thing} steady.`
+      : `No standing error was seen in the times you held your ${thing} steady.`;
+  },
   // Reworded 4 October 2026 (Stage 5a), with the engine's card. It said there was
   // "no answer to give you" and its confirm asked for more long still holds —
   // more of the hovering that had just flipped. It now names what the answer
@@ -2894,10 +2904,33 @@ const PLAIN_ENGLISH = {
   },
   // Added 2 October 2026. This flight used to read "Nothing ... calls for an I
   // change" here, about holds that were never judged.
+  // Reworded 4 October 2026 (Stage 5b): each kind is now read on its own, so
+  // this card means neither kind had enough holds to be read.
   I_TERM_HOLDS_MIXED: finding =>
-    `Your steady ${finding.axis} flying mixed holding still with holding a steady turn. `
-    + 'Those test the I term in two different ways and cannot be judged together, so the I '
-    + 'term was not judged at all — this is not an all-clear.',
+    `Your steady ${finding.axis} flying mixed holding still with holding a steady turn, with `
+    + 'too few of either to read the I term from — each kind is judged on its own. The I term '
+    + 'was not judged at all; this is not an all-clear.',
+  // Added 4 October 2026 (Stage 5b).
+  I_TERM_HOLDS_KINDS_DISAGREE: finding =>
+    `Holding your ${AXIS_THING[finding.axis] ?? finding.axis} still and holding it in a steady `
+    + 'turn told different stories about the I term, and one I setting cannot be both, so it '
+    + 'was not judged. Fly still hovers in one flight and steady turns in another. This is not '
+    + 'an all-clear.',
+  HUNTING_FOLLOWS_THE_STICK: finding =>
+    `The slow wobble while you held your ${AXIS_THING[finding.axis] ?? finding.axis} steady moved `
+    + 'with your own stick inputs, so it was read as your corrections rather than the I term. '
+    + `Fly still holds with the ${finding.axis === 'yaw' ? 'pedals' : 'cyclic'} left alone. `
+    + 'This is not an all-clear.',
+  // Reworded 4 October 2026 (review of round one): what was measured, with the
+  // collective-to-tail mix as one possible cause and not a finding, and how
+  // often the test finds such a link between unrelated signals this slow — the
+  // figure is COLLECTIVE_GUARD_FALSE_ALARM in src/analysis/recommendations.mjs.
+  YAW_HOLD_MOVES_WITH_COLLECTIVE: () =>
+    'Your tail\'s I term moved with the collective during these holds, so the I term was not '
+    + 'judged. One possible cause is main-rotor torque the collective-to-tail mix leaves for the '
+    + 'I term to carry; a link like this also turns up by chance, in about 10-15 % of unrelated '
+    + 'signals this slow. Fly still hovers with the pedals left alone and the '
+    + 'collective held steady. This is not an all-clear.',
   // Added 2 October 2026 (round two). Each of these used to read "Nothing in
   // the way you held ... calls for an I change".
   I_TERM_SIGNATURES_CONFLICT: finding =>
@@ -2937,6 +2970,19 @@ const PLAIN_ENGLISH = {
   I_TERM_NOT_JUDGED: finding => {
     const thing = AXIS_THING[finding.axis] ?? finding.axis;
     const codes = finding.codes ?? [];
+    // Stage 5b (4 October 2026): the two guards on the I-term reading, where
+    // they could not be checked. Each refuses rather than passes, and says so.
+    if (codes.includes('STICK_COHERENCE_NOT_MEASURED')) {
+      return `Your ${thing} wobbled slowly while you held it, but these holds were too short or `
+        + 'too few to check whether the wobble was your own corrections on the stick, so the I '
+        + 'term was not judged. Fly longer still holds with the stick left alone. This is not an '
+        + 'all-clear.';
+    }
+    if (codes.includes('COLLECTIVE_CORRELATION_NOT_MEASURED')) {
+      return 'Whether your tail\'s I term was busy following the collective during these holds '
+        + 'could not be checked, so the I term was not judged. Fly still hovers with the pedals '
+        + 'left alone and the collective held steady. This is not an all-clear.';
+    }
     // 3 October 2026 (re-review of round three): an offset that stood on one side
     // in every hold, beside a band a quicker shake or the gyro's noise hid. It
     // used to be "raise I"; it is said as both halves of what was seen.
@@ -4120,6 +4166,11 @@ const REFUSAL_WORDS = {
   HOLD_KIND_MISMATCH:
     'one flight was holding a heading and the other a constant rate. Those are '
     + 'different tests.',
+  // Stage 5b: holds of each kind are compared with their own kind, and a saved
+  // flight keeps one set of numbers over all its holds.
+  HOLD_KINDS_MIXED_IN_RECORD:
+    'one flight mixed still hovers with steady turns, and a saved flight keeps one '
+    + 'average over all its holds, so it cannot be compared as either kind.',
   HEADSPEED_MISMATCH:
     'the head speed differed between the flights. The same gains at a different '
     + 'head speed are a different controller.',
@@ -7117,7 +7168,7 @@ export function renderStopEvidence(axis, term, diagnostics, evidence, summary) {
  * the strength of least-squares slopes fitted over half-second holds. Numbers a
  * pilot can check beat a badge he cannot.
  */
-function renderHoldEvidence(axis, evidence) {
+export function renderHoldEvidence(axis, evidence) {
   const brief = describeHoldCapture(evidence, {axis});
   const badge = evidence.status === 'captured'
     ? pill('good', 'captured')
@@ -7144,6 +7195,23 @@ function renderHoldEvidence(axis, evidence) {
       stat('Fast content', `${text(summary.meanErrorNoiseRmsDps)}&deg;/s`,
         'noise and vibration, reported apart from the slow ripple')
     ].join('') + '</div>');
+  }
+
+  // WHERE AN INPUT ON ANOTHER AXIS ENDED A HOLD (Stage 5b, 4 October 2026). Such
+  // an input used to void the whole steady stretch; it now ends the hold there
+  // and the steady part before it is measured. Each hold that ended that way is
+  // listed with its seconds into the recording — the clock the window strip
+  // uses — so a hold shorter than the pilot flew it says why.
+  const endedByInput = (evidence.holds ?? []).filter(hold => hold.endedBy === 'off-axis-input');
+  if (endedByInput.length > 0) {
+    const origin = state.window?.logStartUs ?? 0;
+    const at = timeUs => (Number.isFinite(timeUs) ? ((timeUs - origin) / 1e6).toFixed(1) : '—');
+    parts.push('<h3>Holds ended by an input on another axis</h3><ul class="reasons">' +
+      endedByInput.map(hold =>
+        `<li>${esc(at(hold.startTimeUs))}–${esc(at(hold.endTimeUs))} s — ended by a ` +
+        `${esc(hold.endedByAxis ?? 'other-axis')} input; the steady part before it was ` +
+        'measured.</li>'
+      ).join('') + '</ul>');
   }
 
   // Unconditional, and deliberately so. REWORDED 12 August 2026 with the
