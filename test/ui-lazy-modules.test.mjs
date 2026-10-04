@@ -175,7 +175,7 @@ function connect(endpoint) {
         return;
       }
       const handler = pending.get(message.id);
-      if (handler) {
+      if (typeof handler === 'function') {
         pending.delete(message.id);
         handler(message);
       }
