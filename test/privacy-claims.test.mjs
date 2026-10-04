@@ -30,6 +30,18 @@ import path from 'node:path';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+// Repeated until nothing changes, because one pass over `<!<!---->--` leaves a `<!--`;
+// an unterminated comment then runs to the end of the document, as XML says.
+function stripXmlComments(xml) {
+  let previous;
+  let current = xml;
+  do {
+    previous = current;
+    current = current.replace(/<!--[\s\S]*?-->/g, '');
+  } while (current !== previous);
+  return current.replace(/<!--[\s\S]*$/, '');
+}
+
 /** Every JavaScript file that ships inside the APK: `ui/` and `src/`. */
 async function shippedSources(directory = null, collected = []) {
   const roots = directory ? [directory] : [
@@ -285,7 +297,7 @@ test('what is stored cannot leave the phone by backup or by device transfer', as
 
   // Comments in that file explain the domains; scanning them as if they were
   // rules would let a deleted <exclude> pass because its explanation survived.
-  const withoutXmlComments = rules.replace(/<!--[\s\S]*?-->/g, '');
+  const withoutXmlComments = stripXmlComments(rules);
 
   for (const section of ['cloud-backup', 'device-transfer']) {
     const block = withoutXmlComments.match(
@@ -323,9 +335,9 @@ test('what is stored cannot leave the phone by backup or by device transfer', as
     legacyAttribute,
     'the application must declare fullBackupContent for Android 11 and earlier'
   );
-  const legacyRules = (await readFile(
+  const legacyRules = stripXmlComments(await readFile(
     path.join(androidRoot, 'res', 'xml', `${legacyAttribute[1]}.xml`), 'utf8'
-  )).replace(/<!--[\s\S]*?-->/g, '');
+  ));
   assert.doesNotMatch(
     legacyRules,
     /<include\b/,
