@@ -3615,12 +3615,28 @@ test('the engine and shell run in a real browser', {
       // bound it does not have: 0.39 is the p90 of 47 identical-gain pairs and
       // the observed maximum is 1.39. This is the sentence a pilot uses to tell
       // a result from weather, so the worst case has to survive to the screen.
-      const floor = name === 'refused' ? '0.39' : '0.1';
-      assert.match(kept.shown[name].text,
-        new RegExp(`usually differ by less than ${floor.replace('.', '\\.')}°/s`),
-        `${name} must print the measured noise floor beside its numbers`);
-      assert.match(kept.shown[name].text, /as much as 1\.39°\/s/,
-        `${name} must print the worst observed case, not only the p90`);
+      //
+      // Then it quoted that pooled 1.39 — pitch's worst pair — for every axis,
+      // yaw included, whose own worst identical-gain pair is 0.1006; and a
+      // refusal quoted the pooled 0.39, which no gate in the app uses. Since
+      // 3 October 2026 the yaw change prints yaw's floor and yaw's worst pair,
+      // and the refusal prints each axis's own figures.
+      const text = kept.shown[name].text;
+      if (name === 'refused') {
+        assert.match(text, /smaller than 0\.92°\/s on roll, 1\.39°\/s on pitch or 0\.1°\/s on yaw/,
+          `${name} must print each axis's measured noise floor`);
+        assert.match(text, /at most 0\.915°\/s on roll .*1\.39°\/s on pitch .*0\.101°\/s on yaw/,
+          `${name} must print each axis's worst observed case, not only the p90`);
+      } else {
+        assert.match(text, /yaw differed on this measurement usually by less than 0\.1°\/s/,
+          `${name} must print the measured noise floor beside its numbers`);
+        assert.match(text, /at most by 0\.101°\/s/,
+          `${name} must print yaw's worst observed case, not only the p90`);
+        assert.doesNotMatch(text, /1\.39°\/s/,
+          `${name} quotes another axis's worst case beside a yaw change`);
+      }
+      assert.doesNotMatch(text, /\b0\.39°\/s/,
+        `${name} quotes the pooled floor, which gates nothing the app compares`);
       assert.equal(kept.shown[name].overflowX, 0,
         `${name} scrolled the page sideways at 384px`);
       assert.equal(kept.shown[name].injected, 0, 'a record\'s text must not create elements');
@@ -4584,7 +4600,7 @@ test('sharing is never asked by itself, shows what would leave, erases — and s
       expression: `(async () => {
         const bytes = await (await fetch('${REAL_LOG_PATH}')).arrayBuffer();
         const transfer = new DataTransfer();
-        transfer.items.add(new File([bytes], 'BELL-222UT.BBL'));
+        transfer.items.add(new File([bytes], 'FLIGHT-0001.BBL'));
         const input = document.getElementById('file');
         input.files = transfer.files;
         input.dispatchEvent(new Event('change'));
@@ -4834,8 +4850,13 @@ test('sharing is never asked by itself, shows what would leave, erases — and s
     assert.match(run.asked.text,
       /Never the log, never your location, never a date, never a file name, and never your/,
       'the dialog must list what is never sent, item by item');
-    assert.match(run.asked.text, /see everything that has been sent, and delete all of it/,
+    // Conditional since this build cannot send: "You can see everything that
+    // has been sent" in the present tense described a view of nothing.
+    assert.match(run.asked.text,
+      /If a future version ever sends anything, you will be able to see everything that has been sent, and delete all of it/,
       'the dialog must promise the deletion the panel then has to provide');
+    assert.doesNotMatch(run.asked.text, /You can see everything that has been sent/,
+      'nothing has been sent, so there is nothing to see yet');
 
     // Section 4a: one sentence, in the dialog, visually separated.
     assert.equal(run.asked.licenceSeparated, true,
@@ -4854,8 +4875,17 @@ test('sharing is never asked by itself, shows what would leave, erases — and s
     // 4. The dialog must not imply anything is going anywhere.
     assert.match(run.asked.text, /Nothing is sent yet, and this version cannot send/,
       'a dialog offering to send from an app that cannot send must say so');
-    assert.match(run.asked.text, /has no internet or sensitive platform permission/i,
+    // Once pinned as "RotorLens has no INTERNET or sensitive platform
+    // permission", unqualified: true of the Android manifest, but iOS has no such
+    // permission to be missing. The cross-platform fact is that there is no
+    // upload code; the permission is Android's extra barrier, and says so.
+    assert.match(run.asked.text, /There is no upload code in this app\./,
       'and must point at the checkable fact rather than only promising');
+    assert.match(run.asked.text,
+      /On Android, the missing INTERNET permission is an additional operating-system barrier/,
+      'the permission claim must name the one platform it is true of');
+    assert.doesNotMatch(run.asked.text, /RotorLens has no INTERNET/i,
+      'an unqualified permission claim is false on iOS');
 
     // 6. Both buttons the same size, and both a finger target.
     assert.equal(run.asked.buttons.length, 2, 'the dialog offers exactly two answers');
@@ -4939,7 +4969,7 @@ test('sharing is never asked by itself, shows what would leave, erases — and s
         `a never-shared field name is present in the payload shown ${label}`);
       assert.doesNotMatch(payload, /\d{4}-\d{2}-\d{2}/,
         `the log's own start date reached the payload shown ${label}`);
-      assert.doesNotMatch(payload, /BELL-222UT|\.bbl/i,
+      assert.doesNotMatch(payload, /FLIGHT-0001|\.bbl/i,
         `the imported file name reached the payload shown ${label}`);
       assert.doesNotMatch(payload, /latitude|longitude|GPS_home|GPS_coord/i,
         `a location field reached the payload shown ${label}`);
@@ -4954,6 +4984,17 @@ test('sharing is never asked by itself, shows what would leave, erases — and s
       'looking at a sample payload must not write an identity to disk');
     assert.match(run.preview.text, /auditShareableRecord/,
       'the audit must run in front of the reader, as it does before a flight is stored');
+
+    // The size the dialog quotes must be the size the panel prints beside the
+    // real payload. The dialog said "about 4 kB" while the panel printed 2.5 kB
+    // for this same real flight, and nothing compared the two.
+    const quotedKb = Number(run.asked.text.match(/about ([\d.]+) kB of numbers/)?.[1]);
+    const printedKb = Number(run.preview.text.match(/One record, ([\d.]+) kB of numbers/)?.[1]);
+    assert.ok(Number.isFinite(quotedKb) && Number.isFinite(printedKb),
+      `both sizes must be on screen to compare: dialog ${quotedKb}, panel ${printedKb}`);
+    assert.ok(Math.abs(quotedKb - printedKb) <= 0.5,
+      `the dialog says about ${quotedKb} kB of numbers and the panel prints ${printedKb} kB `
+      + 'for the same real flight');
 
     assert.equal(run.reconsider.shown, true,
       'Share from the panel must reopen the complete terms, not record unseen consent');

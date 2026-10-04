@@ -180,6 +180,13 @@ number. It is a span ceiling, not a stationarity gate. Stationarity is a
 property of a particular range, it is measured per range, and it is reported per
 range as `rpmEvidence.headspeed.relativeSpread`.
 
+Since 2 October 2026 it no longer limits how much of a flight the app measures.
+One analysis is also capped at 262,144 *samples*, and at Rotorflight's own
+993 µs interval a 262 s window holds more than that, so clamping the window by
+duration left every ordinary five-minute pack "not measured". The app now calls
+`analyzeMechanicalWindow`, which splits a window longer than one analysis
+accepts into stretches; see the October amendment below.
+
 **`harmonicCorrelationAvailability(null)` reported `FIELD_MISSING`.** That
 function exists to stop "no rotor explains this peak" being said on a range
 where no rotor was checked. Called with no rotor evidence at all — which is
@@ -210,6 +217,14 @@ airframe gate applies — so the panel never draws it as the rotor's own. Each p
 also says whether it is a persistent tone or a short burst listed only for having
 reached the attention threshold. It contains measurements and states only; the
 test suite asserts that no field of it says what to change.
+
+It measures the whole window it is given, through `analyzeMechanicalWindow`, so
+the vibration panel and the recommendation path measure the same seconds. A
+window measured in stretches adds `chunks` to the summary and `chunkRangeUs` to
+each peak. Each peak also publishes its size while it was above the attention
+threshold (`amplitudeWhileAboveThresholdDps`) and the share of the analysed
+windows it was above it in, because a tone that comes and goes averages to less
+than the threshold it crossed.
 
 The conversion from UMD to ES modules was done mechanically by a script rather
 than retyped, because a transcription slip in analysis code is a measurement bug
@@ -364,6 +379,73 @@ region. Only the START edge is dropped: a hold running to the last sample was
 entered from a command change the records contain, so its settle skip is real and
 every number inside it is measured over fully observed samples.
 
+### Amended 2–3 October 2026: the release audit's airframe and I-term changes
+
+Recorded for the same reason as the August amendment: each adds a limit or a
+rule, and the reason belongs beside it. The detail lives in the comments of the
+code named on each line.
+
+- **The whole flight window is measured.** `analyzeMechanicalWindow` in
+  `src/analysis/advisor/mechanical-spectrum.mjs` splits a window longer than one
+  analysis accepts into the fewest roughly equal stretches that fit both caps,
+  and combines them worst-first: attention over insufficient over clear, the gate
+  permitted only if every stretch was, the rotor compared only if every stretch
+  was. A window compared against the rotor in some stretches and not others
+  blocks as `ROTOR_CORRELATION_PARTIAL`. A window one analysis accepts is analysed
+  exactly as before.
+- **A main-rotor once- or twice-per-rev above the experimental level is
+  reported, not blocked — owner decision, 2 October 2026.** The 8 deg/s attention
+  level is calibrated on synthetic signals, and on real flights it was tripped
+  mostly by the main rotor's own orders. `rotorOrderToneAssessment` in
+  `src/analysis/advisor/recommendation-gates.mjs` lets the airframe gate pass,
+  with the card `AIRFRAME_ROTOR_ORDER_TONE` stating the measurement, only when
+  vibration was measured, the rotor was compared, all three axes were measured
+  on unfiltered gyro, no reason code falls outside an allow-list, the peak list
+  says it is complete, and every attention-level peak is a main-rotor 1/rev or
+  2/rev. Any other shape still blocks, and a gain whose oscillation sits on such
+  a tone is still refused.
+- **A ceiling on that, judged on size while present.** Past
+  `GAIN_GATE_THRESHOLDS.rotorOrderToneCeilingMultiple` (3) times the published
+  level, judged on the tone's RMS over the windows in which it was above the
+  level (`attentionWindowBandRmsDps`) rather than on its flight average, the same
+  tone blocks again as `MAIN_ROTOR_ORDER_TONE_LARGE`. It is a safety backstop, not
+  a calibration.
+- **Identity has a tolerance.** A peak is the rotor's own only if its
+  interpolated frequency sits within the logged head speed's spread at that
+  order plus half an analysis bin (`rotorOrderMatchEstablished`). Otherwise it is
+  `ROTOR_ORDER_MATCH_NOT_ESTABLISHED` and blocks like any unexplained tone, past
+  the ceiling included.
+- **A tone above the level for only part of the flight is never an all-clear.**
+  `tonesAboveLevelInPart` reads every peak that reached the level in some window
+  without being attention-eligible. Up to the ceiling it is reported as
+  `TONE_ABOVE_ATTENTION_LEVEL_IN_PART`, on the card
+  `AIRFRAME_TONE_ABOVE_LEVEL_IN_PART`, which takes the place of `AIRFRAME_CLEAR`
+  and `AIRFRAME_TONE_BELOW_ATTENTION`; past it, it blocks.
+- **A standing error needs three holds, and the I-term all-clear must be
+  earned.** `standingErrorRefusal` in `src/analysis/pid-evidence.mjs` reads a
+  standing error only from at least `EVIDENCE_LIMITS.minimumHoldsForStandingError`
+  (3) holds, each with its mean larger than its own movement and all on the same
+  side of the command; otherwise the pilot gets a next-flight card, never an
+  instruction. `I_TERM_WITHIN_TOLERANCE` is reached only through
+  `earnsITermAllClear` in `src/analysis/recommendations.mjs` — a positive
+  within-tolerance measurement and none of the listed problem codes. Holds that
+  no specific finding caught and that do not earn it get `I_TERM_NOT_JUDGED`,
+  which says which measurement was missing, so no all-clear is reached by
+  elimination.
+- **Head-speed segments are physical.** `countHeadspeedSegments` in
+  `src/analysis/recommendations.mjs` merges overlapping hold windows across roll,
+  pitch and yaw, so one hover is one segment. The governor share and the
+  two-segment minimum count only segments whose head speed was read, and a
+  segment is lost to head speed only if no axis measured a hold in it.
+
+What real data says about these, measured 3 October 2026 by running all 110
+real sessions through the calls the app makes, over each detected flight window,
+with each axis selected first in turn: no window needed splitting into
+stretches, so that path has been exercised only by tests on synthetic input;
+29 sessions get `AIRFRAME_ROTOR_ORDER_TONE`, 21 get
+`AIRFRAME_TONE_ABOVE_LEVEL_IN_PART` and 4 get `AIRFRAME_VIBRATION_PRESENT`; and
+no session produces an adjustment.
+
 ## Candour about prior exposure
 
 The people involved have previously seen or worked with GPL viewer code, so this
@@ -414,6 +496,22 @@ The mechanical spectrum now has one documented door for a screen to come in by,
 the shape of a Welch quality block. That door publishes measurements and states
 only — under the decision above, the mechanical module advises nothing, and the
 sentence a pilot reads about his airframe is composed one level up.
+
+The shell is part of the boundary too. `ui/index.html` carries a
+Content-Security-Policy meta tag (`default-src 'none'; script-src 'self';
+style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self';
+object-src 'none'; base-uri 'none'; form-action 'none'`), pinned by
+`test/ui-csp.test.mjs`; both phones serve an imported log from the page's own
+origin, so `connect-src 'self'` is all it needs. On Android, `AssetServer`
+answers every request itself and refuses anything off its origin with an empty
+403, and a WebView renderer that dies no longer takes the app with it:
+`MainActivity.recoverFromRendererLoss` destroys the dead view, drops the open
+log without offering it again, builds a fresh viewer, and tells the page which
+log was lost (`viewer-restarted` for a crash, `viewer-reclaimed` when the system
+killed it). `RendererRecovery` refuses a second rebuild when a replacement dies
+before its page has loaded. iOS enforces an injected policy alongside the
+shell's and handles a dead web-content process differently; see
+[the iOS port](IOS_PORT.md).
 
 ## Dependencies
 

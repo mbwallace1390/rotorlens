@@ -88,7 +88,12 @@ project; see [`backend/firebase/README.md`](backend/firebase/README.md). It does
 not select or deploy to the maintainer's Firebase account and adds no app
 network permission or SDK.
 
-Both tools accept a path, so they work on any log you own:
+Both tools accept a path to any log file you own. The header inventory reads the
+header of any log whose field tables parse, whatever firmware wrote it; a
+malformed header stops it with an error. The decoder behind `verify:log` accepts
+only a Rotorflight 4.3 to 4.6 header (verified on real 4.6 logs only — see
+*Decoder status*): it refuses other firmware as `unsupported-firmware` and a
+malformed header as `corrupt-header`:
 
 ```text
 npm run inspect:fixture -- /path/to/LOG00001.BFL
@@ -97,19 +102,26 @@ npm run verify:log -- /path/to/LOG00001.BFL
 
 ## Decoder status
 
-The compatibility gate accepts Rotorflight **4.3.x through 4.6.x** and rejects
-earlier or future releases until their format is exercised deliberately. That is
-an accepted range, not an equal verification claim: the committed synthetic
-corpus covers 4.3, independently produced/private logs cover 4.4 and 4.6, and
-the event serializer is pinned to 4.6 firmware source. No equivalent 4.5
-firmware-output log is committed.
+The compatibility gate accepts Rotorflight **4.3.x through 4.6.x**. It rejects
+earlier or future Rotorflight releases until their format is exercised
+deliberately, and every other firmware, Betaflight included. The viewer says so
+when it refuses a log: it names the range it opens and why this log falls
+outside it, rather than calling the file damaged. That is an accepted range, not
+an equal verification claim: the committed synthetic corpus covers 4.3 and 4.6,
+firmware output has been decoded for 4.6 alone — 110 private sessions, all 4.6.0
+or its release candidates, with 32 sessions of the two dataflash dumps still
+failing the I-frame continuity check — and the event serializer is pinned to 4.6
+firmware source. No firmware-output 4.3, 4.4 or 4.5 log has been decoded.
 
 **Verified locally against real firmware.** A privately held Rotorflight 4.6.0
-reference log — 8.5 MB and 89 fields — decodes to **134,429 samples with zero
-errors**, a median sample interval of 993 µs with no outliers, and monotonic time
-and loop iteration throughout. The only resync is the last 525 bytes, where the
-capture stops mid-frame because the log was cut short. The log is deliberately
-not redistributed by this repository without a donation sidecar proving consent.
+reference log — 8.6 MB and 89 fields — decodes to **134,429 samples with no decode
+errors in the body of the log** and 0 bytes skipped, a median sample interval of
+993 µs with no outliers, and monotonic time and loop iteration throughout
+(`verify:log` 13/13, re-run 3 October 2026). The capture was cut short: its last
+525 bytes are a final frame that stops after 13 bytes and 512 bytes of erased
+flash behind it, which the decoder reports as one `truncated` error at the tail,
+not as damage. The log is deliberately not redistributed by this repository
+without a donation sidecar proving consent.
 
 That result exercised 7 of 8 field encodings and 9 of 12 predictors on real
 firmware output, including the nibble-packed encoding that round-trip testing
@@ -120,7 +132,8 @@ reference log is the independent firmware check.
 Scope of the claim, precisely: **Rotorflight 4.6, one board, one flight.** Widen
 it only with a log for each version claimed. What remains unverified is listed in
 [Blackbox format notes](docs/BLACKBOX_FORMAT_NOTES.md) — one encoding, three
-predictors, and one event type nobody's log has contained yet.
+predictors, and four event types (14, 51, 100 and 101) that no log we hold has
+contained yet.
 
 Check any log yourself:
 
@@ -184,13 +197,16 @@ It is a **measurement** module: field names deliberately avoid `delta`,
 `direction`, and `recommendation`, and evidence that does not separate the
 failure modes cleanly returns no conclusion at all.
 
-Both kinds of evidence need a manoeuvre, and most flights do not contain one. A
-blank panel reads as a broken app, so `src/analysis/axis-report.mjs` turns the
+Both kinds of evidence need a manoeuvre, flown more than once, and most flights
+do not contain enough of one: of 31 real flights, re-measured 3 October 2026, 25
+carried no stop at all and 17 had no axis with the two holds hold evidence needs.
+A blank panel reads as a broken app, so `src/analysis/axis-report.mjs` turns the
 detector's diagnostics into an answer — see
 [the axis view and capture briefs](docs/AXIS_VIEW_AND_CAPTURE.md).
 
-The same code runs in the Rotorflight Blackbox viewer via a generated build —
-see [integration/rotorflight-blackbox](integration/rotorflight-blackbox/README.md).
+The same code is packaged, as a generated build, for a separate GPL-3.0 fork of
+the Rotorflight Blackbox viewer — see
+[integration/rotorflight-blackbox](integration/rotorflight-blackbox/README.md).
 
 ```text
 npm run build:advisor-bundle
@@ -246,8 +262,11 @@ sidecar proves ownership, consent, and the privacy scan required by
 1. Record logs on your own aircraft and run `verify:log` against each. Fix any
    assumption it catches, then add only consented logs with complete donation
    sidecars — or keep them private and run the environment-gated corpus tests.
-2. Extend the decoder to the frame types real logs exercise that the corpus does
-   not yet: GPS frames with data, slow frames, and every event type encountered.
+2. Close what the decoder has only round-trip evidence for — GPS frames with a
+   non-zero home, `TAG2_3SVARIABLE` fields and the rescue event (type 51) each
+   need a real log, as the [format notes](docs/BLACKBOX_FORMAT_NOTES.md) list —
+   and find out why 32 sessions of the two dataflash dumps fail the I-frame
+   continuity check.
 3. Keep every new deterministic analysis on the parser contract rather than on
    decoder internals, and add a regression at the public boundary.
 4. Continue profiling large-log peak memory and cancellation on mid-range phones;

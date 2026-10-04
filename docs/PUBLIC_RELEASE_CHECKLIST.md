@@ -5,6 +5,11 @@ that an unsigned CI artifact is an official release.
 
 ## Before changing repository visibility
 
+The repository is already public (GitHub reports it public on 3 October 2026).
+None of the items below was recorded here as done before that change, so they
+now stand as a review of what is already published rather than a gate still
+ahead; tick one only once it has actually been checked.
+
 - [ ] Review every advertised branch and tag; delete or archive obsolete refs.
 - [ ] Run a full-history secret and privacy scan across every advertised ref.
 - [ ] Confirm no raw or identifying flight log is reachable without the licence,
@@ -45,6 +50,10 @@ clone; this checklist does not authorize it.
       SPDX/CycloneDX software bill of materials.
 - [ ] Generate and verify build-provenance attestations for downloadable binaries.
 - [ ] Treat the existing debug APK as a tester artifact, never an official release.
+- [ ] Enter `https://mbwallace1390.github.io/rotorlens/privacy-policy.html` as the
+      privacy-policy URL in Play Console and App Store Connect, after confirming it
+      serves the committed `docs/privacy-policy.html`. GitHub Pages publishes it
+      from `main` `/docs`; see `docs/STORE_PRIVACY_ANSWERS.md`.
 
 ## Contributions and flight data
 
@@ -53,6 +62,10 @@ clone; this checklist does not authorize it.
       dumps, location data, filenames, device identifiers, or pilot/craft names.
 - [ ] Community-measurement terms have been formally reviewed and adopted under
       production identifiers before any contribution is solicited or accepted.
+- [ ] The in-app sharing terms (version `2026-08-14`, which the consent dialog
+      labels a draft awaiting legal review) have been legally reviewed and adopted.
+      Until then `AUTOMATIC_SHARING_PROMPT` in `ui/app.mjs` stays `false`, as the
+      owner decided on 2 October 2026.
 - [ ] Source availability does not imply that raw logs, individual measurement
       envelopes, a corpus, or model weights are publicly licensed.
 
