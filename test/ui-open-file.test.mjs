@@ -82,8 +82,11 @@ async function freePort() {
   return port;
 }
 
-async function waitForDevTools(port, attempts = 80) {
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
+// A deadline, not a count of polls: a cold Chromium start on a CI runner can
+// outlast a fixed 20 s budget and fail as "never became ready".
+async function waitForDevTools(port, timeoutMs = 90_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/json/version`);
       if (response.ok) {
