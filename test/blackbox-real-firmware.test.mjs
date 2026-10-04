@@ -73,7 +73,7 @@ test('owner-supplied firmware values are continuous across I-frame boundaries',
     // Every supplied log. Until 2026-10-03 this read ROTORLENS_REAL_LOG only, and
     // the multi-session dumps would have failed it: 32 of their 109 sessions did
     // under `verify:log`, every one a genuine step that landed on a keyframe,
-    // which the check now tells apart from a decoding fault.
+    // which the check now sets aside as a note instead of failing.
     for (const {file, result} of corpus()) {
       for (const session of result.sessions) {
         const continuity = measureIntraFrameContinuity({

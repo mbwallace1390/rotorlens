@@ -11,7 +11,11 @@ response times or individualized flight-tuning services.
    safe to do so.
 3. Reduce the problem to the smallest reproduction using committed or newly
    generated synthetic data.
-4. Use the appropriate GitHub issue form.
+4. Check the firmware. RotorLens opens Blackbox logs from Rotorflight 4.3 to 4.6
+   only, and refuses any other firmware by design, saying which range it reads.
+   A refused log from outside that range is expected behavior, not a decoding
+   bug.
+5. Use the appropriate GitHub issue form.
 
 For vulnerabilities, privacy bypasses, exposed secrets, or an issue that could
 be exploited to produce unsafe advice, follow [SECURITY.md](SECURITY.md) rather

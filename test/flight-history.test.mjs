@@ -1260,10 +1260,35 @@ test('the outcome vocabulary is closed, and none of it is a magnitude', () => {
 });
 
 test('the floor is reported with the comparison, so a pilot can see what it is', () => {
+  // With no gain changed, every axis is gated on its OWN floor, so the sentence
+  // must carry all three of those numbers and not the pooled 0.39, which gates
+  // nothing in the app. It used to print 0.39, and pitch's 1.39 worst case for
+  // every axis including yaw, whose worst identical-gain pair is 0.1006.
   const floor = describeNoiseFloor();
-  assert.equal(floor.absoluteDps, EVIDENCE_LIMITS.holdErrorNoiseFloorDps);
-  assert.ok(floor.sentence.includes(String(floor.absoluteDps)),
-    'the sentence must carry the same number as the gate');
+  assert.equal(floor.absoluteDps, null, 'no single floor gates a no-change comparison');
+  for (const axis of ['roll', 'pitch', 'yaw']) {
+    assert.equal(floor.perAxis[axis].absoluteDps, SENSITIVITY_FLOOR_DPS[axis], axis);
+    assert.ok(floor.sentence.includes(`${SENSITIVITY_FLOOR_DPS[axis]}°/s on ${axis}`),
+      `the sentence must carry the number that gates ${axis}`);
+    assert.ok(floor.sentence.includes(`${floor.perAxis[axis].observedMaximumDps}°/s on ${axis}`),
+      `and ${axis}'s own worst pair`);
+  }
+  assert.ok(!floor.sentence.includes(String(EVIDENCE_LIMITS.holdErrorNoiseFloorDps)),
+    'the pooled floor gates nothing the app compares, so it must not be quoted');
+  assert.ok(floor.perAxis.yaw.observedMaximumDps < 0.2,
+    'yaw must not be quoted another axis\'s worst case');
+
+  // With an axis, only that axis's numbers.
+  for (const axis of ['roll', 'pitch', 'yaw']) {
+    const own = describeNoiseFloor(null, axis);
+    assert.equal(own.absoluteDps, SENSITIVITY_FLOOR_DPS[axis], axis);
+    assert.ok(own.sentence.includes(`${axis} change smaller than ${SENSITIVITY_FLOOR_DPS[axis]}°/s`),
+      own.sentence);
+    assert.ok(own.sentence.includes(`${own.observedMaximumDps}°/s`), own.sentence);
+    for (const other of ['roll', 'pitch', 'yaw'].filter(name => name !== axis)) {
+      assert.ok(!own.sentence.includes(other), `the ${axis} sentence mentions ${other}`);
+    }
+  }
 
   const comparison = compareFlightRecords(record({errorDps: 5}), {...record(), ordinal: 1});
   assert.deepEqual(comparison.noiseFloor, floor);

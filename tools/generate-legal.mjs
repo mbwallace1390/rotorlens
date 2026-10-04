@@ -75,10 +75,50 @@ const HOLDERS = [
   }
 ];
 
+/**
+ * Which logs RotorLens opens is stated narrowly, because it is narrow: the
+ * decoder (`compatibilityError` in src/blackbox/decode.mjs) refuses everything
+ * but Rotorflight 4.3 to 4.6, Betaflight included. The range is pinned to the
+ * decoder's behaviour by test/ui-open-file.test.mjs, which also checks that
+ * this sentence quotes the same range the viewer states.
+ *
+ * And the range is ACCEPTED, not verified: every real log held was written by
+ * 4.6, so the sentence says that too, in the same words the viewer uses when it
+ * refuses a log (READABLE_FIRMWARE.checkedMinors in ui/app.mjs), and the same
+ * test checks both.
+ */
 const NON_AFFILIATION =
   'RotorLens is not affiliated with, endorsed by, or sponsored by the ' +
-  'Rotorflight or Betaflight projects. It reads their Blackbox log format, ' +
-  'which is a published interoperability format, and contains none of their code.';
+  'Rotorflight or Betaflight projects, and contains none of their code. It opens ' +
+  'Blackbox logs written by Rotorflight 4.3 to 4.6, reading the log format as a ' +
+  'published interoperability format. Of that range, only Rotorflight 4.6 has ' +
+  'been checked against real logs.';
+
+/**
+ * Where the privacy policy is published, linked from About & Legal.
+ *
+ * GitHub Pages serves docs/privacy-policy.html from main at this address — the
+ * page `npm run privacy:generate` builds from docs/PRIVACY_POLICY.md. The
+ * policy states its own canonical URL, and `buildLegalData` refuses to run if
+ * the two ever differ, so the app cannot link one address while the policy
+ * names another.
+ *
+ * It is also one more address the Android shell will hand to the browser on a
+ * tap, so ExternalLinks.ALLOWED carries it and test/android-shell.test.mjs fails
+ * if the two lists disagree.
+ */
+const PRIVACY_POLICY_URL = 'https://mbwallace1390.github.io/rotorlens/privacy-policy.html';
+
+/**
+ * What a tap on any link on About & Legal does, said where the links are.
+ *
+ * Android-only on purpose: ExternalLinks hands the exact address to the user's
+ * browser there, the iOS shell cancels the navigation, and a plain browser opens
+ * it as a browser does. Nothing is added to the address and RotorLens sends no
+ * request of its own — the browser makes the visit, under that site's policy.
+ */
+const LINKS_NOTE = 'On Android, tapping a link on this page hands that fixed address ' +
+  'to your web browser. RotorLens adds nothing to it and makes no request itself.';
 
 /**
  * The disclaimer, in the app.
@@ -138,7 +178,8 @@ const DISCLAIMER = {
         + 'creates a random 100-bit identity for each saved helicopter and associates it '
         + 'with that helicopter’s local craft-name and board key. This release has no upload '
         + 'transport. RotorLens never keeps the log itself, a position, a flight date, or a '
-        + 'file name. The History and Sharing screens show the applicable stored state and '
+        + 'file name. The Flight history and Shared measurements panels show the applicable '
+        + 'stored state and '
         + 'let you erase one flight, one helicopter, the sharing preference and identities, '
         + 'or everything.'
     },
@@ -171,8 +212,10 @@ const DISCLAIMER = {
       heading: 'Independent product',
       body: 'RotorLens is not affiliated with, endorsed by, or sponsored by the '
         + 'Rotorflight or Betaflight projects, or by any transmitter or flight-controller '
-        + 'manufacturer. Those names are used only to describe log compatibility, and are '
-        + 'trademarks of their respective owners.'
+        + 'manufacturer. The Rotorflight name is used only to refer to that firmware and '
+        + 'its project — for example, to say which logs RotorLens reads and how to get them '
+        + 'off the aircraft — and never as the name of this app. Both names are trademarks '
+        + 'of their respective owners.'
     }
   ]
 };
@@ -201,6 +244,15 @@ export async function buildLegalData() {
   const packageManifest = JSON.parse(await read('package.json'));
   const mpl = await read('LICENSE');
   const apache = await read('config/licenses/apache-2.0.txt');
+  const policy = await read('docs/PRIVACY_POLICY.md');
+
+  // Line breaks in the markdown are not part of the sentence.
+  if (!policy.replace(/\s+/g, ' ').includes(`published at ${PRIVACY_POLICY_URL}`)) {
+    throw new Error(
+      `docs/PRIVACY_POLICY.md no longer says it is published at ${PRIVACY_POLICY_URL}; ` +
+      'About & Legal must link the address the policy itself names'
+    );
+  }
 
   const repository = packageManifest.repository.url
     .replace(/^git\+/, '')
@@ -237,6 +289,11 @@ export async function buildLegalData() {
   return {
     disclaimer: DISCLAIMER,
     nonAffiliation: NON_AFFILIATION,
+    privacyPolicy: {
+      label: 'Privacy policy',
+      url: PRIVACY_POLICY_URL
+    },
+    linksNote: LINKS_NOTE,
     project: {
       name: 'RotorLens',
       creator: packageManifest.author.name,

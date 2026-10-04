@@ -35,7 +35,8 @@ Goes at the end of the description, on both stores, verbatim.
 > optional future-sharing question also stores your answer; turning it on creates
 > a random 100-bit local identity for each saved helicopter. This release cannot send
 > anything. It never keeps your log, your position, or the flight date, and the
-> History and Sharing screens let you inspect and erase what they store.
+> Flight history and Shared measurements panels let you inspect and erase what
+> they store.
 >
 > Vibration and tracking findings indicate where to look. They are not a
 > substitute for physically inspecting your helicopter. Always ground-check
@@ -58,7 +59,7 @@ being true.
 | Claim | What keeps it true |
 | --- | --- |
 | No connection to your aircraft | There is no flight-controller communication code, and the app requests no sensitive platform permission |
-| Nothing leaves your phone | The shared app contains no upload transport and makes no network requests. Android also omits the `INTERNET` permission. An iOS listing may use this claim only after source, WebView-policy, and on-device network verification |
+| Nothing leaves your phone | The shared app contains no upload transport and makes no network requests, and the viewer page carries a Content-Security-Policy that refuses any connection off its own origin. Android also omits the `INTERNET` permission; a tapped About & Legal link is handed to the phone's own browser, only for the fixed legal addresses. An iOS listing may use this claim only after source, WebView-policy, and on-device network verification |
 | Every suggestion shows its measurements | Each finding carries `basis[]`, and a test requires it non-empty |
 | One change at a time | At most one recommendation is rendered as a change to make now |
 | Silent when it cannot tell | Five gates, plus a stability sweep that refuses any conclusion whose direction flips as the unconstrained constants move |
@@ -78,9 +79,20 @@ feature without deciding deliberately that the claim is being given up. See
 
 Not optional, and not merely polite. `docs/LICENSING_AND_STORE_READINESS.md`
 covers it in full: the app is **RotorLens**, never "Rotorflight anything". The
-Rotorflight and Betaflight names appear only to describe log compatibility.
-A store listing using those names without the non-affiliation statement invites
-a takedown rather than an email.
+Rotorflight name is used only descriptively — to say which logs RotorLens reads,
+how to get them off the aircraft, and where RotorLens stands apart from the
+Rotorflight project — never as part of RotorLens's own name or to suggest
+endorsement. The Betaflight name appears only in the non-affiliation statement.
+
+Compatibility wording follows section 8 of that document: name only versions a
+real log has verified. Listing copy may say RotorLens reads **Rotorflight 4.6**
+Blackbox logs. If it mentions the wider range the decoder accepts, it must carry
+the qualifier in the same sentence — "accepts Rotorflight 4.3 to 4.6; verified on
+real 4.6 logs only" — because this project has decoded no firmware-written 4.3,
+4.4 or 4.5 log. It must never state 4.3 to 4.6 unqualified, and must not claim
+Betaflight or any other firmware: the decoder refuses them. A store listing using
+those names without the non-affiliation statement invites a takedown rather than
+an email.
 
 ## If measurements are ever shared
 
@@ -97,11 +109,14 @@ document and revise the policy and store declarations before adding transport.
 
 - **Screenshots.** They are part of the claim. A screenshot showing a gain
   recommendation sets an expectation the app must meet on the reviewer's own
-  log, and most real logs produce no gain recommendation at all. Measured
-  across 110 real sessions on three boards: **zero** roll or pitch stop events,
-  nine yaw stops spread over six sessions, and **not one gain finding of any
-  kind** — no D, no P, no I. A screenshot of the axis view and the manoeuvre
-  brief is both honest and more representative.
+  log, and most real logs produce no gain recommendation at all. Re-measured on
+  3 October 2026 with the current engine, across 110 real sessions, all
+  Rotorflight 4.6 — logged under three craft-name-and-board combinations on two
+  board models, which `corpus:report` counts as three aircraft; 31 of the
+  sessions were flights, the rest bench runs: **zero** roll or pitch stop events, nine yaw stops spread
+  over six sessions, and **not one gain adjustment of any kind** — no D, no P,
+  no I. A screenshot of the axis view and the manoeuvre brief is both honest and
+  more representative.
 
   (An earlier draft said "109 flights yielded one cyclic stop". Two independent
   counts put cyclic stops at zero; the sentence's conclusion gets stronger, not

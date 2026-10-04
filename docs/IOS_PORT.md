@@ -94,12 +94,16 @@ The `WKWebView` uses `WKWebsiteDataStore.nonPersistent()`, so cookies, web
 storage, and WebKit cache data are memory-only. The custom handler rejects every
 host/path outside the three routes above, normalizes and confines bundle paths,
 and binds imports to the exact current generation. It injects a restrictive CSP
-into `ui/index.html`; the CSP allows bundled same-origin modules and the current
+into `ui/index.html` as a meta tag and sends the same policy as a header on every
+response; the CSP allows bundled same-origin modules and the current
 same-origin log fetch but blocks network connections, frames, objects, forms,
-and remote resources. The navigation delegate permits only the main
-`/ui/index.html` document and rejects popups and other navigation. There is no
-networking framework, URL-session client, local-network permission, background
-mode, or network entitlement in this target.
+and remote resources. `ui/index.html` also carries its own meta policy, stricter
+than the injected one (no `blob:`, `data:`, fonts, workers or media), and WebKit
+enforces every policy together, so a resource must satisfy all of them. The
+navigation delegate permits only the main `/ui/index.html` document and rejects
+popups and other navigation. There is no networking framework, URL-session
+client, local-network permission, background mode, or network entitlement in
+this target.
 
 At document start, before bundled modules execute, the shell defines
 `RotorLensPlatform` as the string `ios` and exposes `RotorLensNative.pickFile()`
@@ -154,7 +158,7 @@ ios/
     ImportStore.swift               bounded coordinated session copy
     WebAssetSchemeHandler.swift     confined asset/import transport and CSP
     Info.plist                      document/open-in and scene declarations
-    PrivacyInfo.xcprivacy           no tracking, collection, or required API use
+    PrivacyInfo.xcprivacy           declares no tracking, collection, or required API use
   RotorLensTests/                   import, stale route, CSP, and type tests
   scripts/generate-project.sh       pinned, offline project generation
   tests/ios-static-contract.test.mjs
@@ -182,11 +186,17 @@ test must verify that an iOS build shows the common creator, source, MPL, and
 safety notices, shows no Android Maven artifacts, and does not hide a real iOS
 third-party component.
 
-The privacy manifest accurately declares no tracking, collected-data types,
-tracking domains, or required-reason API categories for this slice. The shell
-does not read file creation/modification dates, device identifiers, defaults, or
-free-disk-space APIs. The native files store only the page's already documented
-flight-history and sharing JSON, and use no browser storage. Any later use of
+The privacy manifest declares no tracking, collected-data types, tracking
+domains, or required-reason API categories for this slice. The shell's code uses
+no device identifier, defaults, or free-disk-space API, and uses no file
+creation or modification date. One call needs review against Apple's
+file-timestamp category (`NSPrivacyAccessedAPICategoryFileTimestamp`) before an
+iOS submission: `PrivateStore.swift` calls `FileManager.attributesOfItem(atPath:)`,
+which returns the file's dates alongside its size, although only `.size` is read.
+Declare the matching reason code, or read the size through
+`URLResourceValues.fileSize` as `ImportStore.swift` does. The native files store
+only the page's already documented flight-history and sharing JSON, and use no
+browser storage. Any later use of
 required-reason APIs or any telemetry/networking feature requires a new manifest
 and privacy-claim review before merging.
 
@@ -263,3 +273,22 @@ on iOS and is not part of this slice; Files-visible USB/SD storage is the
 documented substitute. Raw logs and the session cache remain outside persistent
 storage. No network, cloud, analytics, model eligibility, or flight-analysis
 behavior is added here.
+
+Two Android behaviors have no iOS counterpart yet, both known from reading the
+source only; nothing here was compiled or run:
+
+- **About & Legal links do nothing on iOS.** The navigation delegate cancels
+  them like any other off-origin navigation. Android hands an exact allow-list
+  of those URLs to the user's browser on a tap
+  (`android/app/src/main/java/app/rotorlens/ExternalLinks.java`); the iOS
+  equivalent is only described in a comment in `ViewerViewController.swift`, not
+  implemented. The repository and component addresses are printed as link text,
+  so they can still be read off the screen.
+- **A web-content process that dies reloads the same log.**
+  `webViewWebContentProcessDidTerminate` reloads the viewer document, and once it
+  loads, `flushPendingEvents` re-sends the current import if it is still current
+  — the log that was open. If that log is what killed the process, this can
+  repeat. Android's renderer recovery instead drops the open log, never re-offers
+  it, tells the new page which log was lost, and stops rebuilding if a
+  replacement dies before its page loads (`MainActivity.recoverFromRendererLoss`,
+  `RendererRecovery`).

@@ -26,7 +26,7 @@ assumption, so a round-trip agreeing with itself is not evidence about the forma
 
 **Verified against real firmware output on 2026-08-11.** A real Rotorflight
 4.6.0 log (`Rotorflight 4.6.0 (118e912) STM32F7X2`, board `FRSK VANTAC_RF007`,
-8.5 MB, 89 fields) decodes to **134,429 samples with zero errors through the body
+8.6 MB, 89 fields) decodes to **134,429 samples with zero errors through the body
 of the log**, a median sample interval of 993 µs with **no outliers at all**, and
 monotonic time and loop iteration throughout. The capture stops part-way through
 its last frame — a power-off artefact, not a decoding fault: 13 bytes of a P
@@ -42,19 +42,25 @@ alignment, not correctness — see the TAG8_4S16 section below. Two encodings an
 predictor were decoding real flights into sawteeth while every check above passed
 perfectly.
 
-**Verified again on 2026-08-12, this time for continuity.** The same log, plus
-the three third-party logs, now also pass an I-frame-phase continuity check
-(described below). Correcting TAG2_3S32 selector 3 and the INCREMENT step brought
-the worst-behaved field on the real log from **33x** down to **1.16x**, against a
-threshold of 2x.
+**Verified again on 2026-08-12, this time for continuity.** The same log now
+also passes an I-frame-phase continuity check (described below). Correcting
+TAG2_3S32 selector 3 and the INCREMENT step brought the worst-behaved field on
+the real log from **33x** down to **1.16x**, against a threshold of 2x.
+Re-run on 2026-10-03: `verify:log` 13/13, worst field 1.16x over 4,200
+keyframes.
 
-Three logs from an independently written Rotorflight encoder
-(`Blackbox Lab`, Rotorflight 4.4 format) also decode clean, which is
-cross-implementation agreement rather than our encoder agreeing with itself.
-Note what those three logs could *not* do: all six of their TAG2_3S32 selector-3
-groups have equal outer widths and their P interval is 1, so **both** of the
-2026-08-12 fixes are byte-for-byte no-ops on them. A corpus that cannot
-distinguish two candidate layouts is not evidence for either.
+**Three files this section used to count as cross-implementation agreement are
+not firmware output.** They were described as logs from an independently
+written Rotorflight encoder (`Blackbox Lab`, Rotorflight 4.4 format) that "also
+decode clean". Their headers name a simulator board and a firmware revision
+marked synthetic, and they carry no `Field I signed` line, which real firmware
+writes. The shipped decoder refuses all three — `corrupt-header` for the missing
+signed flags and, with that line supplied, `unsupported-firmware` for a revision
+outside the accepted pattern — so each decodes to zero samples. They are not
+Rotorflight 4.4 evidence and provide no cross-implementation agreement today.
+Figures further down that were taken on them say so. (Even when they were read,
+all six of their TAG2_3S32 selector-3 groups had equal outer widths and a P
+interval of 1, so both 2026-08-12 fixes were byte-for-byte no-ops on them.)
 
 **One slot layout is still undetermined, and it is not vague — it is exactly
 one.** TAG2_3S32 selector 3's field-0/field-1 width slots are degenerate: swapping
@@ -73,11 +79,18 @@ samples against the shipped order:
 | TAG2_3S32 selector 2 values | 5 | **0** | 5 |
 | TAG2_3S32 selector 3 widths | 5 | **1** — `(1,0,2)` | 4 |
 
+Re-measured 2026-10-03 under the current continuity rule (see [The continuity
+check](#the-continuity-check)): every count is unchanged. All 42 non-degenerate
+permutations are still caught. Outside selector 3, the narrowest is selector 2
+order `(1,0,2)`, with `axisP[1]` at 5.1x once its 3 largest keyframes are set
+aside. Selector 3's `(2,1,0)` and `(2,0,1)` orders are the narrowest of all, at
+4.4x undone at keyframes.
+
 See [The one slot pair no log we hold can
 separate](#the-one-slot-pair-no-log-we-hold-can-separate) for what that one costs
 and for what log would settle it.
 
-Still worth doing: real firmware-output 4.3 and 4.5 logs, a log with GPS frames
+Still worth doing: real firmware-output 4.3, 4.4 and 4.5 logs, a log with GPS frames
 carrying data **and a non-zero home coordinate**, a log with
 `TAG2_3SVARIABLE` fields, a log containing a rescue event (type 51, to exercise
 the firmware-defined path), and — the only one that closes an open
@@ -140,11 +153,20 @@ Facts about the format worth keeping:
   SIGNED_VB. The two copies agree at every sample of all four sessions. That is
   independent evidence for this group's slot order, which no round-trip test can
   give.
+- **Every dump session now passes continuity, and for a while 32 did not.** On
+  2026-10-03, before the check changed, `verify:log` failed "values are
+  continuous across I-frame boundaries" on 32 of the 109 dump sessions (5 of 36
+  on the NEXUS_XR, 27 of 73 on the VANTAC, two of the 27 on 4.6.0 final). It
+  passed every other check on all 109. The flagged fields included governor
+  terms (`govI` up to 87.5x), ESC telemetry (`EscPwm` 41.4x, `EscThr`,
+  `EscRPM`, `EscI`), `rcCommand[4]` at about 10x in several sessions,
+  `headspeed`, `Ibat` and `attitude[2]`. Most of them are SIGNED_VB (predicted
+  by PREVIOUS, or by AVERAGE_2 for `headspeed` and `motor[0]`), which has no
+  width selector to misread. `govI` and `govP` (TAG8_4S16) and `attitude[2]`
+  (TAG2_3S32) were the exceptions.
 
-**All 110 sessions now pass the continuity check, and for a while 32 did not.**
-Under the original ratio rule (below), 5 of the M4Max sessions and 27 of the
-OMP4MAX sessions failed it, two of them on 4.6.0 final. None of them was a
-decoding fault. They were moments in the flight that landed on a keyframe:
+**None of the 32 was a decoding fault.** They were moments in the flight that
+landed on a keyframe:
 
 - The evidence that it was not the decoder: across the 109 dump sessions, 112,517
   step moments (any field moving 50x its own mean in one sample) fell on a
@@ -165,14 +187,14 @@ decoding fault. They were moments in the flight that landed on a keyframe:
 
 The check was what needed to change, not the decoder. See the next section.
 
-What it does **not** add matters more than the sample count: **110 decoded
-sessions are not 110 flights.** 77 of them carry a setpoint that is identically
-zero on all three axes for their whole length, and 26 never turn the rotor above
-300 rpm — they are bench and spool-up recordings. Classifying on "rotor above
-1000 rpm for more than 20 s and the sticks moved" leaves **33 flights and 35.1
-airborne minutes**. For decoder conformance every session counts; for anything
-measured about flying, only the 33 do, and the corpus block in
-`src/analysis/records.mjs` states that distinction where the constants live.
+What the 110 sessions do **not** add matters more than the sample count: **110
+decoded sessions are not 110 flights.** 77 of them carry a setpoint that is
+identically zero on all three axes for their whole length, and 26 never turn the
+rotor above 300 rpm — they are bench and spool-up recordings. Classifying on
+"rotor above 1000 rpm for more than 20 s and the sticks moved" leaves **33
+flights and 35.1 airborne minutes**. For decoder conformance every session
+counts; for anything measured about flying, only the 33 do, and the corpus block
+in `src/analysis/records.mjs` states that distinction where the constants live.
 
 Neither dump closes the open TAG2_3S32 selector-3 question. They widen board and
 firmware coverage, not layout coverage.
@@ -189,13 +211,13 @@ the keyframe period and has it yanked away at the next `I` frame. Measure mean
 else, and correct decoding gives ≈1 — a real signal does not know where the
 keyframes are.
 
-**That ratio alone is not the test, as of 2026-10-03.** On the first four logs
-the worst correctly decoded field read 1.16x. On the 109 dump sessions it read
-up to 87.5x, because a genuine step that lands on a keyframe looks like a defect
-to an average (see the section above). Setting the largest few keyframes aside
-cures that, but on its own it would also have hidden a real shipped defect:
-TAG2_3S32 selector 3 mis-read only seven groups of the reference log, so *its*
-excess also rode on about two keyframes.
+**That ratio alone is not the test, as of 2026-10-03.** On the reference
+flight's 134,429 samples the worst correctly decoded field reads 1.16x. On the
+109 dump sessions it read up to 87.5x, because a genuine step that lands on a
+keyframe looks like a defect to an average (see the section above). Setting the
+largest few keyframes aside cures that, but on its own it would also have hidden
+a real shipped defect: TAG2_3S32 selector 3 mis-read only seven groups of the
+reference log, so *its* excess also rode on about two keyframes.
 
 What separates the two cases is what the keyframe does. A mis-read delta is
 carried forward by the predictor until the next keyframe **undoes** it: with
@@ -216,12 +238,19 @@ An excess with neither shape is reported as a note that names its samples, and
 the session passes.
 
 Measured margins, as calculated by `src/blackbox/continuity.mjs` itself. The
-defect rows were produced by reintroducing each historical defect and decoding
-the reference log. The clean rows cover the reference log and all 109 dump
-sessions: 110 sessions and 2,415 field-sessions above the movement floor.
+defect rows were produced by putting each wrong layout back into the decoder and
+decoding the reference flight: the three that shipped (TAG8_4S16, TAG2_3S32
+selector 3, INCREMENT) and the two wrong alternatives this file also measures
+(AVERAGE_2 with floor, TAG8_8SVB reversed). The first clean row covers the
+reference flight alone; the second covers it together with all 109 dump
+sessions: 110 sessions and 2,415 field-sessions above the movement floor. (The
+reference row was quoted over 224,429 samples across four logs until
+2026-10-03; the other 90,000 were the three simulator files above, which are
+not real flight.)
 
 | population | ratio alone | without 3 largest keyframes | undone at keyframes | called out |
 | --- | --- | --- | --- | --- |
+| correctly decoded, reference flight | ≤ **1.16x** | ≤ 1.11x | ≤ 0.75x | never |
 | correctly decoded, all 110 sessions | up to 87.5x | ≤ **1.59x** | ≤ **1.63x** | never |
 | `attitude[0]`, TAG2_3S32 widths permuted | 2.2x | 0.92x | 1.32x | no |
 | `axisP[1]`, TAG2_3S32 widths permuted | 5.0x | 0.82x | **4.41x** | yes |
@@ -243,11 +272,12 @@ What this costs, stated so nobody has to rediscover it:
   the keyframes then made. That is exactly the shape of a heading genuinely
   wrapping on a keyframe, and the dumps contain four of those, in two sessions.
   This is now the narrowest defect margin the check has.
-- **The narrowest clean margin is 1.63x, and it is the reversing shape.** A
-  heading in that session crossed north on a delta frame and crossed back on the
-  next keyframe. From a single occurrence, a genuine excursion that returns
-  exactly on a keyframe cannot be told apart from a mis-read delta that the
-  keyframe corrects. The check will call one a fault if it ever clears 2x.
+- **The narrowest clean margin is 1.63x, and it is the reversing shape.** In the
+  session behind that figure, a heading crossed north on a delta frame and
+  crossed back on the next keyframe. From a single occurrence, a genuine
+  excursion that returns exactly on a keyframe cannot be told apart from a
+  mis-read delta that the keyframe corrects. The check will call one a fault if
+  it ever clears 2x.
 - **A mis-read in the last keyframe period of a log is invisible.** No keyframe
   follows to undo it. The same was always true of the ratio.
 - **Up to three genuine steps landing on keyframes are tolerated, not more.**
@@ -257,20 +287,32 @@ What this costs, stated so nobody has to rediscover it:
 Two guards keep it honest:
 
 - **A movement floor of 0.05 counts per keyframe.** A ratio between two
-  near-zero means says nothing: an ESC capacity counter that ticks 28 times in a
-  whole flight reads 1.59x, and a field whose range is 0..5 and which moves five
-  times in 30,000 samples reads 7.75x. Both are arithmetic, not evidence. The
-  cost is real and worth stating: **a genuine defect on a field that barely moves
-  will not be caught by this.**
+  near-zero means says nothing. Measured 2026-10-03 on real logs: the reference
+  flight's ESC capacity counter (`EscCap`) moves 0.0067 counts per keyframe and
+  reads 1.59x, and in one session of the NEXUS_XR dump the MCU temperature
+  (`Tmcu`), whose whole range is 36..39 and which changes five times in 91,850
+  samples, reads 7.75x. Across that dump's 36 sessions, 34 of the 951 below-floor
+  field readings that move at all read 2x or more. Both examples are arithmetic,
+  not evidence. (Until 2026-10-03 the second example was "a field whose range is
+  0..5 and which moves five times in 30,000 samples". That was a simulator
+  figure, not a real-log one: read in memory with the missing signed-flags line
+  supplied, each of the three simulator files above is exactly 30,000 samples,
+  and one has a below-floor field reading 7.75x. The decoder refuses those files,
+  so the example was replaced.)
+  The cost is real and worth stating: **a genuine defect on a field that barely
+  moves will not be caught by this.**
 - **It reports a measurement, not a diagnosis.** It says which field is
   discontinuous and by how much. Which bit is wrong is for a human to work out.
 
 The decoder accepts Rotorflight **4.3.x through 4.6.x**, and fails closed outside
-that exact range. Coverage is not equal across it: 4.3 is exercised by the
-committed synthetic corpus, independently produced/private logs cover 4.4 and
-4.6, and the event serializer is verified against 4.6 firmware source. There is
-no equivalent 4.5 firmware-output log in the repository. Do not widen the gate
-or the compatibility claim ahead of a log and conformance run for the new range.
+that exact range. Coverage is not equal across it: 4.3 is exercised only by the
+committed synthetic corpus; firmware output has been decoded for 4.6 alone (the
+reference flight on 4.6.0, and the two dumps on 4.6.0-RC1, RC3 and final); and
+the event serializer is verified against 4.6 firmware source. No firmware-output
+4.4 or 4.5 log has been decoded. The only files labelled 4.4 this project has
+held are the simulator files above, which the decoder refuses. Do not widen the
+gate or the compatibility claim ahead of a log and conformance run for the new
+range.
 
 ## Structure
 
@@ -336,18 +378,22 @@ The writer and independent byte-vector tests now pin the firmware representation
 Source: Rotorflight 4.6.0 commit `118e912`,
 [`blackboxLogEvent`](https://github.com/rotorflight/rotorflight-firmware/blob/118e9120260bb33f46df4f92052fb0e9fd4e9ebc/src/main/blackbox/blackbox.c#L1793-L1856).
 
-Measured event inventory over the full stream of all four logs (2026-08-12), so
-the next log carrying something new is recognisable as new evidence:
+Measured event inventory over the full stream of every real log we hold
+(re-measured 2026-10-03 with the shipped decoder), so the next log carrying
+something new is recognisable as new evidence:
 
 | log | event types present |
 | --- | --- |
 | real 4.6 flight | 0 (×1), 13 (×8), 50 (×3), 52 (×5) |
-| three third-party 4.4 logs | 255 (×1 each) |
+| M4Max dump, 36 sessions | 0 (×34), 13 (×8), 15 (×36), 30 (×36), 50 (×168), 52 (×112), 255 (×36) |
+| OMP4MAX dump, 73 sessions | 0 (×72), 15 (×72), 30 (×72), 50 (×265), 52 (×10), 255 (×72) |
 
-No **51**, no 14, no 30 appeared in that measured corpus. Their layouts are
-nevertheless known from the pinned firmware serializer above. The real log's
-single decode error is 525 bytes from EOF — a truncated final frame followed by
-erased flash, not an unknown event.
+No **51**, no 14 and no 100/101 appear anywhere in it. Their layouts are
+nevertheless known from the pinned firmware serializer above. (Until 2026-10-03
+this table listed the three simulator files instead of the dumps, at one 255
+each, and so also reported no 15 and no 30; the dumps carry both.) The real
+flight's single error is 525 bytes from EOF — a truncated final frame followed
+by erased flash, reported as `truncated`, not an unknown event.
 
 ## Field encodings
 
@@ -363,11 +409,12 @@ that encoding, across 134,000 frames, without the stream ever losing sync.
 | 7 | TAG2_3S32 | see below | real log — **except selector 3's first two width slots, which no log we hold separates** |
 | 8 | TAG8_4S16 | see below | real log |
 | 9 | NULL | no bytes; value comes entirely from the predictor | real log |
-| 10 | TAG2_3SVARIABLE | as TAG2_3S32, widest selector uses signed varints | **round-trip only — not seen in any of the four logs** |
+| 10 | TAG2_3SVARIABLE | as TAG2_3S32, widest selector uses signed varints | **round-trip only — declared by no real log we hold** |
 
-Measured field-table inventory, 2026-08-12: the real 4.6 log declares encodings
-{0, 1, 3, 6, 7, 8, 9}; the three third-party 4.4 logs declare {0, 1, 6, 7, 9}.
-Encoding 10 appears in none of them.
+Measured field-table inventory, 2026-08-12, re-measured 2026-10-03 across all
+110 real sessions: the real 4.6 log declares encodings {0, 1, 3, 6, 7, 8, 9},
+and each dump, across its sessions, declares the same set. Encoding 10 appears
+in none of them. (The three simulator files declared {0, 1, 6, 7, 9}.)
 
 ### TAG2_3S32 — three fields, one lead byte
 
@@ -395,16 +442,21 @@ and the fifth is its **field-0/field-1 transposition** — reading `(1,0,2)`, so
 field 0 takes the width in slot 1 and field 1 takes the width in slot 0.
 
 Measured on the reference 4.6 log, 2026-08-12, by decoding it under all six
-permutations and diffing the samples:
+permutations and diffing the samples. The `verify:log` column was re-measured on
+2026-10-03 under the current continuity rule:
 
 | permutation | samples differing from shipped | verify:log |
 | --- | --- | --- |
 | `(0,1,2)` — as shipped | — | 13/13 |
 | `(1,0,2)` — field 0 ↔ field 1 | **0 of 134,429** | **13/13** |
-| `(0,2,1)` | 53 | 12/13, `axisP[1]` 30.3x |
-| `(1,2,0)` | 53 | 12/13, `axisP[1]` 30.3x |
-| `(2,1,0)` | 53 | 12/13, `attitude[2]` 17.9x |
-| `(2,0,1)` | 53 | 12/13, `attitude[2]` 17.9x |
+| `(0,2,1)` | 53 | 12/13, `axisP[1]` 30.3x (30.2x undone at keyframes) |
+| `(1,2,0)` | 53 | 12/13, `axisP[1]` 30.3x (30.2x undone at keyframes) |
+| `(2,1,0)` | 53 | 12/13, `axisP[1]` 5.0x (4.4x undone at keyframes) |
+| `(2,0,1)` | 53 | 12/13, `axisP[1]` 5.0x (4.4x undone at keyframes) |
+
+In the last two rows the check used to fail on `attitude[2]` at 17.9x. That
+field is now printed as a set-aside step rather than a failure, because its
+keyframes take back only 0.27x — see [The continuity check](#the-continuity-check).
 
 The six collapse into **three** distinguishable classes, and the shipped order
 shares its class with its own transposition. The reason is arithmetic, not luck:
@@ -416,8 +468,10 @@ numbers cannot be told apart by any measurement of those numbers. The
 byte-tightness argument is degenerate here too, since the two slots being
 exchanged always hold the same width.
 
-The other three logs cannot help either: all six of their selector-3 groups have
-three equal widths, so every permutation is a no-op on them.
+The three simulator files once cited here could not help either: all six of
+their selector-3 groups had three equal widths, so every permutation was a no-op
+on them — and the decoder now refuses them outright. The two dumps do not settle
+it either (see the multi-session section above).
 
 **What is at stake.** This group carries `axisP`, `axisI`, `axisD`, `axisF` and
 `axisO`. On the day firmware emits a selector-3 group whose first two fields need
@@ -466,7 +520,9 @@ what a tuning metric looks at.
 Selectors **0, 1 and 2 were swept over all six permutations each** against the
 real log and measured the same way. Every one of the five non-identity orders
 changes the decoded samples and every one is caught; none of them is marginal.
-The worst offender in each reversal:
+That still holds under the current continuity rule (re-measured 2026-10-03; the
+narrowest is 5.1x, see the sweep table at the top of this file). The worst
+offender in each reversal, as measured on 2026-08-12 by the ratio alone:
 
 | selector reversed | worst continuity ratio |
 | --- | --- |
@@ -487,15 +543,16 @@ all*, so it looks like a reversed bit order must change byte consumption and
 destroy sync. It does not. Reversing the bits **within the group** preserves
 their popcount, so exactly the same number of varints is read.
 
-Measured on the real 4.6 log: reversed, it still gives 134,429 samples, 1 error
-and 525 resync bytes — bit-identical to the correct order. Only continuity
-separates them:
+Measured on the real 4.6 log on 2026-08-12: reversed, it still gave 134,429
+samples, 1 error and 525 resync bytes — bit-identical to the correct order as it
+decoded then (that error was the cut final frame, reported as `truncated` with
+no resync since 2026-10-03). Only continuity separates them:
 
 | order | worst continuity |
 | --- | --- |
 | bit *n* → field *n* (shipped) | 1.16x, nothing flagged |
-| reversed within group | `altitude` **infinite**, `rssi` 29.6x |
-| reversed, third-party log | `axisI[0]` **158.9x**, `axisI[2]` 39.0x |
+| reversed within group | `altitude` **infinite**, `rssi` 28.7x (29.6x when first measured, 2026-08-12) |
+| reversed, one simulator file (2026-08-12; refused by the decoder since) | `axisI[0]` **158.9x**, `axisI[2]` 39.0x |
 
 (Reversing across all 8 bit positions regardless of group size *does* break sync,
 which is presumably where the opposite intuition comes from. That is not the
@@ -558,7 +615,8 @@ Two things follow, and they are worth stating as rules rather than as history:
   and believe it settles a layout question.
 - **A synthetic corpus can be structurally incapable of seeing a bug.** If every
   field in a group needs the same width, permuting the slots is a no-op. Our own
-  fixtures and all three third-party logs are in that position for both encodings.
+  fixtures and the three simulator files once cited here are in that position
+  for both encodings.
   `test/blackbox-continuity.test.mjs` therefore builds groups whose widths are
   deliberately all different, and mis-packs them on purpose. Measured 2026-08-12:
   `rf43-single-session.TXT` produces 87 selector-3 groups and **all 87 are
@@ -580,7 +638,7 @@ Two things follow, and they are worth stating as rules rather than as history:
 | 1 | PREVIOUS | previous frame's value | real log |
 | 2 | STRAIGHT_LINE | `2·previous − previous2` | real log |
 | 3 | AVERAGE_2 | `trunc((previous + previous2) / 2)` | real log — **truncation measured, see below** |
-| 4 | MIN_THROTTLE | header `minthrottle` | third-party synthetic only |
+| 4 | MIN_THROTTLE | header `minthrottle` | **round-trip only** — once seen in third-party simulator files the decoder now refuses |
 | 5 | MOTOR_0 | this frame's `motor[0]` | **round-trip only** |
 | 6 | INCREMENT | `previous + step`, step per session | real log — **step measured, see below** |
 | 7 | HOME_COORD | matching GPS home coordinate | real log, but **only with home = [0, 0]** |
@@ -589,18 +647,19 @@ Two things follow, and they are worth stating as rules rather than as history:
 | 10 | LAST_MAIN_FRAME_TIME | last main frame's `time` | real log |
 | 11 | MIN_MOTOR | header `motorOutput` low value | **round-trip only** |
 
-Measured inventory, 2026-08-12: the real 4.6 log declares predictors
-{0, 1, 2, 3, 6, 7, 8, 9, 10}; the three third-party 4.4 logs declare
-{0, 1, 2, 4, 6}. **MOTOR_0 (5) and MIN_MOTOR (11) appear in none of the four**
-and remain genuinely round-trip only. MIN_THROTTLE (4) is declared for `motor[0]`
-and `motor[1]` in all three third-party logs — that is independent of our writer,
-but it is still not firmware output, which is why it gets its own status rather
-than being called "real log".
+Measured inventory, 2026-08-12, re-measured 2026-10-03 across all 110 real
+sessions: the real 4.6 log declares predictors {0, 1, 2, 3, 6, 7, 8, 9, 10}, and
+each dump, across its sessions, declares {0, 1, 2, 3, 6, 8, 9}. **MIN_THROTTLE
+(4), MOTOR_0 (5) and MIN_MOTOR (11) appear in no real log we hold** and remain
+round-trip only. MIN_THROTTLE used to carry a status of its own because the
+three simulator files declare it for `motor[0]` and `motor[1]`; that was
+independent of our writer, but it was never firmware output, and the decoder
+now refuses those files.
 
 **INCREMENT — the step is per session, and it is not always 1.** This file used
 to say the real log "decoded it monotonically across every frame, so the step is
 1", and closed with "a log with a P interval greater than 1 would still be worth
-checking". The log being described **is** that log: `sample-bell-222ut.bbl`
+checking". The log being described **is** that log: the reference flight
 declares `H I interval:64`, `H P interval:2`, `H P ratio:32`. The reasoning was
 also the exact fallacy this file warns about three sections earlier —
 monotonicity is a sync-style argument.
@@ -610,9 +669,9 @@ was yanked forward **33** at every keyframe, at **4,200 of 4,200 I frames** and
 **0 of 130,228** P frames, ending at 268,828 against a true 268,856. Both jumps
 are forwards, so the monotonicity guard was satisfied and no frame was ever
 rejected. The step is now derived as `I interval / P ratio`, falling back to the
-leading integer of `P interval`; both derivations agree on all four logs (2 for
-the real log, 1 for the three third-party ones) and the phase ratio collapses to
-exactly 1.000.
+leading integer of `P interval`; both derivations agree on all 110 real sessions
+we hold, every one of them a step of 2 (re-measured 2026-10-03), and the phase
+ratio on the real flight collapses to exactly 1.000.
 
 **AVERAGE_2 — truncation toward zero, now measured rather than assumed.** The two
 candidates differ only when `previous + previous2` is negative and odd, which
@@ -708,7 +767,8 @@ proves an implementation self-consistent; only real data proves it right.
 ## What the continuity sweep changed (2026-08-12)
 
 The same argument, one level sharper: real data only proves it right if you
-measure the right property. All four logs decoded "cleanly" for months.
+measure the right property. The real log, and the three simulator files counted
+alongside it at the time, decoded "cleanly" for months.
 
 - **TAG2_3S32 selector 3 read its widths from the wrong end** — the second
   instance of the TAG8_4S16 bug, found by generalizing the check that caught the
@@ -724,8 +784,9 @@ measure the right property. All four logs decoded "cleanly" for months.
   continuity check is what confirmed it (floor gives 10x, truncation 1x).
 - **Everything else was cleared with a number rather than an argument**:
   TAG2_3S32 selectors 0/1/2 over all six permutations each and TAG8_8SVB by
-  continuity. Event type 51 remained absent from all four logs, so its regression
-  vector is pinned directly to the firmware serializer instead.
+  continuity. Event type 51 remained absent from every log measured, and is still
+  absent from all 110 real sessions held on 2026-10-03, so its regression vector
+  is pinned directly to the firmware serializer instead.
 
 The methodological point, which is the part worth keeping: **three of these are
 delta-vs-absolute defects, and one check finds all three.** If a future encoding
@@ -737,8 +798,12 @@ the corpus needs a case that makes it visible.
 
 1. Run `npm run verify:log` against it.
 2. Read the continuity line specifically, not just the pass/fail total. A worst
-   ratio creeping towards 2x on a field that moves is the early warning; a log
-   that reports "continuity not measured" has told you nothing about its values.
+   ratio creeping towards 2x on a field that moves is the early warning. A field
+   set aside as a keyframe step is not counted in that worst figure; its note
+   prints the two figures that decide a flag ("without its 3 largest keyframes"
+   and "undone at keyframes"), and either one creeping towards 2x is the same
+   warning. A log that reports
+   "continuity not measured" has told you nothing about its values.
 3. If every check passes, add it as a fixture per `docs/FIXTURE_POLICY.md` and
    record its decoded field inventory as a regression baseline.
 4. If a check fails, correct the relevant assumption above, and add a unit test

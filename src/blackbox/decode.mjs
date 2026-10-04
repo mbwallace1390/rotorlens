@@ -27,8 +27,11 @@ export const ENGINE = Object.freeze({
 const BLACKBOX_PRODUCT = 'Blackbox flight data recorder by Nicholas Sherlock';
 const ROTORFLIGHT_TYPE = 'Rotorflight';
 // Accepted for interoperability, not claimed equally verified: the committed
-// synthetic corpus exercises 4.3, independently produced/private logs cover
-// 4.4 and 4.6, and the event serializer is pinned against 4.6 firmware source.
+// synthetic corpus exercises 4.3 and 4.6; real firmware output has been decoded
+// for 4.6 only (4.6.0 and its RC1 and RC3 candidates, 110 private sessions);
+// no firmware-written 4.4 or 4.5 log has been decoded (the only files labelled
+// 4.4 were simulator output, which the decoder refuses); and the event serializer
+// is pinned against 4.6 firmware source.
 // A future minor may change a field or event contract, so it fails closed until
 // a log and the conformance checks deliberately widen this range.
 const ROTORFLIGHT_REVISION_PATTERN =

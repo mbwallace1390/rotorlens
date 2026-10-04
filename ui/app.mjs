@@ -818,11 +818,20 @@ function sessionOptionLabel(session, index) {
   // `samples` is null until the frames are read and an array afterwards; the
   // decoder is deliberate about that distinction, and this is the one place in
   // the app that depends on it.
-  const measured = sessionIsUnreadable(session)
-    ? 'cannot be read'
-    : session.samples
+  //
+  // A header the decoder REFUSED is not a header that is damaged. Firmware
+  // outside the range it opens says so here, so a pilot on a newer release is
+  // not sent looking for a fault in a healthy file.
+  let measured;
+  if (sessionIsUnsupported(session)) {
+    measured = 'firmware not supported';
+  } else if (sessionIsUnreadable(session)) {
+    measured = 'cannot be read';
+  } else {
+    measured = session.samples
       ? `${session.samples.length.toLocaleString()} samples`
       : 'not opened yet';
+  }
 
   return `${index + 1}. ${name} — ${size}, ${measured}`;
 }
@@ -844,6 +853,66 @@ function sessionOptionLabel(session, index) {
 function sessionIsUnreadable(session) {
   return Boolean(session) && Array.isArray(session.errors) && session.errors.length > 0 &&
     (session.fields?.length ?? 0) === 0;
+}
+
+/**
+ * The firmware this build's decoder opens, for the sentence a pilot reads when
+ * it refuses a log.
+ *
+ * A pilot on a newer Rotorflight than the decoder accepts used to be told the
+ * header block was damaged — a healthy file, a false fault, and nowhere on
+ * screen saying which firmware RotorLens does read. That range is the decoder's
+ * decision, made in `compatibilityError` in src/blackbox/decode.mjs, which does
+ * not export it. So it is stated here and pinned there:
+ * test/ui-open-file.test.mjs relabels a committed fixture across revisions,
+ * decodes each through the real `decodeLog`, and fails the moment the minors it
+ * accepts and this range disagree. Widening the decoder without this, or this
+ * without the decoder, fails the build.
+ *
+ * `checkedMinors` is a different and narrower fact: the minors a real flight
+ * log has actually been decoded from, rather than merely accepted. Every real
+ * log held — the reference flight and both dataflash dumps, 110 sessions — was
+ * written by 4.6.0 or one of its release candidates; no real 4.3, 4.4 or 4.5
+ * log has ever been opened. The sentence says so, because accepting a range is
+ * not the same claim as having verified it (docs/LICENSING_AND_STORE_READINESS.md
+ * section 8). Add a minor here only with a real log from it.
+ */
+export const READABLE_FIRMWARE = Object.freeze({
+  firmware: 'Rotorflight',
+  major: 4,
+  firstMinor: 3,
+  lastMinor: 6,
+  checkedMinors: Object.freeze([6])
+});
+
+/** "Rotorflight 4.3 to 4.6", from READABLE_FIRMWARE. */
+function readableFirmwareRange() {
+  const {firmware, major, firstMinor, lastMinor} = READABLE_FIRMWARE;
+  return `${firmware} ${major}.${firstMinor} to ${major}.${lastMinor}`;
+}
+
+/** "Rotorflight 4.6", from READABLE_FIRMWARE: the part a real log has verified. */
+function checkedFirmwareVersions() {
+  const {firmware, major, checkedMinors} = READABLE_FIRMWARE;
+  return `${firmware} ${checkedMinors.map(minor => `${major}.${minor}`).join(', ')}`;
+}
+
+/** The decoder's own refusal of this session's firmware or format, or null. */
+function unsupportedFirmwareError(session) {
+  if (!sessionIsUnreadable(session)) {
+    return null;
+  }
+  return session.errors.find(error => error?.code === 'unsupported-firmware') ?? null;
+}
+
+/**
+ * A session the decoder refused because of what wrote it, not because it is
+ * damaged: firmware outside READABLE_FIRMWARE, or a Blackbox product or data
+ * version it does not implement. `compatibilityError` reports all three under
+ * one code, `unsupported-firmware`.
+ */
+function sessionIsUnsupported(session) {
+  return unsupportedFirmwareError(session) !== null;
 }
 
 /**
@@ -1680,6 +1749,17 @@ function renderUnreadableSession(session) {
 
   $('session-stats').innerHTML = headerOnlyStatsHtml(session, '—');
 
+  // Refused, not damaged. Saying "damaged" here sent a pilot on a newer firmware
+  // after a fault in a healthy file and never said which firmware is read.
+  if (sessionIsUnsupported(session)) {
+    $('session-issues').innerHTML =
+      `<h3>Integrity</h3>${pill('bad', 'firmware not supported')}` +
+      decodeErrorListHtml(session) +
+      `<p class="muted" style="font-size:12.5px">${esc(unsupportedFirmwareSentence(session))}</p>`;
+    show('session-panel');
+    return;
+  }
+
   $('session-issues').innerHTML =
     `<h3>Integrity</h3>${pill('bad', 'cannot be read')}` +
     decodeErrorListHtml(session) +
@@ -1688,6 +1768,46 @@ function renderUnreadableSession(session) {
     `another from the list above.</p>`;
 
   show('session-panel');
+}
+
+/**
+ * What a pilot is told when the decoder refused a flight for what wrote it.
+ *
+ * Names the range this version opens and, from the refusal itself, what this
+ * log says it is. The decoder raises the one code for three different header
+ * facts, and the sentence follows the one it actually refused on: the firmware
+ * line, or the Blackbox product or data version above it. Only that last pair
+ * quotes the decoder, because "Rotorflight 4.6.0" with a data version it does
+ * not read must not be told its firmware is out of range.
+ */
+function unsupportedFirmwareSentence(session) {
+  const refusal = unsupportedFirmwareError(session);
+  const range = readableFirmwareRange();
+  const firmwareRefused = refusal !== null
+    && ('firmwareRevision' in refusal || 'firmwareType' in refusal);
+
+  let what;
+  if (firmwareRefused) {
+    const named = refusal.firmwareRevision ?? refusal.firmwareType ?? null;
+    what = typeof named === 'string' && named.trim() !== ''
+      ? `This flight was recorded by ${named.trim()}.`
+      : 'This flight\'s header does not name a firmware RotorLens opens.';
+  } else {
+    const said = typeof refusal?.message === 'string' && refusal.message !== ''
+      ? ` (the decoder reported: ${refusal.message})`
+      : '';
+    what = `This flight's header describes a Blackbox format RotorLens does not read${said}.`;
+  }
+
+  const otherReadable = (state.result?.sessions ?? []).some(
+    (other, index) => index !== state.sessionIndex && !sessionIsUnreadable(other));
+
+  return `${what} This version of RotorLens opens logs from ${range} only, so nothing in ` +
+    `this one is decoded. Of that range, only ${checkedFirmwareVersions()} has been checked ` +
+    'against real logs. The file is not necessarily damaged: RotorLens refuses a log ' +
+    'from outside that range rather than guess, because another firmware or a newer ' +
+    'release can lay the log out differently, and a wrong guess would show wrong numbers.' +
+    (otherReadable ? ' Other flights in this file can still be opened from the list above.' : '');
 }
 
 // ---------------------------------------------------------------------------
@@ -2190,7 +2310,7 @@ function commitWindowFromSliders() {
  * How many analysis records may be alive at once.
  *
  * MEASURED, not guessed. `buildAnalysisRecords` on the flight window of the
- * reference log (sample-bell-222ut.bbl, 134,429 samples, 111,509 inside the
+ * private reference log (134,429 samples, 111,509 inside the
  * window) costs ~50 MB of V8 heap per axis — 0.45 KB per record — on top of the
  * ~112 MB the decoded session itself occupies. `buildRecommendations` wants all
  * three axes at once, because the ordering across rungs and the "at most one
@@ -3418,8 +3538,9 @@ async function measureRecommendations() {
 //      itself would make "you can delete all of it" a smaller promise than it
 //      sounds.
 //   2. NO IMPROVEMENT IS CLAIMED THAT THE ENGINE CANNOT SEPARATE FROM NOISE.
-//      The floor is measured — 0.39 °/s between two flights with nothing
-//      changed — and its sentence is printed beside every number.
+//      The floor is measured per axis between two flights with nothing changed
+//      — 0.92, 1.39 and 0.1 °/s on roll, pitch and yaw (SENSITIVITY_FLOOR_DPS)
+//      — and its sentence is printed beside every comparison.
 //   3. "NOTHING MOVED" AND "WE COULD NOT TELL" ARE OPPOSITE ANSWERS, and are
 //      never rendered in the same words. Conflating them is the defect this
 //      whole design exists to avoid.
@@ -5128,7 +5249,8 @@ const SHARING_TERMS_OUTDATED_NO_BUTTON = 'Sharing was enabled under an older dis
   + 'to erase.';
 
 /**
- * `4.2 kB`, so the dialog's "about 4 kB of numbers" can be checked on screen.
+ * `2.5 kB`-style, so the consent dialog's "about 2.5 kB of numbers" can be
+ * checked against the figure printed beside the payload.
  *
  * Measured on the COMPACT form even though the pretty-printed one is what is
  * displayed. The indentation is this screen's doing, not the record's, and
@@ -6515,13 +6637,14 @@ function codeList(codes, label = 'Machine codes') {
  * What this panel is, and what it is not.
  *
  * NOT `brief.boundary`, and that is a deliberate change made on 12 August 2026.
- * `describeStopCapture` and `describeHoldCapture` in
- * `src/analysis/axis-report.mjs` still end their boundary sentence with
+ * Until 3 October 2026 `describeStopCapture` and `describeHoldCapture` in
+ * `src/analysis/axis-report.mjs` ended their boundary sentence with
  * "RotorLens does not tell you what to change", which stopped being true of this
- * product on that date. Printing it twelve lines below a panel that says "Lower
- * yaw D" would make one of the two a lie, and the engine's file is not this
- * one's to edit — see the handoff note. The true half of that sentence, which is
- * what a measurement panel is FOR, is kept here.
+ * product on that date; printing it twelve lines below a panel that says "Lower
+ * yaw D" would have made one of the two a lie. The engine sentence now says the
+ * panel is a measurement and that advice is in "What to change", but this
+ * panel's own wording is kept: it speaks of the flight WINDOW the pilot can
+ * move, and says the numbers are what the recommendation was built from.
  */
 const MEASUREMENT_BOUNDARY =
   'Everything above is a measurement of the flight window, and the manoeuvre below is how '

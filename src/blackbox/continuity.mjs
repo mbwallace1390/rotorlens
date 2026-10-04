@@ -20,8 +20,11 @@
  * does not know where the keyframes are.
  *
  * This module measures exactly that: mean |Δ| entering an I frame, against mean
- * |Δ| everywhere else. Correct decoding gives ≈1. On the real 4.6 log the three
- * defects gave 33x (loopIteration), 17.9x (attitude[2]) and 5.0x (axisP[1]).
+ * |Δ| everywhere else. Correct decoding gives ≈1. Put back into the decoder, the
+ * three defects read on the real 4.6 log: TAG8_4S16 346x on setpoint[3],
+ * INCREMENT 33x on loopIteration, and TAG2_3S32 selector 3 17.9x on attitude[2]
+ * and 5.0x on axisP[1]. Those are ratios alone, which as below are no longer the
+ * whole rule.
  *
  * A RATIO ABOVE THE THRESHOLD IS NOT ENOUGH ON ITS OWN, and the 109 sessions of
  * two private dataflash dumps are what showed it. Under the ratio alone 32 of
@@ -62,25 +65,42 @@
  * A field must move at least this much per I frame before a ratio means anything.
  *
  * A ratio is a quotient of two tiny numbers when a field barely moves, and then
- * it says nothing: a monotonic ESC capacity counter that ticks 28 times in a
- * whole flight reads 1.59x, and a field whose entire range is 0..5 and which
- * moves five times in 30,000 samples reads 7.75x. Both are arithmetic, not
- * evidence. 0.05 counts per I frame excludes those while keeping every field
- * that carried a real defect: the smallest was axisP[1] at 0.165.
+ * it says nothing. Measured on real logs, 2026-10-03: the reference flight's ESC
+ * capacity counter (EscCap) moves 0.0067 counts per I frame and reads 1.59x, and
+ * in one session of a real dump the MCU temperature (Tmcu), whose whole range is
+ * 36..39 and which changes five times in 91,850 samples, reads 7.75x. Both are
+ * arithmetic, not evidence, and 0.05 counts per I frame excludes them. (The
+ * 7.75x example used to be a 0..5 field in 30,000 samples, measured on a
+ * simulator file the decoder now refuses; see docs/BLACKBOX_FORMAT_NOTES.md.)
+ *
+ * The floor gates the mean a field is called out on: the mean left after setting
+ * the largest keyframe jumps aside, or the mean taken back at keyframes (see
+ * `broad` and `reversing` below). Under the ratio-only rule every field that
+ * carried a real defect cleared it, the smallest being attitude[0] under
+ * TAG2_3S32 selector 3 at 0.105. Under this rule the narrowest defect still
+ * called out, axisP[1] under the same selector, clears it on its taken-back mean
+ * of 0.147.
  */
 const DEFAULT_MOVEMENT_FLOOR = 0.05;
 
 /**
  * Ratio at or above which a field is called out. Correct decoding sits near 1.
  *
- * Measured margin: across the real 4.6 log and three third-party logs — 224,429
- * samples in total — the worst correctly decoded field above the movement floor
- * reads 1.16x. The defects read 33x, 17.9x, 5.0x and 2.2x. 2.0 sits in the empty
- * band between those two populations.
+ * Measured margin on the real 4.6 reference log (134,429 samples), on the ratio
+ * alone: the worst correctly decoded field above the movement floor reads 1.16x,
+ * and the defects read 346x, 33x, 17.9x, 5.0x and 2.2x. 2.0 sits in the empty
+ * band between those two populations on that log. (This said 224,429 samples
+ * across four logs until 2026-10-03; the other three were simulator files, not
+ * firmware output.)
  *
- * The same 2x is what each of the two shapes above must clear. Over 110 real
+ * The two real dumps do not show that empty band: 32 of their 109 sessions have
+ * a field above the movement floor at 2x or more. Investigated 2026-10-03, every
+ * one is a genuine step that landed on a keyframe — see the header above. The
+ * same 2x is what each of the two shapes there must clear: over all 110 real
  * sessions the worst correctly decoded field reaches 1.59x broad and 1.63x
- * reversing; the narrowest defect, selector 3 on axisP[1], reverses at 4.41x.
+ * reversing, and the narrowest defect, selector 3 on axisP[1], reverses at
+ * 4.41x. That selector's other two fields, attitude[2] (17.9x) and attitude[0]
+ * (2.2x) on the ratio, clear neither shape and are no longer called out.
  */
 const DEFAULT_RATIO_THRESHOLD = 2;
 
@@ -246,12 +266,17 @@ export function measureIntraFrameContinuity(input, options = {}) {
       interMean,
       ratio,
       trimmedRatio: trimmed.ratio,
+      trimmedMean: trimmed.mean,
       reversalRatio: reversal.ratio,
+      reversalMean: reversal.mean,
+      broad,
+      reversing,
       largestKeyframeJumps: largest.filter(entry => entry.size > 0),
       belowMovementFloor: !moves,
       // Over the threshold on the ratio alone, but carried by a few keyframes
-      // that take back too little to be a mis-read: a moment in the flight that
-      // landed on a keyframe.
+      // that take back too little to have the shape of a mis-read: the shape of
+      // a moment in the flight landing on a keyframe. A mis-read confined to a
+      // keyframe or two can share it (attitude[2] under TAG2_3S32 selector 3).
       concentrated: moves && ratio >= ratioThreshold && !flagged,
       flagged
     });

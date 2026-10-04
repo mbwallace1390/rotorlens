@@ -12,9 +12,11 @@
  *   - time and loop iteration advance monotonically across every frame;
  *   - the sample interval is stable, matching a fixed-rate logger;
  *   - decoded values land inside the physical range their sensor can report;
- *   - **no field jumps at I-frame boundaries** — see below. A genuine step that
- *     happens to land on a keyframe (a throttle cut, the governor engaging) is
- *     told apart from a decoding fault and printed as a note with its sample.
+ *   - **no field jumps at I-frame boundaries** — see below. A step that lands
+ *     on a keyframe without undoing the delta frames' movement (a throttle cut,
+ *     the governor engaging) is set aside and printed as a note with its sample
+ *     rather than failed. A mis-read confined to a keyframe or two can take the
+ *     same shape, which is why the note names the samples.
  *
  * The first four are all *alignment* checks, and alignment is not enough. Three
  * decoder defects shipped past every one of them, because a bit layout can be
@@ -195,31 +197,49 @@ for (const session of result.sessions) {
         ? `worst ${worstClean.name} ${worstClean.ratio.toFixed(2)}x ` +
           `(threshold ${continuity.ratioThreshold}x, ${continuity.intraTransitions} keyframes)` +
           (concentrated.length > 0
-            ? `; ${concentrated.length} single-moment step${concentrated.length === 1 ? '' : 's'} set aside`
+            ? `; ${concentrated.length} field${concentrated.length === 1 ? '' : 's'} ` +
+              'with a keyframe step set aside'
             : '')
         : flagged.slice(0, 6)
           .map(entry =>
             `${entry.name} ${times(entry.ratio)} ` +
             `(${entry.intraMean.toFixed(2)} per keyframe vs ${entry.interMean.toFixed(2)} elsewhere; ` +
-            (entry.trimmedRatio >= continuity.ratioThreshold
-              ? `${times(entry.trimmedRatio)} without its ` +
-                `${continuity.concentrationKeyframes} largest keyframes)`
-              : `${times(entry.reversalRatio)} undone at keyframes)`))
+            // Whichever shape actually called it out, both when both did.
+            [
+              entry.broad && `${times(entry.trimmedRatio)} without its ` +
+                `${continuity.concentrationKeyframes} largest keyframes`,
+              entry.reversing && `${times(entry.reversalRatio)} undone at keyframes`
+            ].filter(Boolean).join(', ') + ')')
           .join(', '));
 
     if (concentrated.length > 0) {
       notes.push(
         `${label}: ${concentrated.slice(0, 6)
           .map(entry =>
-            `${entry.name} ${times(entry.ratio)} rides on ` +
+            // The two figures that actually decide a flag, so a margin creeping
+            // towards the threshold is visible here too. A mean of zero is said
+            // as such: as a ratio it would print 0.0x, or 1.0x by the 0/0 rule
+            // when the delta frames never move either.
+            `${entry.name} ${times(entry.ratio)} (` +
+            (entry.trimmedMean > 0
+              ? `${times(entry.trimmedRatio)} without its ` +
+                `${continuity.concentrationKeyframes} largest keyframes`
+              : `nothing left without its ${continuity.concentrationKeyframes} largest keyframes`) +
+            ', ' +
+            (entry.reversalMean > 0
+              ? `${times(entry.reversalRatio)} undone at keyframes`
+              : 'nothing undone at keyframes') +
+            ') rides on ' +
             entry.largestKeyframeJumps
               .map(jump => `sample ${jump.sampleIndex} (Δ${jump.size})`)
               .join(', '))
           .join('; ')}${concentrated.length > 6 ? `; and ${concentrated.length - 6} more` : ''}. ` +
-        `Each falls under the threshold once its ${continuity.concentrationKeyframes} largest ` +
-        'keyframe jumps are set aside, and its keyframes take back too little of the ' +
-        'delta frames\' movement to look like a mis-read: a step in the flight that ' +
-        'landed on a keyframe, not a field decoded from the wrong bits.'
+        `Once each field's ${continuity.concentrationKeyframes} largest keyframe jumps are set ` +
+        'aside, it falls under the threshold or the movement floor, and its keyframes take ' +
+        'back too little of the delta frames\' movement to have the shape of a mis-read. ' +
+        'That is what a step in the flight landing on a keyframe looks like. A mis-read ' +
+        'confined to a keyframe or two can look the same, so if a field with the same ' +
+        'encoding fails, look at these samples too.'
       );
     }
 

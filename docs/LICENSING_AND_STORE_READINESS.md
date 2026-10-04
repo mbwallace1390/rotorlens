@@ -215,9 +215,14 @@ identify authorship. A separate trademark policy controls use of the RotorLens
 name and logo so modified builds can give accurate credit without presenting
 themselves as official releases.
 
-Compatibility wording may say RotorLens reads Rotorflight or Betaflight logs. It
-must not imply endorsement or affiliation, and the non-affiliation statement must
-remain in the store listing and About & Legal screen.
+Compatibility wording may say RotorLens reads Rotorflight Blackbox logs, naming
+only versions a real log has verified — today Rotorflight 4.6, one board, one
+flight (section 5). The decoder accepts a Rotorflight 4.3 to 4.6 header and
+refuses every other firmware, Betaflight included (`compatibilityError` in
+`src/blackbox/decode.mjs`), so wording must not claim Betaflight logs, and must
+not present acceptance of 4.3 to 4.5 as verification. It must not imply
+endorsement or affiliation, and the non-affiliation statement must remain in the
+store listing and About & Legal screen.
 
 ## 9. Release checklist
 
@@ -248,6 +253,11 @@ Store and privacy:
 - [ ] Current-build copy says there is no upload transport; Android-specific copy
       separately states that Android requests no `INTERNET` permission.
 - [ ] Privacy policy and contribution terms are live at stable public URLs.
+      Status, 3 October 2026: the policy is live at
+      `https://mbwallace1390.github.io/rotorlens/privacy-policy.html` (GitHub
+      Pages from `main` `/docs`); nothing here records it as entered in either
+      store console yet. The contribution terms are an engineering draft; no
+      adopted terms exist to publish.
 - [ ] Store screenshots and descriptions match the shipped recommendation and
       data-sharing behavior.
 

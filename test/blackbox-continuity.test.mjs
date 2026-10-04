@@ -385,9 +385,10 @@ test('an injected keyframe sawtooth is caught across its whole magnitude range',
 });
 
 test('a field that barely moves is reported as unmeasurable, not as a fault', () => {
-  // Both false positives seen on real logs were this shape: a ratio between two
-  // near-zero means. An ESC capacity counter that ticks 28 times in a flight read
-  // 1.59x, and a 0..5 field that moved five times in 30,000 samples read 7.75x.
+  // The floor's two real-log examples are this shape: a ratio between two
+  // near-zero means. The reference flight's ESC capacity counter moves 0.0067
+  // counts per keyframe and reads 1.59x, and one dump session's MCU temperature,
+  // changing five times in 91,850 samples, reads 7.75x.
   const fields = [{name: 'barely'}];
   const samples = [];
   const intraSampleIndices = [];
@@ -461,8 +462,8 @@ const MOMENT_FIELDS = [
 /**
  * Spool-up, a long steady stretch, then a throttle cut at `cutAt`: the moment
  * that failed the real sessions, rebuilt field by field. Arming happens eight
- * keyframe periods earlier and every ramp has settled before the cut's period
- * begins, so the cut is a step out of a steady state.
+ * keyframe periods and seven samples earlier, and every ramp has settled before
+ * the cut's period begins, so the cut is a step out of a steady state.
  */
 function buildMomentFrames({frameCount, seed, cutAt}) {
   const noise = createNoise(seed);
@@ -516,9 +517,11 @@ function buildMomentLog({seed, cutAt, frameCount = 1024}) {
 }
 
 test('a throttle cut that lands on a keyframe is a moment in the flight, not a decoding fault', () => {
-  // Every keyframe phase, so the one phase that used to fail is surrounded by the
-  // 31 that never did. Encoded by our writer and decoded by the real decoder: the
-  // same path a dump takes through `verify:log`.
+  // Every keyframe phase, encoded by our writer and decoded by the real decoder:
+  // the same path a dump takes through `verify:log`. At phase 0 the cut lands on
+  // a keyframe. At a few other phases a different step does instead — at phase 7
+  // it is arming, and at phases 19 and 31 two ESC ramp steps land on keyframes —
+  // and those failed the ratio-only rule too. Every phase must now pass.
   let reachedOldFailure = 0;
 
   for (let seed = 1; seed <= 8; seed += 1) {
@@ -559,6 +562,11 @@ test('a throttle cut that lands on a keyframe is a moment in the flight, not a d
         assert.ok(concentrated, `seed ${seed}: the keyframe step was not reported at all`);
         assert.equal(concentrated.largestKeyframeJumps[0].sampleIndex, cutAt);
         assert.equal(concentrated.largestKeyframeJumps[0].size, 498);
+        // Nothing is left once the cut is set aside, and the cut undoes nothing:
+        // both means are zero. As ratios they would print 0.0x, a figure that
+        // reads like a measurement rather than "nothing at all".
+        assert.equal(concentrated.trimmedMean, 0);
+        assert.equal(concentrated.reversalMean, 0);
       }
     }
   }
@@ -694,10 +702,13 @@ const NARROW_FIELDS = [
 ];
 
 test('selector-3 widths mis-packed in only one or two groups are caught at the real entry point', () => {
-  // Reproduces the reference log's situation exactly: every TAG2_3S32 group fits
-  // selectors 0-2 except one or two, which need selector 3 with three DIFFERENT
-  // byte widths. Written with the slots reversed, those groups alone are mis-read;
-  // the stream stays aligned and nothing but continuity can see it.
+  // The shape of the reference log's defect rather than its census. There the
+  // reversed selector-3 slots mis-read only seven groups (reversal is a no-op on
+  // every group whose swapped widths are equal), and the excess rode on about two
+  // keyframes. Here one or two groups need selector 3, with three DIFFERENT byte
+  // widths so that the reversal mis-reads them. Written with the slots reversed,
+  // those groups alone are mis-read; the stream stays aligned and nothing but
+  // continuity can see it.
   for (let seed = 1; seed <= 40; seed += 1) {
     const noise = createNoise(seed * 668265263);
     const frameCount = 1024;

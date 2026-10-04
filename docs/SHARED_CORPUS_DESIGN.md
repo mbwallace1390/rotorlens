@@ -21,11 +21,13 @@ update, or network transport; on Android it adds no `INTERNET` permission.
 Phase 1.** No code sends anything anywhere; Android requests no `INTERNET`
 permission. Adding transport (and that Android permission) is a separate,
 deliberate commit — the commit that spends the store claim in section 7. **The
-offline schema, cohort builder, shadow aggregator, CLI, and sections 11 and 12
-are built and running.** They are the part of the problem that needs no
-permission: defining and auditing the shape, measuring donated `.bbl` files
-locally, and refusing to publish one that carries a position. They do not yet
-make an evaluated community tuning model.
+offline schema, cohort builder, shadow aggregator, and the section 11 tools are
+built and running.** They are the part of the problem that needs no
+permission: defining and auditing the shape, measuring `.bbl` files locally,
+and refusing to publish one that carries a position. They do not yet make an
+evaluated community tuning model. **Nothing is being collected:** there is no
+intake channel for logs, and section 12's request for them is withdrawn until
+there is one.
 
 The order is deliberate and worth stating, because it looks backwards. Building
 the contract and safety proof before the transport is how the chosen goal stays
@@ -35,8 +37,10 @@ other `.bbl` files in Discord today, so the shape is useful before any transport
 exists. **Choosing global learning does not authorize section 6.** That is a
 later product and privacy decision after the offline shadow gate passes.
 
-Written because the app hit a wall that one pilot cannot climb: across 109 real
-flights on two aircraft, the learning model found **zero usable data points**, and
+Written because the app hit a wall that one pilot cannot climb: across the 109
+real sessions in the two dumps — two craft-name-and-board groups, 30 of those
+sessions flights by `checkFlightAdmissible` — the learning model found **zero
+usable data points**, and
 the effect-size sweep says a single term needs roughly twelve deliberate flights
 before it can name a direction. Pooled across many pilots those numbers stop being
 absurd. That is the whole case for this.
@@ -54,7 +58,7 @@ guesses at.
 | Question | Status today | What a corpus gives |
 | --- | --- | --- |
 | How many hold segments can a real flight produce? | `minimumComparisonHolds` is 5. **The maximum ever observed is 4**, so the comparison has never once fired. | The real distribution, and a gate that can open. |
-| What is the flight-to-flight noise floor per axis? | Measured on 2 aircraft: roll 0.915, pitch 1.390, yaw 0.0966 °/s. n = 5, 4 and 18. | The same numbers at n in the thousands, per aircraft class. |
+| What is the flight-to-flight noise floor per axis? | Measured on two craft-name-and-board groups (yaw on one of them): roll 0.915, pitch 1.390, yaw 0.0966 °/s. n = 5, 4 and 18. | The same numbers at n in the thousands, per aircraft class. |
 | When is vibration worth chasing? | `8 °/s`, calibrated on synthetic signals, marked experimental. | Where normal sits, and — with labelled faults — where bad sits. |
 | Is 80 °/s the right stop threshold? | Chosen for 3D flying. The owner's flights peak at 56 and 32. | What learners actually fly, so the gate matches the users. |
 | Does a P change move roll standing error enough to measure? | **Unmeasured. Nobody has flown it.** | Answered by the first fifty pilots who try. |
@@ -69,7 +73,10 @@ need volume to surface at all.
 ## 2. What would be sent
 
 **The flight record, not the log.** The record already exists: `buildFlightRecord`
-runs on every analysis, before the pilot decides anything. It is about 4.4 kB.
+runs on every analysis, before the pilot decides anything. Stored locally it is
+about 4.4 kB; the narrower shared projection described below is about 2.5 kB
+compact (2,560 bytes for a real 4.6 flight, measured 3 October 2026; see
+section 4).
 
 It was designed for local storage under rules that forbid the log, any
 coordinate, any date and any filename, with `auditFlightRecord` enforcing that by
@@ -158,9 +165,10 @@ The production legal registries are empty. The expanded Phase 1 text in
 for engineering tests, but those identifiers are rejected by production audit;
 the app's narrower `2026-08-14` local-sharing choice is also rejected. Formal
 adoption must create new identifiers and preserve a separate acceptance receipt.
-The current Discord request in section 12 deliberately obtains no such licence,
-so those logs may measure demand and detector behaviour but may not train a model
-that is shipped or sold.
+The withdrawn Discord draft in section 12 would have obtained no such licence.
+Any version posted after the preconditions in section 12 are met must point at
+the adopted terms; logs gathered without them may measure demand and detector
+behaviour but may not train a model that is shipped or sold.
 
 `exportHistory` already rebuilds records from a documented allowlist rather than
 stringifying what it was handed. The shared projection is a second, narrower
@@ -194,6 +202,29 @@ the noise floor gets measured.
 ---
 
 ## 4. What the pilot is asked, and when
+
+**Suspended 2 October 2026, by the owner's decision: the app does not ask by
+itself.** The automatic prompt described below is off (`AUTOMATIC_SHARING_PROMPT
+= false` in `ui/app.mjs`) until the terms the dialog asks a pilot to accept are
+formally reviewed and adopted. The dialog's own footnote calls them a draft
+awaiting legal review, and `docs/PUBLIC_RELEASE_CHECKLIST.md` says no
+contribution is solicited before adoption. The same dialog still opens from the
+**Share measurements** button on the Shared measurements panel, for a pilot who
+goes looking for it. Turning the prompt back on is a deliberate owner decision
+after that review, not a cleanup; the timing below is the design to return to
+then.
+
+The quoted wording is the design for a build that can send. The shipping dialog
+departs from it only where it would be false today: it says a *future* version
+could send, states that nothing is sent yet and this version cannot send, and
+makes the see-and-delete promise for the day sending exists rather than in the
+present tense. It also says about 2.5 kB rather than 4 kB, because that is what
+the panel prints beside the real payload: the shared record of a real
+Rotorflight 4.6 flight is 2,560 bytes compact, measured on 3 October 2026. And
+because it can open from the panel with no flight on screen, it says "each real
+flight you open (never a bench run or a spool-up)" rather than "this flight" —
+the scope section 3 sets, since only flights that pass `checkFlightAdmissible`
+would be sent.
 
 Not at first run. Asking before the app has done anything useful is how consent
 becomes a reflex tap. Ask **after the first successful analysis**, once there is
@@ -723,10 +754,16 @@ useful on aircraft excluded from its training data.
 
 Two Phase 1 collection paths supply that proof without spending the claim:
 
-- **Ask.** Post in the Rotorflight Discord asking for `.bbl` files with the field
-  set and what the pilot changed. If nobody answers, no upload path would have
-  helped. *The message to post is in section 12, and the tools that measure what
-  comes back are in section 11 — both built.*
+- **Ask — withdrawn until there is somewhere private to send a log.** The plan
+  was to post in the Rotorflight Discord asking for `.bbl` files with the field
+  set and what the pilot changed; if nobody answered, no upload path would have
+  helped. It is not being done: there is no intake channel, no terms and no
+  receipt for a raw log, `docs/PUBLIC_RELEASE_CHECKLIST.md` says no contribution
+  is solicited before the community-measurement terms are reviewed and adopted,
+  and a reply in a public channel is exactly the public posting `SUPPORT.md` and
+  `docs/PILOT_GUIDE.md` tell pilots never to do. *The draft message is kept in
+  section 12 with its preconditions; the tools that would measure what came
+  back are built, in section 11.*
 - **Manual contribution pack.** After the complete configuration extractor and
   adopted terms exist, build a separate no-network export of the audited
   community envelope plus a retained consent/licence receipt. The existing
@@ -746,8 +783,9 @@ goal does not make networking implicit.
 Everything above waits on a transport. The first of the two cheap experiments
 does not: pilots hand `.bbl` files to each other in Discord today, and a log
 that arrives that way can be measured for detector coverage with no upload path,
-no in-app consent flow and no change to the app. **That reporting half is built.**
-It is not the licensed controlled-trial intake required by the community model.
+no in-app consent flow and no change to the app. **That reporting half is built;
+the asking half is withdrawn (section 12).** It is not the licensed
+controlled-trial intake required by the community model.
 Nothing in it touches the network, and the store claim in section 7 is untouched.
 
 ### `npm run corpus:report -- <file-or-directory>`
@@ -780,7 +818,8 @@ the one that gets sent to a person.
 ### What the first run says
 
 Both reference dumps plus the reference flight — 110 sessions, 31 of which flew,
-31.1 airborne minutes, 3 aircraft:
+31.1 airborne minutes, 3 aircraft (the report's grouping: one per
+craft-name-and-board combination):
 
 | Measurement | Result |
 | --- | --- |
@@ -833,9 +872,30 @@ REFUSED.**
 
 ---
 
-## 12. The ask
+## 12. The ask — withdrawn, not to be posted
 
-Short enough that somebody reads it. Post as-is.
+**Do not post this. Withdrawn 3 October 2026.** It asks pilots for raw `.bbl`
+files, and this project has nowhere to take one: no private intake channel, no
+terms and no receipt for a raw log. `docs/PILOT_GUIDE.md` and `SUPPORT.md` tell
+pilots never to put a log anywhere public, and a reply to a forum or Discord post
+with a file attached is exactly that. `docs/PUBLIC_RELEASE_CHECKLIST.md` says no
+contribution is solicited or accepted before the community-measurement terms are
+formally reviewed and adopted.
+
+The draft is kept as the starting point for the day that changes. Before any
+version of it is posted, all of these must hold:
+
+- the community-measurement terms are reviewed and adopted, and the message
+  points at them — the checklist makes adopted terms a precondition of asking
+  at all, which supersedes the "does not ask for a licence" choice explained
+  below;
+- a private intake exists, with its own terms and a receipt, and the message
+  names it and tells pilots to send a log only there — never as a reply, an
+  attachment or a public link;
+- the owner has decided to open it, deliberately, in the same way as turning
+  the automatic sharing prompt back on (section 4).
+
+The draft, as originally written:
 
 > **Anyone willing to send me a Rotorflight blackbox log? (~2 minutes)**
 >

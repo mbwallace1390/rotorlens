@@ -190,8 +190,12 @@ test('every axis reaches a full stop capture from the committed bytes', async ()
     assert.deepEqual(capture.refusals, [], `${axis} refusals`);
     assert.match(capture.headline, /stops captured/);
     // The boundary sentence is what keeps "fly this" from reading as "change
-    // this". It renders on this path and nowhere else in these assertions.
-    assert.match(capture.boundary, /does not tell you what to change/);
+    // this". It renders on this path and nowhere else in these assertions. It
+    // once said RotorLens "does not tell you what to change", which has been
+    // false since 12 August 2026; it now points at where the advice is.
+    assert.match(capture.boundary, /Neither is advice/);
+    assert.match(capture.boundary, /“What to change” panel/);
+    assert.doesNotMatch(capture.boundary, /does not tell you what to change/);
 
     assert.equal(evidence.status, 'captured', `${axis} evidence status`);
     for (const direction of ['positive', 'negative']) {

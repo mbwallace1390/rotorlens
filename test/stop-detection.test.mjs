@@ -966,7 +966,7 @@ test('the rejection tally survives a log with more refusals than the candidate c
 // ---------------------------------------------------------------------------
 // What the reference flight actually constrains
 //
-// `sample-bell-222ut.bbl` can never be committed, so the figures it yields are
+// The private reference log can never be committed, so the figures it yields are
 // recorded here as bounds instead. Every number below was re-measured against
 // the FIXED decoder — before the TAG8_4S16 width-selector fix every setpoint in
 // that log was a sawtooth and its peak roll command read 287 deg/s against a

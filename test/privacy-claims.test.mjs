@@ -409,6 +409,48 @@ test('the policy page renders wrapped sentences whole', async () => {
   assert.doesNotMatch(html, /<p>copy of it\.<\/p>/, 'a continuation must not become a paragraph');
 });
 
+test('the policy page keeps data rows as data, italics as italics, and comments private', async () => {
+  // Three defects the published page carried: a table with an empty header row
+  // had its first DATA row promoted into the header, so "Accounts or email" was
+  // set in bold as a column heading; *emphasis* was printed with its asterisks;
+  // and an internal repository path sat in the first public paragraph, where a
+  // comment now keeps it.
+  const {renderPolicyHtml} = await import('../tools/generate-privacy-page.mjs');
+  const html = renderPolicyHtml([
+    '# Title',
+    '',
+    '<!--',
+    'internal: docs/STORE_PRIVACY_ANSWERS.md',
+    '-->',
+    '',
+    'The *flight history* section.',
+    '',
+    '| | |',
+    '| --- | --- |',
+    '| Accounts or email | none |',
+    '| Location | never requested |',
+    '',
+    '| | Why |',
+    '| --- | --- |',
+    '| Craft name | to tell aircraft apart |',
+    ''
+  ].join('\n'));
+
+  assert.doesNotMatch(html, /<th>Accounts or email<\/th>/,
+    'the first data row of a table with an empty header became a header');
+  assert.match(html, /<tr><td>Accounts or email<\/td><td>none<\/td><\/tr>/);
+  assert.equal((html.match(/<tr><th><\/th><th>Why<\/th><\/tr>/g) ?? []).length, 1,
+    'a header with any text in it is still a header');
+  assert.match(html, /The <em>flight history<\/em> section\./);
+  assert.doesNotMatch(html, /\*/, 'an asterisk reached the page');
+  assert.doesNotMatch(html, /STORE_PRIVACY_ANSWERS|internal:/, 'a comment was published');
+
+  // And what it cannot render, it refuses rather than mangles.
+  assert.throws(() => renderPolicyHtml('# T\n\nA stray * here.\n'), /emphasis/);
+  assert.throws(() => renderPolicyHtml('# T\n\n<!-- never closed\n'), /unterminated comment/);
+  assert.throws(() => renderPolicyHtml('# T\n\n| a | b |\n| c | d |\n'), /separator row/);
+});
+
 test('the policy page loads nothing from anyone else', async () => {
   // A privacy policy that pulls a font or a script from a third party is a
   // tracking vector on the page explaining that the app does not track you.
@@ -463,8 +505,15 @@ test('the sharing store is disclosed field-for-field before release', async () =
     assert.match(document,
       /turn(?:ing)? sharing off[\s\S]{0,220}(?:does not|doesn't|retains?)[\s\S]{0,120}(?:aircraft key|identity|mapping)/i,
       'turning sharing off retains existing local aircraft identity mappings');
-    for (const control of ['Erase identity', 'Forget helicopter', 'Forget everything']) {
-      assert.match(document, new RegExp(control.replace(' ', '\\s+'), 'i'),
+    // The labels a pilot actually sees on the buttons. This list once read
+    // "Erase identity" and "Forget helicopter", which no button says, so the
+    // disclosure could only pass by naming controls the app does not have; each
+    // label is now checked against the page that renders it as well.
+    for (const control of [
+      'Erase the sharing identity', 'Forget this helicopter', 'Forget everything'
+    ]) {
+      assert.ok(page.includes(control), `ui/app.mjs no longer renders a "${control}" control`);
+      assert.match(document, new RegExp(control.replace(/ /g, '\\s+'), 'i'),
         `the disclosure must name ${control} as an identity-removal control`);
     }
     assert.match(document, /before (?:you )?(?:tap )?save|before a flight is saved/i,

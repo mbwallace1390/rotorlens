@@ -355,7 +355,8 @@ function buildFieldTable(headers, frameType, nameSourceType = frameType, headerO
  * ramped 1 per P frame and was yanked forward 33 at every keyframe: a sawtooth
  * at 4200 of 4200 I frames, ending 28 counts short of the truth. Nothing caught
  * it because 33 and 1 are both forward, so the monotonicity guard was satisfied
- * and no frame was ever rejected. Both derivations agree on all four logs held.
+ * and no frame was ever rejected. Both derivations agree on all 110 real
+ * sessions held, every one a step of 2 (re-measured 2026-10-03).
  */
 function incrementStep(headers) {
   const intraInterval = intHeader(headers, 'I interval', 0);
