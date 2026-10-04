@@ -140,7 +140,13 @@
     /** Above this, the two directions are not describing the same aircraft behavior. */
     directionalAsymmetryWarnRatio: 0.30,
 
-    /** A hold's command must stay inside this band around its median. */
+    /**
+     * A hold's command must stay inside this band around the command at the
+     * hold's FIRST sample. Not around its median: `detectHoldSegments` anchors
+     * the band on the sample a segment opens at and ends the segment at the first
+     * sample outside it (corrected 4 October 2026; this said "median", which the
+     * code has never done).
+     */
     holdSetpointBandDps: 15,
 
     /**

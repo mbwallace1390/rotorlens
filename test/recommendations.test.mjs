@@ -1755,6 +1755,164 @@ test('the I-term sweep brackets the shipped constants and blocks a verdict that 
       'and the pilot is told that it flipped, not left with silence');
   });
 
+test('a reading that flips names the sweep points that flipped, and what settles it', () => {
+  // Stage 5a. Cutting the spool-down off the window puts more ordinary hovers in
+  // front of the I-term sweep, and on the 31 real flights the pitch "slightly
+  // high" reading then flipped on 7 of them instead of 2. The card used to send
+  // the pilot to fly more long still holds — more of the very hovering that had
+  // just flipped. It now says which smoothing and ripple points read which way,
+  // that more of the same is likely to flip again, and that two flights with one
+  // change between them is what settles it.
+  const records = simulateHoldFlight({gains: HOLD_SOFT, gustDps2: 600});
+  const hold = assessHoldIndication(records, 'yaw');
+  assert.equal(hold.sweepStable, false, 'the marginal fixture must flip, or this proves nothing');
+
+  // Every point the sweep ran is reported, with the reading it gave.
+  assert.equal(hold.sweepPoints.length, hold.sweepRunCount);
+  assert.deepEqual([...new Set(hold.sweepPoints.map(point => point.indication))].sort(),
+    [...hold.sweepIndicationsSeen].sort());
+  for (const point of hold.sweepPoints) {
+    assert.ok(HOLD_SWEEP.huntingSmoothingUs.includes(point.huntingSmoothingUs));
+    assert.ok(HOLD_SWEEP.huntingRippleDps.includes(point.huntingRippleDps));
+  }
+
+  const card = findingsById(recommendFor(records, 'yaw'))['I_TERM_VERDICT_UNSTABLE:yaw'];
+  assert.ok(card);
+  // The minority reading's points, by name, in the words and in the basis.
+  const counts = {};
+  for (const point of hold.sweepPoints) {
+    counts[point.indication] = (counts[point.indication] ?? 0) + 1;
+  }
+  const minority = Object.keys(counts).sort((a, b) => counts[a] - counts[b])[0];
+  const minorityPoints = hold.sweepPoints.filter(point => point.indication === minority);
+  const flipped = card.basis.find(entry => entry.label.startsWith('sweep points that read'));
+  assert.ok(flipped, card.basis.map(entry => entry.label).join(' | '));
+  // Every smoothing length and ripple threshold behind the minority reading is
+  // named, however the sentence groups them.
+  for (const point of minorityPoints) {
+    for (const value of [point.huntingSmoothingUs / 1000, point.huntingRippleDps]) {
+      const named = new RegExp(`(?<![\\d.])${String(value).replace('.', '\\.')}(?![\\d.])`);
+      assert.match(flipped.value, named, `${value} is not named: ${flipped.value}`);
+      assert.match(card.reasoning, named, `${value} is not in the reasoning: ${card.reasoning}`);
+    }
+  }
+  assert.match(card.reasoning, new RegExp(`${minorityPoints.length} of ${hold.sweepRunCount}`));
+  // ...and what to do about it, which is no longer "more of the same".
+  assert.match(card.confirm, /likely to flip again/);
+  assert.match(card.confirm, /one setting different/);
+  assert.match(card.confirm, /one step/);
+  assert.ok(!/\b(?:raise|lower|increase|decrease|reduce)\b/i.test(card.confirm),
+    `the pair names no direction, because none was earned: ${card.confirm}`);
+  assert.equal(card.direction, null);
+});
+
+/**
+ * A mechanical result the airframe gate blocks: a main-rotor tone the rotor-order
+ * rule accounts for, over a broadband floor far above the attention level. Built
+ * the way the airframe tests build `noisyRotorOnly`, so the blocker it raises is
+ * AIRFRAME_BROADBAND_ELEVATED — a machine that is shaking, not one unmeasured.
+ */
+function shakingAirframe() {
+  const peaks = [{frequencyHz: 29.3, bandRmsDps: 13.8, attentionWindowBandRmsDps: 13.8,
+    attentionPersistenceRatio: 1, bandwidthHz: 2, persistenceRatio: 1,
+    attentionEligible: true,
+    harmonicMatch: {rotor: 'main', order: 1, predictedHz: 30, deltaHz: 0.7, toleranceHz: 2.9,
+      spreadHz: 0.45, frequencyResolutionHz: 1.953}}];
+  return cleanAirframe({
+    status: 'attention',
+    reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY', 'MAIN_ROTOR_HARMONIC_CORRELATION'],
+    tuningEvidenceGate: {status: 'blocked',
+      reasonCodes: ['PERSISTENT_NARROWBAND_ENERGY', 'MAIN_ROTOR_HARMONIC_CORRELATION']},
+    axes: ['roll', 'pitch', 'yaw'].map(axis => ({
+      axis, source: 'gyroRAW', available: true, attentionEligibleUnlistedCount: 0,
+      medianNoisePsdDps2PerHz: 24, broadbandRmsDps: 109, peaks
+    }))
+  });
+}
+
+/** Everything a card says that names a gain step, in any of the words used for one. */
+const GAIN_STEP_WORDS = /\bI gain\b|\bone step\b|one setting different|one-change|one change between/i;
+
+test('a reading that flips offers a gain step only once the airframe and the head speed are cleared',
+  () => {
+    // Stage 5a review, 4 October 2026. The reworded card told the pilot to fly a
+    // pair with "the yaw I gain, moved one step either way" — and it is built
+    // before holdFindings looks at the airframe, and orderFindings keeps every
+    // finding that is not an adjustment, so a shaking airframe got a gain step
+    // printed under its own blocker. Mechanical faults outrank gains: a gain
+    // step flown on a machine that is shaking, or whose head speed would not
+    // hold, tests the fault and not the gain. The same flight, three ways.
+    const records = simulateHoldFlight({gains: HOLD_SOFT, gustDps2: 600});
+
+    // 1. Nothing above it blocked: the pair may be offered.
+    const clear = recommendFor(records, 'yaw');
+    assert.equal(clear.gates.airframe.status, 'permitted');
+    assert.equal(clear.gates.headspeed.status, 'permitted');
+    const offered = findingsById(clear)['I_TERM_VERDICT_UNSTABLE:yaw'];
+    assert.ok(offered, 'the marginal flight must reach the card, or this proves nothing');
+    assert.match(offered.confirm, /the yaw I gain, moved one step either way/);
+    assert.ok(!offered.codes.some(code => code.startsWith('GAIN_STEP_WAITS_ON_')),
+      offered.codes.join(', '));
+
+    // 2. The airframe blocked, by a machine that is shaking.
+    const shaking = recommendFor(records, 'yaw', shakingAirframe());
+    assert.equal(shaking.gates.airframe.status, 'blocked');
+    assert.ok(shaking.findings.some(finding => finding.id === 'AIRFRAME_BROADBAND_ELEVATED'
+      && finding.kind === 'blocker'), shaking.findings.map(finding => finding.id).join(', '));
+    const waits = findingsById(shaking)['I_TERM_VERDICT_UNSTABLE:yaw'];
+    assert.ok(waits, 'the pilot is still told the reading flipped');
+    assert.doesNotMatch(spokenText(waits), GAIN_STEP_WORDS,
+      `a gain step was offered under an airframe blocker: ${spokenText(waits)}`);
+    assert.match(waits.confirm, /airframe/);
+    assert.match(waits.confirm, /before any gain/);
+    assert.ok(waits.codes.includes('GAIN_STEP_WAITS_ON_AIRFRAME'), waits.codes.join(', '));
+    assert.equal(waits.direction, null);
+
+    // 3. The airframe clear, the head speed not: half of the steady segments
+    // this flight read were lost to the rotor speed moving. The first 28 s are
+    // the flight above, sample for sample; two more holds follow with the
+    // governor hunting through them.
+    const huntingTail = simulateHoldFlight({gains: HOLD_SOFT, gustDps2: 600, durationS: 52,
+      commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 12, untilS: 12.4, dps: 120},
+        {atS: 28, untilS: 28.4, dps: 120}, {atS: 40, untilS: 40.4, dps: 120}]})
+      .map(record => (record.timeUs < 28_000_000 ? record : {...record,
+        headspeed: 1800 * (1 + 0.08 * Math.sin(2 * Math.PI * 0.2 * record.timeUs / 1e6))}));
+    const hunting = recommendFor(huntingTail, 'yaw');
+    assert.equal(hunting.gates.airframe.status, 'permitted');
+    assert.equal(hunting.gates.headspeed.status, 'blocked',
+      hunting.gates.headspeed.codes.join(', '));
+    assert.ok(hunting.gates.headspeed.codes.includes('HEADSPEED_COST_THIS_FLIGHT_ITS_HOLDS'));
+    const governor = findingsById(hunting)['I_TERM_VERDICT_UNSTABLE:yaw'];
+    assert.ok(governor, `the hunting-tail flight must still flip: ${hunting.findings
+      .map(finding => finding.id).join(', ')}`);
+    assert.doesNotMatch(spokenText(governor), GAIN_STEP_WORDS,
+      `a gain step was offered under a head-speed blocker: ${spokenText(governor)}`);
+    assert.match(governor.confirm, /head speed/);
+    assert.ok(governor.codes.includes('GAIN_STEP_WAITS_ON_HEADSPEED'), governor.codes.join(', '));
+    assert.ok(!governor.codes.includes('GAIN_STEP_WAITS_ON_AIRFRAME'));
+  });
+
+test('the one-change pair says what it settles, and that the before/after needs more holds', () => {
+  // Stage 5a review, 4 October 2026. The card asked for 3 holds a flight and then
+  // said the before/after panel compares the two flights once each has 5 — a
+  // count no flight in the corpus has reached on one axis — so the pair "that
+  // settles it" read as though the panel would settle it. What the pair settles
+  // is this card's own reading taken on each side; the panel's hold-for-hold
+  // comparison is a stricter test, and the sortie's hold block is what gives it.
+  const card = findingsById(recommendFor(simulateHoldFlight({gains: HOLD_SOFT, gustDps2: 600}),
+    'yaw'))['I_TERM_VERDICT_UNSTABLE:yaw'];
+  assert.ok(card);
+  const needed = pidEvidence.HOLDS_FOR_A_FULL_READING;
+  const comparison = pidEvidence.EVIDENCE_LIMITS.minimumComparisonHolds;
+  assert.ok(comparison > needed, 'the two counts must differ, or there is nothing to explain');
+  assert.match(card.confirm, /reading taken on each side|reading on each side/);
+  assert.match(card.confirm, new RegExp(`\\bFly ${needed} or more\\b`));
+  assert.match(card.confirm, new RegExp(`needs ${comparison} holds on each side`));
+  assert.match(card.confirm, /sortie/);
+  // It must not read as though the panel settles the pair.
+  assert.doesNotMatch(card.confirm, /compares the two flights' holds once each has/);
+});
+
 /* =========================================================================== */
 /* 8. THE TWO LOGS THIS REPOSITORY ACTUALLY HAS                                */
 /* =========================================================================== */

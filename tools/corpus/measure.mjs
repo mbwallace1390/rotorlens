@@ -34,9 +34,10 @@
 import {FrameType, parseSession, findSessionStarts} from '../../src/blackbox/headers.mjs';
 import {FrameDecoder} from '../../src/blackbox/frames.mjs';
 import {resolveFlightWindow} from '../../src/analysis/flight-window.mjs';
+import {sliceSessionToSpan, spannedSession} from '../../src/analysis/evidence-span.mjs';
 import {buildAnalysisRecords} from '../../src/analysis/records.mjs';
 import {
-  AXES, resolveAxisSignals, summarizeAxis, indexAtOrAfter
+  AXES, resolveAxisSignals, summarizeAxis
 } from '../../src/analysis/axis-report.mjs';
 import {buildHoldEvidence} from '../../src/analysis/pid-evidence.mjs';
 import {
@@ -115,7 +116,11 @@ export const CORPUS_FIELDS = Object.freeze({
   windowBasis:
     'how the flight window was established, and therefore why a bench run was excluded',
   durationSeconds:
-    'the length of the analysed window. An offset within the recording, never a clock time',
+    'the length of the flight window. An offset within the recording, never a clock time',
+  evidenceSpanBasis:
+    'whether the window was cut to the seconds the governor was flying the rotor, and if not why not (no governor state logged, or never ACTIVE inside the window). Without it a flight measured over its spool-down and one measured without it read alike. Null only when the scan was asked not to cut, which only the check of figures quoted from earlier runs does',
+  analysedSeconds:
+    'the length of that span, which is what every axis field below was measured over — the same seconds the app analyses. The difference from durationSeconds is the spool-down and any pre-ACTIVE stretch',
   admissible:
     'whether the shipped gate would keep this session as a flight. 72% of sessions in the reference corpus are bench runs and spool-ups, and a distribution that pools them describes a workbench',
   admissionCodes:
@@ -300,34 +305,14 @@ function emptyMeasurement(sourceFile, sessionIndex) {
     reachedLogEnd: false,
     windowBasis: null,
     durationSeconds: null,
+    evidenceSpanBasis: null,
+    analysedSeconds: null,
     admissible: false,
     admissionCodes: [],
     ratesFingerprint: null,
     gains: {roll: null, pitch: null, yaw: null},
     axes
   };
-}
-
-/**
- * Trims a decoded session to its flight window.
- *
- * Everything downstream measures inside the window, because a distribution
- * measured over the spool-up and the walk back to the bench is a distribution
- * about a workbench. `ui/app.mjs` does the same thing before building a record.
- */
-function windowedSession(session, window) {
-  if (!window || !Number.isFinite(window.startUs) || !Number.isFinite(window.endUs)) {
-    return session;
-  }
-  const timeIndex = session.fields.findIndex(field => field.name === 'time');
-  if (timeIndex === -1) {
-    return session;
-  }
-  const from = indexAtOrAfter(session.samples, timeIndex, window.startUs);
-  const to = indexAtOrAfter(session.samples, timeIndex, window.endUs + 1);
-  return (from === 0 && to >= session.samples.length)
-    ? session
-    : {...session, samples: session.samples.slice(from, to)};
 }
 
 /** Shapes a decoded session the way `src/analysis/**` expects to receive one. */
@@ -399,8 +384,16 @@ function measureAxis(session, scoped, axis) {
  * Stateful only in the aircraft grouping, which has to span files: two donations
  * from the same pilot are two files and one helicopter, and a null pair measured
  * across them is a real null pair.
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.cutToGovernorSpan] true (the default, and what the
+ *   app does) cuts each window to the governor span. `false` measures over the
+ *   whole flight window, as every run before 4 October 2026 did; it exists so the
+ *   figures quoted in `src/` from those runs can still be reproduced and checked,
+ *   and nothing else should ask for it.
  */
-export function createCorpusScan() {
+export function createCorpusScan(options = {}) {
+  const cutToGovernorSpan = options.cutToGovernorSpan !== false;
   const groupByKey = new Map();
   const measurements = [];
   const fileFailures = [];
@@ -450,7 +443,8 @@ export function createCorpusScan() {
 
     const produced = [];
     for (let index = 0; index < starts.length; index += 1) {
-      const measurement = measureSession(bytes, starts, index, sourceFile, groupFor);
+      const measurement = measureSession(bytes, starts, index, sourceFile, groupFor,
+        cutToGovernorSpan);
       measurements.push(measurement);
       produced.push(measurement);
       if (onSession) {
@@ -483,7 +477,7 @@ export function createCorpusScan() {
  * are as good as any others. Catching everything in one block would throw all of
  * that away and report the donation as unreadable.
  */
-function measureSession(bytes, starts, index, sourceFile, groupFor) {
+function measureSession(bytes, starts, index, sourceFile, groupFor, cutToGovernorSpan = true) {
   const measurement = emptyMeasurement(sourceFile, index);
   const start = starts[index];
   const end = starts[index + 1] ?? bytes.length;
@@ -560,7 +554,31 @@ function measureSession(bytes, starts, index, sourceFile, groupFor) {
     measurement.admissionCodes = ['ADMISSION_CHECK_FAILED'];
   }
 
-  const scoped = windowedSession(session, window);
+  // The flight window cut to the governor's ACTIVE span, through the same
+  // function `ui/app.mjs` slices through, so a corpus figure and the app's panel
+  // are about the same seconds. Everything downstream measures inside it,
+  // because a distribution measured over the spool-up, the spool-down and the
+  // walk back to the bench is a distribution about a workbench.
+  let scoped = session;
+  try {
+    if (cutToGovernorSpan) {
+      const cut = spannedSession(session, window);
+      scoped = cut.session;
+      measurement.evidenceSpanBasis = cut.span.basis;
+      measurement.analysedSeconds = Number.isFinite(cut.span.durationUs)
+        ? round(cut.span.durationUs / 1e6, 3) : null;
+    } else {
+      // The pre-4-October measurement, kept only so figures quoted from it can
+      // be reproduced: the whole flight window, no governor cut.
+      scoped = sliceSessionToSpan(session, window);
+      measurement.analysedSeconds = measurement.durationSeconds;
+    }
+  } catch (error) {
+    measurement.failureStage = 'window';
+    measurement.failureCode = errorCodeOf(error, 'EVIDENCE_SPAN_FAILED');
+    measurement.failureDetail = String(error?.message ?? error);
+    return measurement;
+  }
 
   for (const axis of AXES) {
     try {

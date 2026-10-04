@@ -2142,22 +2142,37 @@ function compareAxisStop(before, after, axis) {
  * The identical-gain pairs behind each axis's floor: how many, and the largest
  * difference any of them showed.
  *
- * From section 4 of `npm run corpus:report` over the 110 real sessions,
- * re-run 3 October 2026: roll 5 pairs, max 0.9150; pitch 4 pairs, max 1.3896;
- * yaw 18 pairs, p90 0.0966, max 0.1006. Rounded to three significant figures.
- * On roll and pitch the worst pair IS the p90, because four or five pairs
- * cannot separate the two; only yaw has enough pairs for its worst case to sit
- * above its floor.
+ * MEASURED OVER THE GOVERNOR SPAN, the seconds every hold the app measures now
+ * comes from (Stage 5a): section 4 of `npm run corpus:report` over the two
+ * reference dumps, re-run 4 October 2026 — roll 8 pairs, p90 = max 0.8096;
+ * pitch 12 pairs, p90 0.3636, max 1.2472; yaw 19 pairs, p90 0.0880, max 0.1115.
+ * Each maximum is rounded UP to three significant figures, because this is the
+ * bound a pilot is told no pair of unchanged flights exceeded, and rounding a
+ * bound down makes it false. `test/corpus-report.test.mjs` re-measures them
+ * when ROTORLENS_CORPUS_LOGS is set and fails if a span pair exceeds one.
+ *
+ * WHY THEY WERE RE-QUOTED (Stage 5a review). Until then these were the window
+ * figures of 3 October 2026 — roll 5 pairs, max 0.915; pitch 4, max 1.3896; yaw
+ * 18, max 0.1006 — while the holds behind a comparison were measured over the
+ * span, where yaw's worst pair is 0.1115. The yaw sentence said "at most by
+ * 0.101°/s" of a measurement that reaches 0.1115: the "differ by up to 0.39"
+ * error again, one decimal place smaller.
+ *
+ * The GATES did not move with them. SENSITIVITY_FLOOR_DPS is rounded up from
+ * the window-era p90s, and every span p90 sits below it (roll 0.81 under 0.92,
+ * pitch 0.36 under 1.39, yaw 0.088 under 0.1), so the cut made no gate looser;
+ * lowering one is a calibration decision, not a re-quote. On roll and pitch
+ * the gate now sits above the worst pair as well, so their sentence names only
+ * the worst pair; yaw's worst pair sits above its gate, and both are named.
  *
  * Per axis, because the pooled worst case (1.390, from the 47 pooled pairs in
- * EVIDENCE_LIMITS.holdErrorNoiseFloorDps) matches pitch's worst pair, 1.3896, to
- * three decimals; roll's is 0.915 and yaw's 0.1006. Quoting it beside a yaw
- * floor told a pilot yaw had once wandered by fourteen times its real worst.
+ * EVIDENCE_LIMITS.holdErrorNoiseFloorDps) quoted beside a yaw floor told a pilot
+ * yaw had once wandered by more than ten times its real worst.
  */
 const OBSERVED_NULL_PAIRS = Object.freeze({
-  roll: Object.freeze({pairs: 5, maximumDps: 0.915}),
-  pitch: Object.freeze({pairs: 4, maximumDps: 1.39}),
-  yaw: Object.freeze({pairs: 18, maximumDps: 0.101})
+  roll: Object.freeze({pairs: 8, maximumDps: 0.81}),
+  pitch: Object.freeze({pairs: 12, maximumDps: 1.25}),
+  yaw: Object.freeze({pairs: 19, maximumDps: 0.112})
 });
 
 const FLOOR_AXES = Object.freeze(['roll', 'pitch', 'yaw']);
@@ -2167,8 +2182,8 @@ function corpusAxisSentence(axis) {
   const floor = SENSITIVITY_FLOOR_DPS[axis];
   const {pairs, maximumDps} = OBSERVED_NULL_PAIRS[axis];
   // Yaw's floor is a p90 with a worst case above it, so both are named. On roll
-  // and pitch the floor is the worst case rounded up, and "usually less than
-  // 0.92, at most 0.915" would read as a contradiction.
+  // and pitch the floor sits above the worst pair, and "usually less than 0.92,
+  // at most 0.81" would read as a contradiction.
   const spread = maximumDps > floor
     ? `usually by less than ${floor}°/s and at most by ${maximumDps}°/s`
     : `by at most ${maximumDps}°/s`;
@@ -2201,6 +2216,10 @@ function corpusAxisSentence(axis) {
  *     anything was measured — it names all three, because that is what each
  *     axis is gated on. The pooled 0.39 is not quoted: every axis
  *     `compareFlightRecords` compares is gated on its own floor instead.
+ *
+ * AND THEN ITS WORST PAIRS DESCRIBED SECONDS THE HOLDS NO LONGER CAME FROM. From
+ * 4 October 2026 holds are measured over the governor span, and the pair counts
+ * and maxima quoted are the span's; see OBSERVED_NULL_PAIRS.
  *
  * THE OPTIONAL ARGUMENT is a floor entry from `buildSensitivityModel`, measured
  * on the pilot's OWN aircraft. When one is passed the sentence changes, because
@@ -2513,7 +2532,11 @@ export function compareFlightRecords(before, after) {
  * pooled gate sits above the full dynamic range, and 2.4x to 3.6x too tight on
  * roll and pitch. The scale separation is corroborated independently at better n
  * by per-segment spread: roll sd 0.348 (n=28), pitch 0.445 (n=21), yaw 0.0355
- * (n=25).
+ * (n=25). Those pair figures are over whole flight windows (3 October 2026);
+ * over the governor span the holds are now measured on, the same corpus gives
+ * roll p90 0.8096 (n=8), pitch 0.3636 (n=12), yaw 0.0880 (n=19) — yaw's scale
+ * still four to nine times below the others' (4 October 2026; see
+ * OBSERVED_NULL_PAIRS).
  *
  * The same cut dissolves the "heavy tail" that motivated so much of the caution
  * here. Half-normal sigmas fitted to the pooled null quantiles span 8.3x
@@ -2608,7 +2631,13 @@ export const SENSITIVITY_RESPONSE_METRIC = 'meanAbsoluteSteadyStateErrorDps';
  * The flight-to-flight noise floor PER AXIS, in deg/s, measured on the corpus.
  *
  * Rounded UP from the measured identical-gain p90s (roll 0.915, pitch 1.3896,
- * yaw 0.0966), because rounding a floor up only ever refuses more. `pooled` is
+ * yaw 0.0966, over whole flight windows, 3 October 2026), because rounding a
+ * floor up only ever refuses more. Over the governor span the holds are now
+ * measured on, the same corpus gives p90s of roll 0.8096, pitch 0.3636 and yaw
+ * 0.0880 (4 October 2026): every one is below its floor, so the floors were
+ * left as they are — still conservative, and lowering one is a calibration
+ * decision for its own change. The pair counts and worst pairs the pilot is
+ * shown are the span's (OBSERVED_NULL_PAIRS). `pooled` is
  * the shipped figure, kept as the fallback for an axis with no per-axis
  * measurement and named `pooled` so it can never again be mistaken for one.
  *

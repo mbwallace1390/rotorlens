@@ -100,6 +100,7 @@ import {
   FlightWindowBasis,
   resolveFlightWindow
 } from '../src/analysis/flight-window.mjs';
+import {EvidenceSpanBasis, spannedSession} from '../src/analysis/evidence-span.mjs';
 // `../src/analysis/recommendations.mjs` is NOT imported here. It is fetched in
 // `collectRecommendationMaterial`, the one place that uses it; see the note
 // there.
@@ -199,11 +200,16 @@ const state = {
 
   // ---- the flight window ------------------------------------------------
   // The resolved `resolveFlightWindow` result. EVERY analysis on the page is
-  // taken over `[window.startUs, window.endUs]`: the axis summary, the stop
-  // detector, the holds, the recommendations and the vibration measurement.
-  // Two panels quoting numbers from two different stretches of flight is worse
-  // than either panel not existing, so there is one window and it lives here.
+  // taken over this window, cut to `evidenceSpan` below: the axis summary, the
+  // stop detector, the holds, the recommendations and the vibration
+  // measurement. Two panels quoting numbers from two different stretches of
+  // flight is worse than either panel not existing, so there is one window and
+  // it lives here.
   window: null,
+  // The part of the window the governor was flying the rotor, from
+  // `src/analysis/evidence-span.mjs`. Set by `analysedSession()` and nowhere
+  // else, so it is always the span the analysed samples were cut to.
+  evidenceSpan: null,
   // What the pilot dragged, or null. Handed to `resolveFlightWindow` as
   // `options.override`, which uses it verbatim when it survives
   // `checkFlightWindow` and falls back to detection when it does not.
@@ -542,7 +548,7 @@ function takeDownAnalysis() {
   // before/after over a flight that has nothing to measure.
   state.recommendationRun += 1;
   retireAdvice();
-  windowedSessionCache = null;
+  forgetAnalysedSession();
   state.window = null;
   state.windowPreview = null;
   state.windowTrace = null;
@@ -738,7 +744,7 @@ function closeCurrentLog() {
   state.decodedSessions = [];
   state.sessionHeaders = [];
   state.byteLength = null;
-  windowedSessionCache = null;
+  forgetAnalysedSession();
   state.records = null;
   state.recordsAxis = null;
   state.axisSignals = null;
@@ -1073,7 +1079,7 @@ async function openSession(index) {
   retireAdvice();
 
   state.sessionIndex = index;
-  windowedSessionCache = null;
+  forgetAnalysedSession();
   state.records = null;
   state.recordsAxis = null;
   state.marks = [];
@@ -1830,7 +1836,20 @@ function fieldIndexByName(session, name) {
 }
 
 /**
- * A session object carrying only the samples inside the flight window.
+ * THE session every analysis on this page reads: the flight window, cut to the
+ * stretch of it the governor was flying the rotor.
+ *
+ * ONE helper, and both analysis paths go through it —
+ * `collectRecommendationMaterial` (the records and the vibration range behind
+ * "What to change") and `analyse()` (the Tune evidence and the marks it draws)
+ * — as do the axis summary and the history record built from them. Measured on
+ * the 31 admissible real flights this repository holds, the window ran on into
+ * the spool-down on 30 of them; a path that read the window while the other
+ * read the span would count holds the advice never saw. The cut itself is
+ * `spannedSession` in `src/analysis/evidence-span.mjs`, the same function
+ * `tools/corpus/measure.mjs` slices through, so the corpus report and this page
+ * are about the same seconds too. A dragged window becomes drag ∩ span here,
+ * because the override IS `state.window`.
  *
  * Cached, because `summarizeAxis`, `buildAnalysisRecords` and
  * `buildMechanicalSeries` all want one and slicing 130k pointers three times per
@@ -1838,44 +1857,109 @@ function fieldIndexByName(session, name) {
  * array of the same references, so the cost is one pointer per sample and not a
  * second copy of the log.
  */
-let windowedSessionCache = null;
+let analysedSessionCache = null;
 
-function windowedSession() {
+/** Retires the cached slice and its span. Every path that moves the window or the log calls it. */
+function forgetAnalysedSession() {
+  analysedSessionCache = null;
+  state.evidenceSpan = null;
+}
+
+function analysedSession() {
   const session = currentSession();
   // No log open, or a session whose frames could not be read. Everything below
   // slices `session.samples`, and every caller of this — the analyser, the
   // vibration sweep, the record builder — is reached from a control the pilot
   // can press. `null` travels; a throw in a handler does not.
   if (!session?.samples) {
+    // Nothing is analysed, so no span may outlive the samples it described
+    // (Stage 5a review, 4 October 2026): `currentEvidenceSpan()` reads the field
+    // straight after this call.
+    forgetAnalysedSession();
     return null;
   }
 
   const window_ = state.window;
   if (!window_ || !Number.isFinite(window_.startUs) || !Number.isFinite(window_.endUs)) {
+    state.evidenceSpan = null;
     return session;
   }
 
   const key = `${state.sessionIndex}:${window_.startUs}:${window_.endUs}`;
-  if (windowedSessionCache?.key === key) {
-    return windowedSessionCache.session;
+  if (analysedSessionCache?.key === key) {
+    state.evidenceSpan = analysedSessionCache.span;
+    return analysedSessionCache.session;
   }
 
-  const timeIndex = timeIndexOf(session);
-  if (timeIndex === -1) {
-    return session;
-  }
-
-  const from = indexAtOrAfter(session.samples, timeIndex, window_.startUs);
-  // `indexAtOrAfter` returns the first sample at or after the time, so the
-  // sample AT endUs is included by searching one microsecond past it.
-  const to = indexAtOrAfter(session.samples, timeIndex, window_.endUs + 1);
-  const sliced = from === 0 && to >= session.samples.length
-    ? session
-    : {...session, samples: session.samples.slice(from, to)};
-
-  windowedSessionCache = {key, session: sliced};
-  return sliced;
+  const {session: spanned, span} = spannedSession(session, window_);
+  analysedSessionCache = {key, session: spanned, span};
+  state.evidenceSpan = span;
+  return spanned;
 }
+
+/** The span `analysedSession()` cuts to, resolving it if nothing has asked yet. */
+function currentEvidenceSpan() {
+  analysedSession();
+  return state.evidenceSpan;
+}
+
+/**
+ * The parts of the flight window that are in no number on the page, as
+ * `{startUs, endUs, kind}`: before the governor was ACTIVE and settled, and
+ * after it left ACTIVE for the last time. Empty when nothing was trimmed.
+ */
+function notAnalysedRanges() {
+  const span = currentEvidenceSpan();
+  const window_ = state.window;
+  if (!span || span.basis !== EvidenceSpanBasis.GOVERNOR_ACTIVE
+      || !Number.isFinite(window_?.startUs) || !Number.isFinite(window_?.endUs)) {
+    return [];
+  }
+  const ranges = [];
+  if (span.trimmedStartUs > 0) {
+    ranges.push({startUs: window_.startUs, endUs: span.startUs, kind: 'before'});
+  }
+  if (span.trimmedEndUs > 0) {
+    ranges.push({startUs: span.endUs, endUs: window_.endUs, kind: 'after'});
+  }
+  return ranges;
+}
+
+/**
+ * Shades a not-analysed stretch on a canvas: a faint rose fill under rose
+ * diagonal stripes. A colour no trace on these canvases uses, so it cannot be
+ * read as data, and distinct from the dark dimming of "outside the window"
+ * because these seconds ARE inside the window the pilot set — they are the
+ * governor not yet flying the rotor, or the rotor spooling down after it
+ * stopped, which is a different fact from "not part of the flight".
+ */
+function shadeNotAnalysed(context, left, right, top, bottom) {
+  const width = right - left;
+  if (!(width > 0)) {
+    return;
+  }
+  context.save();
+  context.beginPath();
+  context.rect(left, top, width, bottom - top);
+  context.clip();
+  context.fillStyle = 'rgba(219,97,162,0.16)';
+  context.fillRect(left, top, width, bottom - top);
+  context.strokeStyle = 'rgba(219,97,162,0.7)';
+  context.lineWidth = 1.5;
+  context.beginPath();
+  for (let x = left - (bottom - top); x < right; x += 7) {
+    context.moveTo(x, bottom);
+    context.lineTo(x + (bottom - top), top);
+  }
+  context.stroke();
+  context.restore();
+}
+
+/** What a not-analysed band is, in the words drawn on it and in its legend. */
+const NOT_ANALYSED_WORDS = Object.freeze({
+  before: 'governor not yet flying the rotor — not analysed',
+  after: 'rotor spooling down — not analysed'
+});
 
 /**
  * Re-resolves the window and re-runs everything that depends on it.
@@ -1893,7 +1977,7 @@ function applyFlightWindow(options = {}) {
     session,
     state.windowOverride ? {override: state.windowOverride} : {}
   );
-  windowedSessionCache = null;
+  forgetAnalysedSession();
   // Records are built from the windowed session, so a moved window retires
   // them. Dropping the reference BEFORE anything rebuilds keeps one copy alive
   // at a time — see the note on the axis picker.
@@ -2032,11 +2116,18 @@ function syncWindowTimes(preview = null) {
     ? `${((timeUs - origin) / 1e6).toFixed(1)} s`
     : '—');
 
+  // The analysed seconds belong to the committed window, so they are left off
+  // while an end is being dragged.
+  const span = preview ? null : currentEvidenceSpan();
+  const trimmed = span?.basis === EvidenceSpanBasis.GOVERNOR_ACTIVE
+    && (span.trimmedStartUs > 0 || span.trimmedEndUs > 0);
+
   $('window-times').innerHTML =
     `<span>Takeoff <b>${at(startUs)}</b></span>` +
     `<span>Landing <b>${at(endUs)}</b></span>` +
     `<span>Flight <b>${Number.isFinite(endUs - startUs)
       ? `${((endUs - startUs) / 1e6).toFixed(1)} s` : '—'}</b></span>` +
+    (trimmed ? `<span>Analysed <b>${(span.durationUs / 1e6).toFixed(1)} s</b></span>` : '') +
     `<span class="muted">of ${((window_.logDurationUs ?? 0) / 1e6).toFixed(1)} s recorded</span>`;
 }
 
@@ -2152,6 +2243,25 @@ function drawWindowPlot() {
   context.fillRect(0, 0, startX, cssHeight);
   context.fillRect(endX, 0, cssWidth - endX, cssHeight);
 
+  // Inside the window but in no number: the rotor before the governor was
+  // flying it, and the spool-down after. Not drawn while a finger is down,
+  // because these belong to the committed window and the dragged one has not
+  // been measured yet.
+  const bands = state.windowPreview ? [] : notAnalysedRanges();
+  for (const band of bands) {
+    const left = Math.max(0, Math.min(cssWidth, toX(band.startUs)));
+    const right = Math.max(0, Math.min(cssWidth, toX(band.endUs)));
+    shadeNotAnalysed(context, left, right, 0, cssHeight);
+    const words = NOT_ANALYSED_WORDS[band.kind];
+    context.font = '11px system-ui, sans-serif';
+    if (right - left >= context.measureText(words).width + 8) {
+      context.fillStyle = '#e6edf3';
+      context.textAlign = 'center';
+      context.textBaseline = 'middle';
+      context.fillText(words, (left + right) / 2, cssHeight / 2);
+    }
+  }
+
   context.strokeStyle = '#e6edf3';
   context.lineWidth = 1.5;
   for (const x of [startX, endX]) {
@@ -2214,7 +2324,12 @@ function drawWindowPlot() {
     (state.window.corroboration?.airborneEvent?.state === 'latched'
       ? ` &middot; <span style="color:#a371f7">&#9711;</span> the controller's own airborne flag`
       : '') +
-    `. The dimmed ends are outside the window and are in no number on this page. ` +
+    (bands.length > 0
+      ? ` &middot; <span style="color:#db61a2">&#9638;</span> ` +
+        bands.map(band => esc(NOT_ANALYSED_WORDS[band.kind])).join('; ')
+      : '') +
+    `. The dimmed ends are outside the window and are in no number on this page` +
+    (bands.length > 0 ? ', and neither are the shaded seconds inside it' : '') + '. ' +
     `Drag either slider to move an end; everything re-measures when you let go.`;
 }
 
@@ -2360,6 +2475,12 @@ const CONFIDENCE_PILL = {
 
 /** The word for an axis in the language a pilot uses about his helicopter. */
 const AXIS_THING = {roll: 'roll', pitch: 'pitch', yaw: 'tail'};
+/** One I-term sweep reading, in a pilot's words, for the card that says it flipped. */
+const SWEEP_READING_PLAIN = Object.freeze({
+  increase: '"a little too little I"',
+  decrease: '"a little too much I"',
+  hold: '"nothing to change"'
+});
 /** ...and what stopping that axis is called. */
 const AXIS_STOP = {
   roll: 'stop a roll',
@@ -2737,9 +2858,40 @@ const PLAIN_ENGLISH = {
     + 'not silence — it was looked at and there was nothing to fix.',
   I_TERM_WITHIN_TOLERANCE: finding =>
     `Nothing in the way you held ${finding.axis} calls for an I change.`,
-  I_TERM_VERDICT_UNSTABLE: finding =>
-    `The I-term answer for ${finding.axis} changed depending on how it was measured, so `
-    + 'there is no answer to give you.',
+  // Reworded 4 October 2026 (Stage 5a), with the engine's card. It said there was
+  // "no answer to give you" and its confirm asked for more long still holds —
+  // more of the hovering that had just flipped. It now names what the answer
+  // flipped between, says more of the same is likely to flip again, and names
+  // what settles it.
+  //
+  // Branches on the engine's gate codes (Stage 5a review, same day): under an
+  // airframe or head-speed blocker the engine withholds the one-change pair,
+  // because a gain step flown on a shaking machine or a wandering rotor speed
+  // measures that and not the I term. This sentence must withhold it too.
+  I_TERM_VERDICT_UNSTABLE: finding => {
+    const thing = AXIS_THING[finding.axis] ?? finding.axis;
+    const codes = finding.codes ?? [];
+    const seen = (finding.basis ?? [])
+      .find(entry => entry.label === 'readings seen across the sweep')?.value;
+    const readings = String(seen ?? '').split(',').map(reading => reading.trim())
+      .filter(reading => Object.prototype.hasOwnProperty.call(SWEEP_READING_PLAIN, reading));
+    const between = readings.length > 1
+      ? ` between ${readings.map(reading => SWEEP_READING_PLAIN[reading]).join(' and ')}`
+      : '';
+    const flipped = `The I-term answer for your ${thing} flipped${between} depending on how it `
+      + 'was measured, so there is no answer yet. More holds like these are likely to flip '
+      + 'again on this helicopter';
+    if (codes.includes('GAIN_STEP_WAITS_ON_AIRFRAME')) {
+      return `${flipped}, and the vibration finding above has to be sorted out before any gain `
+        + 'change is worth flying to settle it.';
+    }
+    if (codes.includes('GAIN_STEP_WAITS_ON_HEADSPEED')) {
+      return `${flipped}, and the head speed has to hold steady before any gain change is worth `
+        + 'flying to settle it.';
+    }
+    return `${flipped}; two flights flown the same way, with one change between them, are what `
+      + 'settle it.';
+  },
   // Added 2 October 2026. This flight used to read "Nothing ... calls for an I
   // change" here, about holds that were never judged.
   I_TERM_HOLDS_MIXED: finding =>
@@ -3075,6 +3227,83 @@ export function findingHtml(finding, context = {}) {
     parts.join('') + '</div>';
 }
 
+/** Seconds to one decimal, for the analysed-span line. */
+function secondsText(us) {
+  return `${(us / 1e6).toFixed(1)} s`;
+}
+
+/**
+ * One line saying how much of the flight window was analysed, and what was not.
+ *
+ * A MEASUREMENT, not a finding: it changes nothing the engine concludes and
+ * carries no confidence. It exists because every number below it was taken over
+ * these seconds and not over the window drawn further down, and a pilot who
+ * cannot see that will compare a hold count against the wrong stretch of trace.
+ *
+ * Pure and exported so every basis renders in a test without a log that
+ * reaches it.
+ *
+ * @param {object|null} span a `resolveEvidenceSpan` result
+ */
+export function analysedSpanHtml(span) {
+  if (!span || !Number.isFinite(span.durationUs)) {
+    return '';
+  }
+  const analysed = secondsText(span.durationUs);
+  const windowUs = (span.windowEndUs ?? 0) - (span.windowStartUs ?? 0);
+  const whole = `Analysed the whole ${secondsText(windowUs)} flight window`;
+  const gaps = Array.isArray(span.inactiveRangesInside) ? span.inactiveRangesInside : [];
+  let sentence;
+  if (span.basis === EvidenceSpanBasis.GOVERNOR_STATE_NOT_LOGGED) {
+    sentence = `${whole}. This log does not record the governor state, so a rotor spooling `
+      + 'down at either end cannot be told apart from flight and is included.';
+  } else if (span.basis === EvidenceSpanBasis.GOVERNOR_NEVER_ACTIVE) {
+    // Said as what the LOG holds, not what the governor did (Stage 5a review, 4
+    // October 2026). A log that starts recording mid-flight carries no ACTIVE
+    // report even though the governor was flying the rotor all along, and "the
+    // governor never reported itself flying the rotor" read as "it was not".
+    // A window dragged off the ACTIVE stretches lands here too, and is told so.
+    const where = span.activeRangeCount > 0
+      ? 'for a settled stretch inside this window, only outside it,'
+      : 'for this stretch — it may have started recording after the governor took over —';
+    sentence = `${whole}: this log holds no report of the governor flying the rotor ${where} `
+      + 'so nothing was trimmed, and a rotor spooling down cannot be told apart from flight and '
+      + 'is included.';
+  } else if (span.trimmedStartUs > 0 || span.trimmedEndUs > 0) {
+    const left = [];
+    if (span.trimmedEndUs > 0) {
+      left.push(`the last ${secondsText(span.trimmedEndUs)} were the rotor spooling down after `
+        + 'the governor stopped flying it');
+    }
+    if (span.trimmedStartUs > 0) {
+      left.push(`the first ${secondsText(span.trimmedStartUs)} came before the governor was `
+        + 'flying the rotor and had settled');
+    }
+    sentence = `Analysed ${analysed} of the ${secondsText(windowUs)} flight window: `
+      + `${left.join(', and ')}. Those seconds are shaded on the trace below and are in no `
+      + 'number on this page.';
+  } else if (gaps.length > 0) {
+    // Not "throughout" when it was not (same review): with nothing trimmed, the
+    // governor was flying the rotor at the window's two ends, and the stretch
+    // between where it was not is said in the next sentence.
+    sentence = `${whole}: the governor was flying the rotor at both ends of it.`;
+  } else {
+    sentence = `${whole}: the governor was flying the rotor throughout.`;
+  }
+
+  if (gaps.length > 0) {
+    let gapUs = 0;
+    for (const gap of gaps) {
+      gapUs += gap.endUs - gap.startUs;
+    }
+    sentence += ` Inside the analysed seconds, the governor stopped flying the rotor `
+      + `${gaps.length === 1 ? 'once' : `${gaps.length} times`}, for ${secondsText(gapUs)} in `
+      + 'all, and came back; those seconds are included.';
+  }
+  return `<p class="muted analysed-span" style="font-size:12.5px;margin:-4px 0 12px">`
+    + `${esc(sentence)}</p>`;
+}
+
 /**
  * The whole panel, from one `buildRecommendations` result.
  *
@@ -3099,6 +3328,7 @@ export function recommendationsHtml(result, coverage = {}, learning = null) {
   parts.push('<div class="gate-row">' +
     gate('airframe', result.gates?.airframe) +
     gate('head speed', result.gates?.headspeed) + '</div>');
+  parts.push(analysedSpanHtml(coverage.span ?? null));
 
   const acted = result.findings.filter(finding => finding.actNow);
   if (acted.length === 0) {
@@ -3228,7 +3458,7 @@ function yieldToPaint() {
  */
 function mechanicalRange(scoped) {
   const bounds = sessionTimeBounds(scoped);
-  const startTimeUs = bounds.startTimeUs ?? state.window.startUs ?? 0;
+  const startTimeUs = bounds.startTimeUs ?? state.evidenceSpan?.startUs ?? state.window.startUs ?? 0;
   return {
     startTimeUs,
     endTimeUs: Math.max(startTimeUs, bounds.endTimeUs ?? startTimeUs)
@@ -3236,14 +3466,16 @@ function mechanicalRange(scoped) {
 }
 
 /**
- * Builds everything `buildRecommendations` needs, over the flight window.
+ * Builds everything `buildRecommendations` needs, over the analysed span of the
+ * flight window. `scoped` is `analysedSession()`; see that function for why
+ * this path and the Tune evidence must read the same one.
  *
  * Axes are taken selected-first so that when the record budget runs out it is
  * the axis the pilot is not looking at that goes without.
  */
 const AXIS_ORDER = ['roll', 'pitch', 'yaw'];
 
-async function collectRecommendationMaterial(scoped, session) {
+async function collectRecommendationMaterial(scoped, session, span = null) {
   // Fetched here rather than imported at the top of this file.
   //
   // `recommendations.mjs` and the gates it pulls in are 210 KB, and they are of
@@ -3275,7 +3507,7 @@ async function collectRecommendationMaterial(scoped, session) {
   const selected = $('axis').value;
   const order = [selected, ...AXIS_ORDER.filter(axis => axis !== selected)];
 
-  // The whole flight window, through the same function the vibration panel
+  // The whole analysed span, through the same function the vibration panel
   // uses, so the airframe finding and the panel are about the same seconds.
   const range = mechanicalRange(scoped);
   const mechanical = await analyzeMechanicalWindow(
@@ -3345,7 +3577,9 @@ async function collectRecommendationMaterial(scoped, session) {
       // 1 for a window one analysis accepts; more when it was measured in
       // consecutive stretches and combined.
       vibrationStretches: Array.isArray(mechanical.chunks) ? mechanical.chunks.length : 1,
-      windowBasis: state.window.basis
+      windowBasis: state.window.basis,
+      // The governor span `scoped` was cut to, for the line under the gate row.
+      span
     }
   };
 }
@@ -3425,12 +3659,15 @@ async function measureRecommendations() {
   }
 
   const session = currentSession();
-  const scoped = windowedSession();
+  const scoped = analysedSession();
+  // Taken in the same breath as the slice it describes; a window moved while
+  // this run awaits retires the run below rather than relabelling it.
+  const span = state.evidenceSpan;
   const started = performance.now();
 
   let produced;
   try {
-    produced = await collectRecommendationMaterial(scoped, session);
+    produced = await collectRecommendationMaterial(scoped, session, span);
   } catch (error) {
     if (token !== state.recommendationRun) {
       return;
@@ -3503,8 +3740,11 @@ async function measureRecommendations() {
   }
 
   const seconds = ((state.window.endUs - state.window.startUs) / 1e6).toFixed(1);
+  const analysed = Number.isFinite(span?.durationUs) ? (span.durationUs / 1e6).toFixed(1) : seconds;
   line.innerHTML =
-    `Measured over the ${esc(seconds)} s flight window below, on ` +
+    (analysed === seconds
+      ? `Measured over the ${esc(seconds)} s flight window below, on `
+      : `Measured over ${esc(analysed)} s of the ${esc(seconds)} s flight window below, on `) +
     `${esc(produced.coverage.analysed.join(', ') || 'no axis')}. ` +
     `Took ${Math.round(performance.now() - started)} ms on this device.` +
     (produced.coverage.vibrationStretches > 1
@@ -5547,9 +5787,10 @@ function renderAxisPanel() {
     return;
   }
 
-  // Over the flight window, like everything else on the page. The signals are
-  // column indexes and do not care which session object they are read from.
-  const summary = summarizeAxis(windowedSession(), signals);
+  // Over the analysed span of the flight window, like everything else on the
+  // page. The signals are column indexes and do not care which session object
+  // they are read from.
+  const summary = summarizeAxis(analysedSession(), signals);
   state.axisSummary = summary;
 
   // `summarizeAxis` answers null when there are no samples to summarise. This
@@ -5598,7 +5839,9 @@ function renderAxisPanel() {
       ? `, unfiltered is <code>${esc(signals.names.unfiltered)}</code>.`
       : '. This log does not carry an unfiltered gyro, so the number above is what ' +
         'survived the filters, not what the airframe produced.') +
-    ' These are measurements of the flight window, taken straight off the log. They are ' +
+    ' These are measurements of the flight window, taken straight off the log' +
+    (state.evidenceSpan?.basis === EvidenceSpanBasis.GOVERNOR_ACTIVE
+      ? ' over the seconds the governor was flying the rotor' : '') + '. They are ' +
     'what the recommendations at the top of the page are built from, so if one of them ' +
     'looks wrong to you, the recommendation above it is wrong too.';
 
@@ -5611,12 +5854,15 @@ function renderAxisPanel() {
 }
 
 /**
- * Resets the visible window to the FLIGHT WINDOW.
+ * Resets the visible window to the ANALYSED SPAN of the flight window.
  *
  * `firstUs`/`lastUs` stay the ends of the whole recording, deliberately: zooming
  * out past the window has to be possible, because what is outside it is drawn
  * dimmed and seeing that is how a pilot judges whether the ends are in the right
- * place. What changes is where the view opens, which is on the flight.
+ * place. What changes is where the view opens, which is on the seconds every
+ * number on the page was measured over — so the vibration panel, which measures
+ * what this plot shows, opens on the same seconds as the airframe finding. The
+ * spool-down and any pre-ACTIVE stretch are a zoom-out away, shaded.
  */
 function fitAxisView() {
   const session = currentSession();
@@ -5630,8 +5876,11 @@ function fitAxisView() {
   const firstUs = samples[0][signals.timeIndex];
   const lastUs = samples[samples.length - 1][signals.timeIndex];
   const window_ = state.window;
-  const startUs = Number.isFinite(window_?.startUs) ? window_.startUs : firstUs;
-  const endUs = Number.isFinite(window_?.endUs) ? window_.endUs : lastUs;
+  const span = currentEvidenceSpan();
+  const startUs = Number.isFinite(span?.startUs) ? span.startUs
+    : Number.isFinite(window_?.startUs) ? window_.startUs : firstUs;
+  const endUs = Number.isFinite(span?.endUs) ? span.endUs
+    : Number.isFinite(window_?.endUs) ? window_.endUs : lastUs;
 
   state.view = {
     firstUs,
@@ -5866,6 +6115,21 @@ function drawAxisPlot() {
     }
   }
 
+  // ----- inside the window, not analysed ----------------------------------
+  // The spool-down, and any stretch before the governor was flying the rotor.
+  // Shaded rather than dimmed: they are inside the window the pilot set.
+  const notAnalysed = [];
+  for (const band of notAnalysedRanges()) {
+    const left = Math.max(PLOT_PAD.left,
+      Math.min(PLOT_PAD.left + plotWidth, toX((band.startUs - startUs) / spanUs)));
+    const right = Math.max(PLOT_PAD.left,
+      Math.min(PLOT_PAD.left + plotWidth, toX((band.endUs - startUs) / spanUs)));
+    if (right > left) {
+      shadeNotAnalysed(context, left, right, PLOT_PAD.top, PLOT_PAD.top + plotHeight);
+      notAnalysed.push(NOT_ANALYSED_WORDS[band.kind]);
+    }
+  }
+
   // ----- detected stops ---------------------------------------------------
   const visibleMarks = state.marksAxis === signals.axis
     ? state.marks.filter(mark => mark.timeUs >= startUs && mark.timeUs <= endUs)
@@ -5900,7 +6164,8 @@ function drawAxisPlot() {
       `${Math.round(command.samplesPerColumn)} samples per column, drawn as min-to-max`}` +
     ` · drag to pan` +
     (outsideVisible ? ' · the dimmed part is outside the flight window and is in no ' +
-      'measurement on this page' : '');
+      'measurement on this page' : '') +
+    (notAnalysed.length > 0 ? ` · shaded: ${notAnalysed.join('; ')}` : '');
 
   // The vibration panel measures whatever this plot is showing, so its label —
   // and any result already on screen — follows the window from here.
@@ -6379,19 +6644,26 @@ function syncVibrationRange() {
       '<p class="muted">The window moved. Measure again for what is on screen now.</p>';
   }
 
-  // Whether the plot has been panned away from the flight window matters here:
-  // the airframe finding at the top of the page was measured over the window,
-  // and a vibration result taken somewhere else is a different measurement.
-  const flight = state.window;
+  // Whether the plot has been panned away from the analysed seconds matters
+  // here: the airframe finding at the top of the page was measured over the
+  // flight window cut to the governor span, and a vibration result taken
+  // anywhere else is a different measurement.
+  const span = currentEvidenceSpan();
+  const flight = Number.isFinite(span?.startUs) ? span : state.window;
   const offWindow = Number.isFinite(flight?.startUs)
     && (Math.abs(window_.startTimeUs - flight.startUs) > 1000
       || Math.abs(window_.endTimeUs - flight.endUs) > 1000);
+  const spanTrimmed = span?.basis === EvidenceSpanBasis.GOVERNOR_ACTIVE
+    && (span.trimmedStartUs > 0 || span.trimmedEndUs > 0);
 
   range.textContent =
     `${((window_.endTimeUs - window_.startTimeUs) / 1e6).toFixed(1)} s of flight` +
     (offWindow
-      ? ' — not the flight window, so this will not be the same measurement the airframe '
-        + 'finding at the top of the page was made from'
+      ? (spanTrimmed
+        ? ' — not the analysed seconds of the flight window, so this will not be the same '
+          + 'measurement the airframe finding at the top of the page was made from'
+        : ' — not the flight window, so this will not be the same measurement the airframe '
+          + 'finding at the top of the page was made from')
       : '');
 }
 
@@ -6583,11 +6855,27 @@ function renderPlot() {
     }
   }
 
+  // ...and the seconds inside the window that are in no number either.
+  let shaded = false;
+  if (timeIndex !== -1 && Number.isFinite(window_?.logDurationUs) && window_.logDurationUs > 0) {
+    const toX = timeUs => ((timeUs - window_.logStartUs) / window_.logDurationUs) * cssWidth;
+    for (const band of notAnalysedRanges()) {
+      const left = Math.max(0, Math.min(cssWidth, toX(band.startUs)));
+      const right = Math.max(0, Math.min(cssWidth, toX(band.endUs)));
+      if (right > left) {
+        shadeNotAnalysed(context, left, right, 0, cssHeight);
+        shaded = true;
+      }
+    }
+  }
+
   const name = session.fields[fieldIndex]?.name ?? `field ${fieldIndex}`;
   $('plot-caption').textContent =
     `${name} — range ${low.toFixed(1)} to ${high.toFixed(1)} over ` +
     `${samples.length.toLocaleString()} samples, the whole recording` +
-    (dimmed ? '. The dimmed ends are outside the flight window' : '');
+    (dimmed ? '. The dimmed ends are outside the flight window' : '') +
+    (shaded ? '. The shaded stretches are inside it but come before the governor was flying '
+      + 'the rotor or after it stopped, and are not analysed' : '');
 }
 
 // ---------------------------------------------------------------------------
@@ -6595,7 +6883,8 @@ function renderPlot() {
 // ---------------------------------------------------------------------------
 
 /**
- * Records for one axis, over the flight window.
+ * Records for one axis, over `analysedSession()` — the flight window cut to the
+ * governor span, the same seconds "What to change" was built from.
  *
  * Two shapes come back from here historically — `buildAnalysisRecords` returns
  * `{records, usable, missing}` while `collectRecommendationMaterial` caches the
@@ -6609,7 +6898,7 @@ function ensureRecords(axis) {
   // No log open, or one whose frames could not be read. Every caller already
   // handles `usable: false`; reaching `buildAnalysisRecords` with nothing would
   // throw inside a click handler instead, where nobody sees it.
-  const scoped = windowedSession();
+  const scoped = analysedSession();
   if (!scoped) {
     state.records = null;
     state.recordsAxis = null;

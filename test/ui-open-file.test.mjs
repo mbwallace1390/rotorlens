@@ -42,7 +42,14 @@ import {createUiServer} from '../tools/serve-ui.mjs';
 import {
   addFlightRecord, buildFlightRecord, createHistory, exportHistory
 } from '../src/analysis/flight-history.mjs';
-import {HOLD_EVIDENCE_KIND} from '../src/analysis/pid-evidence.mjs';
+import {AXES, HOLD_EVIDENCE_KIND, buildHoldEvidence} from '../src/analysis/pid-evidence.mjs';
+import {manoeuvreSession} from '../tools/generate-fixtures.mjs';
+import {decodeLog} from '../src/blackbox/decode.mjs';
+import {resolveFlightWindow} from '../src/analysis/flight-window.mjs';
+import {buildAnalysisRecords} from '../src/analysis/records.mjs';
+import {
+  EvidenceSpanBasis, sliceSessionToSpan, spannedSession
+} from '../src/analysis/evidence-span.mjs';
 
 function findBrowser() {
   const {
@@ -3061,7 +3068,33 @@ test('the plain copy added on 3 October renders as a sentence, never a code', {
     {id: 'AXIS_DOES_NOT_ARREST', axes: ['roll', 'pitch', 'yaw'], rung: 'gain-P',
       kind: 'next-flight',
       codes: ['RESIDUAL_RATE_IN_COMMAND_DIRECTION', 'COMMANDED_RATE_NOT_MEASURED'],
-      words: /rate you asked for could not be measured.*Nothing to change yet/}
+      words: /rate you asked for could not be measured.*Nothing to change yet/},
+    // Reworded 4 October 2026 (Stage 5a): names what it flipped between when the
+    // basis says, and what settles it either way.
+    {id: 'I_TERM_VERDICT_UNSTABLE', axes: ['roll', 'pitch', 'yaw'], rung: 'evidence',
+      kind: 'next-flight',
+      codes: ['HOLD_VERDICT_FLIPS_ACROSS_SWEEP'],
+      words: /flipped depending on how it was measured.*likely to flip again.*one change between them/},
+    {id: 'I_TERM_VERDICT_UNSTABLE', axes: ['pitch'], rung: 'evidence',
+      kind: 'next-flight',
+      codes: ['HOLD_VERDICT_FLIPS_ACROSS_SWEEP'],
+      basis: [{label: 'readings seen across the sweep', value: 'decrease, hold', unit: null,
+        source: 'HOLD_SWEEP'}],
+      words: /flipped between "a little too much I" and "nothing to change".*likely to flip again/},
+    // Stage 5a review, 4 October 2026: under an airframe or head-speed blocker
+    // the engine withholds the one-change pair, and the plain sentence must not
+    // offer it either — "one change between them" under a shaking airframe is a
+    // gain step printed beneath its own blocker.
+    {id: 'I_TERM_VERDICT_UNSTABLE', axes: ['yaw'], rung: 'evidence',
+      kind: 'next-flight',
+      codes: ['HOLD_VERDICT_FLIPS_ACROSS_SWEEP', 'GAIN_STEP_WAITS_ON_AIRFRAME'],
+      words: /flipped depending on how it was measured.*likely to flip again.*vibration.*before any gain/,
+      never: /one change between|one step|I gain/},
+    {id: 'I_TERM_VERDICT_UNSTABLE', axes: ['roll'], rung: 'evidence',
+      kind: 'next-flight',
+      codes: ['HOLD_VERDICT_FLIPS_ACROSS_SWEEP', 'GAIN_STEP_WAITS_ON_HEADSPEED'],
+      words: /flipped depending on how it was measured.*likely to flip again.*head speed.*before any gain/,
+      never: /one change between|one step|I gain|vibration/}
   ];
   for (const {id, codes} of cases) {
     assert.ok(engine.includes(`id: '${id}'`), `the engine no longer builds ${id}`);
@@ -3077,32 +3110,38 @@ test('the plain copy added on 3 October renders as a sentence, never a code', {
       document.body.appendChild(box);
       const flat = text => text.replace(/\\s+/g, ' ').trim();
       const out = [];
-      for (const entry of ${JSON.stringify(cases.map(({words, ...rest}) => rest))}) {
+      for (const entry of ${JSON.stringify(cases.map(({words, never, ...rest}, index) =>
+    ({...rest, index})))}) {
         for (const axis of entry.axes) {
           box.innerHTML = app.findingHtml({
             id: entry.id, rung: entry.rung, rungOrder: 1, axis, kind: entry.kind,
             adjust: null, direction: null, confidence: 'low',
             headline: 'the engine headline stands here', reasoning: 'because',
-            basis: [], confirm: null, candidates: [], codes: entry.codes,
+            basis: entry.basis ?? [], confirm: null, candidates: [], codes: entry.codes,
             actNow: false, sequence: 0
           });
           const plain = box.querySelector('p.plain');
-          out.push({id: entry.id, axis, plain: plain ? flat(plain.textContent) : null});
+          out.push({id: entry.id, index: entry.index, axis,
+            plain: plain ? flat(plain.textContent) : null});
         }
       }
       box.remove();
       return JSON.stringify(out);
     })()`);
 
-    assert.equal(rendered.length, 7, 'every branch must be rendered on every axis it carries');
+    assert.equal(rendered.length, 13, 'every branch must be rendered on every axis it carries');
     const thing = {roll: 'roll', pitch: 'pitch', yaw: 'tail'};
-    for (const {id, axis, plain} of rendered) {
+    for (const {id, index, axis, plain} of rendered) {
       const label = `${id} on ${axis ?? 'no axis'}`;
       assert.ok(plain, `${label}: no plain sentence was drawn`);
       assert.notEqual(plain, 'the engine headline stands here',
         `${label}: fell back to the engine's headline; the plain copy is missing`);
-      assert.match(plain, cases.find(entry => entry.id === id).words,
+      assert.match(plain, cases[index].words,
         `${label}: rendered another branch's words: ${plain}`);
+      if (cases[index].never) {
+        assert.doesNotMatch(plain, cases[index].never,
+          `${label}: offered what its blocker withholds: ${plain}`);
+      }
       assert.doesNotMatch(plain, /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/,
         `${label}: an engine code reached the pilot: ${plain}`);
       assert.doesNotMatch(plain, /\b(?:null|undefined|NaN)\b/, `${label}: ${plain}`);
@@ -3111,6 +3150,215 @@ test('the plain copy added on 3 October renders as a sentence, never a code', {
           `${label}: the sentence does not name the ${thing[axis]}: ${plain}`);
       }
     }
+    assert.deepEqual(pageErrors, []);
+  });
+});
+
+test('the analysed-seconds line says what the log reported, and never contradicts itself', {
+  skip: browserSkip
+}, async () => {
+  // Stage 5a review, 4 October 2026, two edge cases of `analysedSpanHtml`:
+  //  - A log that starts recording mid-flight carries no state-4 event, so its
+  //    basis is GOVERNOR_NEVER_ACTIVE — and "the governor never reported itself
+  //    flying the rotor" read as "the governor was not flying". What is known is
+  //    only that the log holds no such report for this stretch, so nothing was
+  //    trimmed.
+  //  - With no trim and a gap inside the span, "the governor was flying the
+  //    rotor throughout" was followed by "the governor also left that state
+  //    once in flight".
+  // Every span here is hand-built in the shape `resolveEvidenceSpan` returns,
+  // because no committed or private log reaches either case.
+  await withViewer({}, async ({evaluate, pageErrors}) => {
+    const said = await evaluate(`(async () => {
+      const app = await import('/ui/app.mjs');
+      const box = document.createElement('div');
+      const flat = html => {
+        box.innerHTML = html;
+        return box.textContent.replace(/\\s+/g, ' ').trim();
+      };
+      const base = {startUs: 10e6, endUs: 70e6, durationUs: 60e6, windowStartUs: 10e6,
+        windowEndUs: 70e6, trimmedStartUs: 0, trimmedEndUs: 0, inactiveRangesInside: [],
+        activeRangeCount: 0, settleUs: 500000};
+      const gap = [{startUs: 30e6, endUs: 33e6, states: [7]}];
+      return JSON.stringify({
+        noReportInLog: flat(app.analysedSpanHtml({...base, basis: 'GOVERNOR_NEVER_ACTIVE'})),
+        reportElsewhere: flat(app.analysedSpanHtml({...base, basis: 'GOVERNOR_NEVER_ACTIVE',
+          activeRangeCount: 1})),
+        gapNoTrim: flat(app.analysedSpanHtml({...base, basis: 'GOVERNOR_ACTIVE',
+          activeRangeCount: 2, inactiveRangesInside: gap})),
+        gapTrimmed: flat(app.analysedSpanHtml({...base, basis: 'GOVERNOR_ACTIVE',
+          activeRangeCount: 2, endUs: 65e6, durationUs: 55e6, trimmedEndUs: 5e6,
+          inactiveRangesInside: gap})),
+        whole: flat(app.analysedSpanHtml({...base, basis: 'GOVERNOR_ACTIVE', activeRangeCount: 1}))
+      });
+    })()`);
+
+    for (const name of ['noReportInLog', 'reportElsewhere']) {
+      const text = said[name];
+      assert.doesNotMatch(text, /never reported itself|was not flying|wasn't flying|governor never/i,
+        `${name}: reads as though the governor was not flying the rotor: ${text}`);
+      assert.match(text, /no report of the governor flying the rotor/, `${name}: ${text}`);
+      assert.match(text, /nothing was trimmed/, `${name}: ${text}`);
+      assert.match(text, /Analysed the whole 60\.0 s flight window/, `${name}: ${text}`);
+    }
+    assert.doesNotMatch(said.gapNoTrim, /throughout/,
+      `"throughout" beside a stretch it left: ${said.gapNoTrim}`);
+    assert.match(said.gapNoTrim, /at both ends of it/, said.gapNoTrim);
+    assert.match(said.gapNoTrim, /once, for 3\.0 s.*included/, said.gapNoTrim);
+    assert.match(said.gapTrimmed, /Analysed 55\.0 s of the 60\.0 s flight window/, said.gapTrimmed);
+    assert.match(said.gapTrimmed, /once, for 3\.0 s.*included/, said.gapTrimmed);
+    assert.doesNotMatch(said.gapTrimmed, /throughout/, said.gapTrimmed);
+    // ...and the ordinary case still says it plainly.
+    assert.match(said.whole, /the governor was flying the rotor throughout\./, said.whole);
+    assert.deepEqual(pageErrors, []);
+  });
+});
+
+/**
+ * A hover-rich flight whose governor is ACTIVE for only its middle stretch,
+ * built in memory and never written to disk.
+ *
+ * Every committed fixture logs governor state 1 and nothing else, so none of
+ * them has an evidence span to trim and none carries a single hold. This one is
+ * the stop-manoeuvre generator with six seconds hands-off after each stop — a
+ * zero-rate hold on the axis just flown — and its two state events rewritten
+ * in place: event 50 state 1 at 45 % of the frames becomes state 4 (ACTIVE),
+ * and the event-52 airborne drop at 80 % becomes event 50 state 0. Holds then
+ * fall both inside and outside the span on every axis, which is what lets a
+ * path that forgot the span disagree with one that did not.
+ */
+function spanFlight() {
+  const profile = (axis, peakDps) => ({axis, peakDps,
+    trackingErrorDps: {positive: 5, negative: 5}, ringingDps: {positive: 12, negative: 12}});
+  const {bytes} = manoeuvreSession({
+    axes: [profile('roll', 180), profile('pitch', 140), profile('yaw', 260)],
+    fastRingDecay: 150,
+    slowRingDecay: 450,
+    plateauJitterDps: 3,
+    cycle: {ramp: 20, hold: 150, release: 30, quiet: 3000}
+  }, {seed: 0x52_4c_05_0a, craftName: 'RL-SYNTH-SPAN'});
+  // A copy: the generator hands back a Node Buffer, whose slice() shares memory.
+  const log = new Uint8Array(bytes);
+  const states = decodeLog(log).sessions[0].events.filter(event => event.event === 'state');
+  assert.deepEqual(states.map(event => `${event.eventType}:${event.state}`),
+    ['50:1', '52:1', '52:0'], 'the generator no longer writes the events this test rewrites');
+  for (const [event, type, state] of [[states[0], 50, 4], [states[2], 50, 0]]) {
+    assert.equal(log[event.offset], 0x45, 'an event frame starts with E');
+    log[event.offset + 1] = type;
+    log[event.offset + 2] = state;
+  }
+  return log;
+}
+
+test('the Tune evidence and "What to change" read the same governor-ACTIVE seconds', {
+  skip: browserSkip
+}, async () => {
+  // Two analysis paths read a flight: `collectRecommendationMaterial`, behind
+  // "What to change", and `analyse()`, behind the Tune evidence panel. If one is
+  // cut to the governor's ACTIVE span and the other is not, the panel a pilot
+  // checks the advice against counts holds the advice never saw. Each axis is
+  // re-selected before Analyse, which drops the records the advice cached, so
+  // the Tune path builds its own and cannot pass by borrowing the other's.
+  const log = spanFlight();
+  const session = decodeLog(log).sessions[0];
+  const window = resolveFlightWindow(session);
+  const {session: spanned, span} = spannedSession(session, window);
+  const holdsIn = (scoped, axis) => buildHoldEvidence(
+    buildAnalysisRecords(scoped, {axis}).records, {axis, term: 'I'}).holds.length;
+  const expected = {};
+  const unspanned = {};
+  for (const axis of AXES) {
+    expected[axis] = holdsIn(spanned, axis);
+    unspanned[axis] = holdsIn(sliceSessionToSpan(session, window), axis);
+  }
+  assert.equal(span.basis, EvidenceSpanBasis.GOVERNOR_ACTIVE);
+  assert.ok(span.trimmedStartUs > 0 && span.trimmedEndUs > 0,
+    'the flight must be trimmed at both ends for both bands to be drawn');
+  assert.notDeepEqual(expected, unspanned,
+    'with the same holds inside and outside the span, this test could not fail');
+  const analysedSeconds = (span.durationUs / 1e6).toFixed(1);
+  const spoolSeconds = (span.trimmedEndUs / 1e6).toFixed(1);
+
+  await withViewer({}, async ({evaluate, pageErrors}) => {
+    const run = await evaluate(`(async () => {
+      ${PAGE_HELPERS}
+      const binary = atob('${Buffer.from(log).toString('base64')}');
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      openBytes(bytes, 'SPAN.BBL');
+      const ready = await waitFor(analysed, 4800);
+      const {state} = await import('/ui/app.mjs');
+
+      // The window strip, read back as pixels: the band's stripes are a rose
+      // no trace on that canvas is drawn in. Opaque pixels only: the faint
+      // anti-aliased rim of the purple airborne-flag ring carries rose-like
+      // colour values at an alpha of 3 to 21, and is not a band.
+      const strip = $('window-plot');
+      const data = strip.getContext('2d').getImageData(0, 0, strip.width, strip.height).data;
+      const columns = new Set();
+      for (let index = 0; index < data.length; index += 4) {
+        const [r, g, b, a] = [data[index], data[index + 1], data[index + 2], data[index + 3]];
+        if (a > 64 && r > g + 60 && b > g + 30) {
+          columns.add((index / 4) % strip.width);
+        }
+      }
+      const banded = [...columns].map(column => column / strip.width);
+      const at = timeUs => (timeUs - state.window.logStartUs) / state.window.logDurationUs;
+      const spanStart = at(state.evidenceSpan?.startUs);
+      const spanEnd = at(state.evidenceSpan?.endUs);
+      const bandedInMiddle = banded
+        .filter(x => x > spanStart + 0.01 && x < spanEnd - 0.01).length;
+
+      const behind = {};
+      const tune = {};
+      for (const axis of ['roll', 'pitch', 'yaw']) {
+        behind[axis] = state.recommendations?.gates?.holds?.[axis]?.evidence?.holds?.length ?? null;
+        $('axis').value = axis;
+        $('axis').dispatchEvent(new Event('change'));
+        $('term').value = 'I';
+        $('analyse').click();
+        const tile = [...$('tune').querySelectorAll('.stat')]
+          .find(element => element.querySelector('.k')?.textContent === 'Holds measured');
+        tune[axis] = tile ? Number(tile.querySelector('.v').textContent) : 0;
+      }
+      const flat = node => node.textContent.replace(/\\s+/g, ' ').trim();
+      return JSON.stringify({
+        ready, behind, tune,
+        basis: state.evidenceSpan?.basis ?? null,
+        recommend: flat($('recommend')),
+        legend: flat($('window-note')),
+        bandedFirst: banded.length ? Math.min(...banded) : null,
+        bandedLast: banded.length ? Math.max(...banded) : null,
+        bandedColumns: banded.length,
+        bandedInMiddle,
+        logStartUs: state.window.logStartUs,
+        logDurationUs: state.window.logDurationUs
+      });
+    })()`);
+
+    assert.equal(run.ready, true, 'the flight never finished its first analysis');
+    assert.equal(run.basis, EvidenceSpanBasis.GOVERNOR_ACTIVE);
+    assert.deepEqual(run.behind, expected,
+      '"What to change" did not read the governor-ACTIVE span');
+    assert.deepEqual(run.tune, run.behind,
+      'the Tune evidence panel counted different holds from the ones behind "What to change"');
+
+    // One line under the gate row says how much was analysed and what was not.
+    assert.match(run.recommend, new RegExp(`Analysed ${analysedSeconds.replace('.', '\\.')} s`),
+      run.recommend.slice(0, 400));
+    assert.match(run.recommend, new RegExp(`last ${spoolSeconds.replace('.', '\\.')} s`));
+    assert.match(run.recommend, /rotor spooling down/);
+    assert.match(run.legend, /not analysed/);
+
+    // Both bands are on the strip, at the two ends of the window and nowhere in
+    // the analysed middle.
+    const at = timeUs => (timeUs - run.logStartUs) / run.logDurationUs;
+    assert.ok(run.bandedColumns > 0, 'no not-analysed band was drawn on the window strip');
+    assert.ok(run.bandedFirst < at(span.startUs), 'the pre-ACTIVE band is missing');
+    assert.ok(run.bandedLast > at(span.endUs), 'the spool-down band is missing');
+    assert.equal(run.bandedInMiddle, 0, 'the band was drawn over seconds that were analysed');
     assert.deepEqual(pageErrors, []);
   });
 });

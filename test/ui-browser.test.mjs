@@ -3620,18 +3620,23 @@ test('the engine and shell run in a real browser', {
       // yaw included, whose own worst identical-gain pair is 0.1006; and a
       // refusal quoted the pooled 0.39, which no gate in the app uses. Since
       // 3 October 2026 the yaw change prints yaw's floor and yaw's worst pair,
-      // and the refusal prints each axis's own figures.
+      // and the refusal prints each axis's own figures. Since 4 October 2026
+      // the worst pairs and their counts are the governor span's, which is what
+      // the holds are measured over: yaw's worst is 0.1115, so "at most 0.101"
+      // was a bound the measurement broke.
       const text = kept.shown[name].text;
       if (name === 'refused') {
         assert.match(text, /smaller than 0\.92°\/s on roll, 1\.39°\/s on pitch or 0\.1°\/s on yaw/,
           `${name} must print each axis's measured noise floor`);
-        assert.match(text, /at most 0\.915°\/s on roll .*1\.39°\/s on pitch .*0\.101°\/s on yaw/,
+        assert.match(text, /at most 0\.81°\/s on roll \(8 pairs\), 1\.25°\/s on pitch \(12 pairs\) and 0\.112°\/s on yaw \(19 pairs\)/,
           `${name} must print each axis's worst observed case, not only the p90`);
       } else {
         assert.match(text, /yaw differed on this measurement usually by less than 0\.1°\/s/,
           `${name} must print the measured noise floor beside its numbers`);
-        assert.match(text, /at most by 0\.101°\/s/,
+        assert.match(text, /Across 19 pairs .*at most by 0\.112°\/s/,
           `${name} must print yaw's worst observed case, not only the p90`);
+        assert.doesNotMatch(text, /0\.101°\/s/,
+          `${name} quotes the window-era yaw maximum the span measurement exceeds`);
         assert.doesNotMatch(text, /1\.39°\/s/,
           `${name} quotes another axis's worst case beside a yaw change`);
       }

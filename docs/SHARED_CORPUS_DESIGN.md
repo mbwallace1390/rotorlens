@@ -58,7 +58,7 @@ guesses at.
 | Question | Status today | What a corpus gives |
 | --- | --- | --- |
 | How many hold segments can a real flight produce? | `minimumComparisonHolds` is 5. **The maximum ever observed is 4**, so the comparison has never once fired. | The real distribution, and a gate that can open. |
-| What is the flight-to-flight noise floor per axis? | Measured on two craft-name-and-board groups (yaw on one of them): roll 0.915, pitch 1.390, yaw 0.0966 °/s. n = 5, 4 and 18. | The same numbers at n in the thousands, per aircraft class. |
+| What is the flight-to-flight noise floor per axis? | Measured on two craft-name-and-board groups, over the seconds the governor was flying the rotor (4 October 2026): p90 roll 0.8096, pitch 0.3636, yaw 0.0880 °/s, worst pair 0.8096, 1.2472 and 0.1115, at n = 8, 12 and 19. Over whole flight windows (3 October 2026) the p90s were 0.915, 1.390 and 0.0966 at n = 5, 4 and 18, and the shipped gates are rounded up from those. | The same numbers at n in the thousands, per aircraft class. |
 | When is vibration worth chasing? | `8 °/s`, calibrated on synthetic signals, marked experimental. | Where normal sits, and — with labelled faults — where bad sits. |
 | Is 80 °/s the right stop threshold? | Chosen for 3D flying. The owner's flights peak at 56 and 32. | What learners actually fly, so the gate matches the users. |
 | Does a P change move roll standing error enough to measure? | **Unmeasured. Nobody has flown it.** | Answered by the first fifty pilots who try. |
@@ -829,10 +829,12 @@ craft-name-and-board combination):
 | Peak yaw command | median 119 °/s, max 289. 18 of 31 reach 80 |
 | Broadband gyro RMS, filtered | never once reaches 8 °/s on any axis — 0 of 31 flights on all three (roll max 2.38) |
 | Broadband gyro RMS, unfiltered | roll median 7.88, max 12.66 — **15 of 31 flights at or above 8**; pitch 6 of 31; yaw 0 of 31 |
-| Null pairs | roll 0.915 °/s p90 (n=5), pitch 1.390 (n=4), yaw 0.0966 (n=18) |
+| Null pairs | over whole windows: roll 0.915 °/s p90 (n=5), pitch 1.390 (n=4), yaw 0.0966 (n=18). Over the governor span (re-run 4 October 2026): roll p90 and max 0.8096 (n=8), pitch p90 0.3636, max 1.2472 (n=12), yaw p90 0.0880, max 0.1115 (n=19) |
 
 The last row reproduces the figures quoted in `src/analysis/flight-history.mjs`
-to four decimal places, from an independent path — which is the evidence that
+— the window p90s its comparison gates were rounded up from, and the span pair
+counts and worst pairs it quotes to a pilot — to four decimal places, from an
+independent path — which is the evidence that
 the tool measures what those comments claim, rather than a second opinion that
 happens to agree.
 

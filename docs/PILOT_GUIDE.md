@@ -165,10 +165,12 @@ log. RotorLens will show what moved.
 It will also, very often, say the movement is too small to call — and that is
 the feature working. Two flights with nothing changed between them usually
 differ on the hold measurement by less than 0.92°/s on roll, 1.39°/s on pitch
-and 0.1°/s on yaw, and the worst such pair measured differed by 1.39°/s. The
-comparison prints the figure for the axis you changed beside the result, and
-when nothing was changed it quotes each axis's own floor (0.92°/s roll, 1.39°/s
-pitch, 0.1°/s yaw). A change smaller than that is
+and 0.1°/s on yaw, and the worst such pairs measured differed by 0.81°/s on
+roll, 1.25°/s on pitch and 0.112°/s on yaw (re-measured 4 October 2026, over
+the seconds the governor was flying the rotor, which is where the holds are
+measured). The comparison prints the figure for the axis you changed beside the
+result, and when nothing was changed it quotes each axis's own floor (0.92°/s
+roll, 1.39°/s pitch, 0.1°/s yaw). A change smaller than that is
 weather, not tuning, and an app that called it an improvement would be lying to
 you in a way you could not check.
 

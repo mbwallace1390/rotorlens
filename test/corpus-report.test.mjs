@@ -28,7 +28,13 @@ import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 
 import {parseSessions} from '../src/blackbox/headers.mjs';
-import {EVIDENCE_LIMITS} from '../src/analysis/pid-evidence.mjs';
+import {EVIDENCE_LIMITS, buildHoldEvidence} from '../src/analysis/pid-evidence.mjs';
+import {decodeLog} from '../src/blackbox/decode.mjs';
+import {resolveFlightWindow} from '../src/analysis/flight-window.mjs';
+import {buildAnalysisRecords} from '../src/analysis/records.mjs';
+import {sliceSessionToSpan, spannedSession} from '../src/analysis/evidence-span.mjs';
+import {describeNoiseFloor} from '../src/analysis/flight-history.mjs';
+import {manoeuvreSession} from '../tools/generate-fixtures.mjs';
 import {
   AXES, createCorpusScan, auditCorpusMeasurement, CORPUS_FIELDS, NEVER_REPORTED
 } from '../tools/corpus/measure.mjs';
@@ -740,6 +746,76 @@ test('a corpus with no unfiltered gyro says so, because it cannot judge an airfr
 });
 
 // ---------------------------------------------------------------------------
+// The governor span
+// ---------------------------------------------------------------------------
+
+/**
+ * A hover-rich flight whose governor is ACTIVE for its middle stretch, built in
+ * memory: the stop-manoeuvre generator with six seconds hands-off after each
+ * stop, and its event 50 state 1 and event 52 state 0 rewritten in place to
+ * event 50 states 4 and 0. Holds fall inside and outside the span on every
+ * axis. The same construction test/ui-open-file.test.mjs uses for the app.
+ */
+function spanFlight() {
+  const profile = (axis, peakDps) => ({axis, peakDps,
+    trackingErrorDps: {positive: 5, negative: 5}, ringingDps: {positive: 12, negative: 12}});
+  const {bytes} = manoeuvreSession({
+    axes: [profile('roll', 180), profile('pitch', 140), profile('yaw', 260)],
+    fastRingDecay: 150,
+    slowRingDecay: 450,
+    plateauJitterDps: 3,
+    cycle: {ramp: 20, hold: 150, release: 30, quiet: 3000}
+  }, {seed: 0x52_4c_05_0a, craftName: 'RL-SYNTH-SPAN'});
+  // A copy: the generator hands back a Node Buffer, whose slice() shares memory.
+  const log = new Uint8Array(bytes);
+  const states = decodeLog(log).sessions[0].events.filter(event => event.event === 'state');
+  assert.deepEqual(states.map(event => `${event.eventType}:${event.state}`),
+    ['50:1', '52:1', '52:0'], 'the generator no longer writes the events this test rewrites');
+  for (const [event, type, state] of [[states[0], 50, 4], [states[2], 50, 0]]) {
+    log[event.offset + 1] = type;
+    log[event.offset + 2] = state;
+  }
+  return log;
+}
+
+test('a corpus measurement is taken over the same governor-ACTIVE seconds as the app', () => {
+  // Stage 5a. The app cuts every analysis to the governor's ACTIVE span; a
+  // corpus figure taken over the whole window would be a figure about seconds
+  // the app never reads, and the two would disagree about the same log.
+  const log = spanFlight();
+  const scan = createCorpusScan();
+  scan.addLog(log, 'span.bbl');
+  const [measurement] = scan.measurements;
+  const audit = auditCorpusMeasurement(measurement);
+  assert.equal(audit.ok, true, JSON.stringify(audit.violations));
+
+  const session = decodeLog(log).sessions[0];
+  const window = resolveFlightWindow(session);
+  const {session: spanned, span} = spannedSession(session, window);
+  assert.equal(measurement.evidenceSpanBasis, 'GOVERNOR_ACTIVE');
+  assert.equal(measurement.analysedSeconds, Math.round(span.durationUs / 1e3) / 1e3);
+  assert.ok(measurement.analysedSeconds < measurement.durationSeconds,
+    'the span must be shorter than the window, or this test proves nothing');
+
+  const holds = scoped => Object.fromEntries(AXES.map(axis => [axis, buildHoldEvidence(
+    buildAnalysisRecords(scoped, {axis}).records, {axis, term: 'I'}).holds.length]));
+  const inSpan = holds(spanned);
+  assert.notDeepEqual(inSpan, holds(sliceSessionToSpan(session, window)),
+    'with the same holds inside and outside the span, this test could not fail');
+  assert.deepEqual(Object.fromEntries(AXES.map(axis =>
+    [axis, measurement.axes[axis].holdCount])), inSpan);
+});
+
+test('a log whose governor never reports ACTIVE is measured over its whole window', async () => {
+  const scan = createCorpusScan();
+  scan.addLog(await bytesOf(path.join(syntheticDir, 'rf46-stop-manoeuvres.TXT')), 'a.bbl');
+  const [measurement] = scan.measurements;
+  // The committed fixtures log governor state 1 and never 4.
+  assert.equal(measurement.evidenceSpanBasis, 'GOVERNOR_NEVER_ACTIVE');
+  assert.equal(measurement.analysedSeconds, measurement.durationSeconds);
+});
+
+// ---------------------------------------------------------------------------
 // Grouping
 // ---------------------------------------------------------------------------
 
@@ -777,13 +853,20 @@ test('the reference dumps reproduce the per-axis floors quoted in src/',
   {skip: !process.env.ROTORLENS_CORPUS_LOGS
     && 'set ROTORLENS_CORPUS_LOGS to a semicolon-separated list of .bbl paths'},
   async () => {
-    const scan = createCorpusScan();
-    for (const file of process.env.ROTORLENS_CORPUS_LOGS.split(';').filter(Boolean)) {
-      scan.addLog(await bytesOf(file), path.basename(file));
+    // The figures in src/ were measured over whole flight windows, before the
+    // 4 October 2026 governor cut. They are reproduced the way they were taken,
+    // so their provenance stays checkable...
+    const files = process.env.ROTORLENS_CORPUS_LOGS.split(';').filter(Boolean);
+    const quoted = createCorpusScan({cutToGovernorSpan: false});
+    const spanned = createCorpusScan();
+    for (const file of files) {
+      const bytes = await bytesOf(file);
+      quoted.addLog(bytes, path.basename(file));
+      spanned.addLog(bytes, path.basename(file));
     }
 
-    const summary = summarizeCorpus(scan.measurements, scan.fileFailures);
-    assert.equal(auditAll(scan.measurements).ok, true);
+    const summary = summarizeCorpus(quoted.measurements, quoted.fileFailures);
+    assert.equal(auditAll(quoted.measurements).ok, true);
 
     // The whole reason the tool exists: the gate has never opened, and this is
     // the run that says so out of a corpus rather than out of a comment.
@@ -794,6 +877,45 @@ test('the reference dumps reproduce the per-axis floors quoted in src/',
       const measured = summary.nullPairs[axis].delta.p90;
       assert.ok(Math.abs(measured - expected) < 0.005,
         `${axis} p90 measured ${measured}, src/ quotes ${expected}`);
+    }
+
+    // ...and over the governor span, which is what the app and the default
+    // report now measure, the gate still never opens and every shipped per-axis
+    // floor is at or above what the span measures, so none of them was made
+    // looser by the cut. Measured 4 October 2026: roll 0.8096 (8 pairs), pitch
+    // 0.3636 (12), yaw 0.0880 (19). Re-deriving the floors from these is a
+    // calibration decision, not part of the cut.
+    const current = summarizeCorpus(spanned.measurements, spanned.fileFailures);
+    assert.equal(auditAll(spanned.measurements).ok, true);
+    assert.equal(current.holds.maximumHolds, SHIPPED_FIGURES.observedMaximumHolds);
+    assert.equal(current.holds.flightAxesReachingGate, 0);
+    for (const [axis, shipped] of Object.entries(SHIPPED_FIGURES.perAxisNoiseFloorP90Dps)) {
+      const measured = current.nullPairs[axis].delta.p90;
+      assert.ok(measured <= shipped,
+        `${axis}: over the governor span the null pairs measure p90 ${measured}, above the `
+        + `${shipped} quoted in src/ — the shipped floor is no longer conservative`);
+    }
+
+    // THE WORST PAIR THE PILOT IS TOLD ABOUT (Stage 5a review, 4 October 2026).
+    // The floor sentence under every before/after (`describeNoiseFloor`) quotes,
+    // per axis, how many identical-gain pairs there were and the largest
+    // difference any of them showed. Hold evidence is measured over the span, so
+    // those are span figures — and when they were still the window's, the yaw
+    // sentence said "at most by 0.101°/s" of a measurement whose span pairs reach
+    // 0.1115. A bound is the one thing that sentence may not get wrong, so no span
+    // pair may exceed the maximum it quotes, the pair count must be the one
+    // measured, and the quote may sit above the measurement only by rounding up.
+    for (const axis of AXES) {
+      const quoted = describeNoiseFloor(null, axis);
+      const entry = current.nullPairs[axis];
+      assert.ok(entry.delta.max <= quoted.observedMaximumDps,
+        `${axis}: a span null pair differs by ${entry.delta.max}, more than the `
+        + `${quoted.observedMaximumDps}°/s the pilot is told is the most two such flights differ by`);
+      assert.equal(entry.pairCount, quoted.nullPairCount,
+        `${axis}: ${entry.pairCount} span null pairs measured, ${quoted.nullPairCount} quoted`);
+      assert.ok(quoted.observedMaximumDps - entry.delta.max <= 0.01 * quoted.observedMaximumDps,
+        `${axis}: the quoted ${quoted.observedMaximumDps} is more than rounding above the `
+        + `measured ${entry.delta.max}`);
     }
   });
 
