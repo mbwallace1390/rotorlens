@@ -533,8 +533,134 @@ sample, so the whole flight re-segments: against cutting the end alone
 (38/36/38), the start cut adds one roll hold and loses three pitch holds, and
 every hold it changes starts after the span does — none of them lost samples
 from before ACTIVE. That path dependence predates this change (the August
-amendment above found the same thing sweeping the takeoff trim) and is Stage
-5b's to remove.
+amendment above found the same thing sweeping the takeoff trim). Stage 5b kept
+the first-sample anchor, as its brief required, so it remains.
+
+### Amended 4 October 2026 (Stage 5b): holds that survive ordinary flying, read per kind, with two guards
+
+**An input on another axis ends a hold instead of voiding it.** Until now a
+steady segment ran on through any input over 30 °/s on another axis and
+`measureHold` refused all of it (`HOLD_OFF_AXIS_INPUT`): over the governor span
+that threw away 37 roll, 36 pitch and 15 yaw stretches on the 31 admissible
+flights, mostly still hovers ended by a pedal or roll input. `detectHoldSegments`
+now ends the segment at the sample before the input, and the axis may open
+another only once its own command has left the ±15 °/s band around its value at
+that moment, so one hover never becomes several holds and the clipped first
+stretch after the window opens stays dropped (the integrator is still winding
+up there). The band, its first-sample anchor, the 1 s settle, the 30 °/s limit
+and the 5 s minimum are unchanged. `HOLD_OFF_AXIS_INPUT` stays in `measureHold`
+as a guard; the one path left to it is records whose timestamps run backwards,
+and a test builds that by hand. `EVIDENCE_LIMITS.offAxisInputEndsHold: false`
+restores the old detector, used only by `createCorpusScan` to reproduce the
+floors quoted in `src/`.
+
+Two qualifications came from the review of the first round. The segment at the
+first sample is open from that sample even when another axis is already over
+the limit there: as first written, records that began during such an input had
+nothing open for it to end, and the rest of the first stretch opened after it
+as an unclipped hold. And an input inside an open segment's 1 s settle, which
+`measureHold` discards anyway, neither ends the segment nor arms the move — as
+before Stage 5b. Ending holds on it had cost three corpus holds.
+
+Measured on the 31 flights through the app's own calls, before and after:
+accepted holds 39/33/38 → 54/44/41; flight-axes with three or more holds
+3/2/5 → 7/4/6, two or more 14/8/13 → 20/12/13, five or more 0 → 0;
+adjustments 0 → 0. Nine previously accepted holds are lost, for two reasons.
+Seven are lost to the must-move rule: each followed an input on another axis
+after which its own axis never moved more than 15 °/s from its value at the
+moment of that input, so the rule reads it as the rest of the hover that input
+ended. The value is taken at the input, so which input arms the rule decides
+what counts as the same hover; one of the seven (on one flight's pitch) is lost
+only because the settle exemption moved the arming input, where a peak 15 °/s
+from the new value — not over it — no longer releases the rule. The other two
+were never under an armed rule: a segment that opens when an input ends anchors
+its band at a different sample, which splits a later hover into pieces under
+5 s. The first round lost eleven; three of those, lost to an input inside the
+settle second, are back, and so is one of the other eight. A variant that asks the axis to move only after a stretch that was
+itself a hold kept eight of the first round's eleven but changes the approved
+rule and gave 63/55/49 holds with flight-axes reaching five holds; it was
+measured on the first round and not adopted.
+
+**Each kind of hold is read on its own.** `buildHoldEvidence` carries a summary
+per kind (`kinds.zero`, `kinds.sustained`), and `interpretHoldEvidence` and
+`compareHoldEvidence` read each kind separately instead of refusing a flight
+with both (`HOLD_KIND_MISMATCH`, kept only for captures built before the
+split). Completeness is unchanged: two holds of a kind for a reading of it,
+three for a standing error. Two kinds that both read and disagree are refused
+as an I-term reading (`I_TERM_HOLDS_KINDS_DISAGREE`); the one exception is the
+completeness rule itself, a kind whose only objection to the other's standing
+error is having too few holds for one, on the same side. Disagreement never
+removes a mechanical blocker: the bind is read over the holds the reading came
+from, over each readable kind on its own, and over all the holds pooled as
+before Stage 5b, and a bind any of them shows stands. The first round switched
+the bind check off where the kinds disagreed, and three clean turns added to
+three bound hovers then turned "look at the linkage" into a gain change. A saved
+flight-history record keeps one set of hold numbers, so a side that mixed both
+kinds is refused as `HOLD_KINDS_MIXED_IN_RECORD`. No corpus flight has a
+steady-rate hold of 5 s or more, so these paths rest on synthetic wiring tests
+and add no threshold.
+
+**Two guards, in `src/analysis/low-frequency.mjs`.** Welch magnitude-squared
+coherence at one frequency (Hann window, per-segment detrend, half overlap
+counted at its worth) and a correlation judged on an effective sample count,
+written for this stage from the published definitions — Welch 1967, Bartlett
+1946, Bretherton et al. 1999, Fisher's z, Abramowitz and Stegun 7.1.26 — not
+taken from `mechanical-spectrum.mjs`'s private code or from any other project.
+Measurement only. Their cut-offs are null-hypothesis levels computed from alpha
+(0.01, 0.05) and the evidence count, swept in `HOLD_SWEEP` with Welch segments
+of 2.56 and 5.12 s; a reading must survive every point.
+
+- A "lower I" survives only where the stick-to-error coherence at the hunt's
+  frequency sits under its null (`HUNTING_FOLLOWS_THE_STICK`; untestable
+  refuses too). A coherence under its null counts only from a vote able to have
+  seen the stick (`STICK_COHERENCE_VOTE`, review of the first round): its null
+  must be at or under 0.20, where a wobble as coherent with the stick as the
+  least at which this guard found the stick on the corpus (0.29) reads over it
+  80 % of the time — about 15 effective segments at alpha 0.05. From fewer
+  segments a failure to reject is no evidence — two segments give a null of
+  0.95 — so that vote abstains, and if nothing else votes the reading is
+  refused (`STICK_COHERENCE_NOT_MEASURED`). A coherence that reaches its null
+  refuses from any number of segments. The cost is that holds as short as the
+  brief allows no longer pass a "Lower I" unless the stick was still at the
+  hunt's frequency; designed for the Stage 5 study's least, 0.40, the limit
+  would be 0.30. The "Lower I" card states the coherence, its null and the
+  segments behind it, not that the wobble was not the stick. On the corpus the
+  guard was measured on the 30 flight-axes where any sweep point read "lower I":
+  the error followed the stick on 17 of 20 roll and pitch axes and on none of
+  10 yaw axes; of the other 13, 6 yaw axes read under the null and 7 could not
+  be read (46 of the 120 votes abstained under the new rule). It decided
+  nothing there: 28 of those readings had already flipped across the sweep, and
+  the other 2 were refused because the I term did not move with the error.
+- On yaw, a reading of the I term — "raise", "lower" or the all-clear — survives
+  only where the integrator's correlation with collective inside the holds is
+  not significant (`YAW_HOLD_MOVES_WITH_COLLECTIVE`; untestable refuses too).
+  Measured on the 12 yaw flight-axes with captured holds, significant on 7; it
+  decided 1, an all-clear. The test behind it calls unrelated signals as slow
+  as these related in about 10-15 % of draws at alpha 0.05, not 5 %
+  (`COLLECTIVE_GUARD_FALSE_ALARM`), so its card says the I term moved with the
+  collective and was not judged, gives the collective precompensation as one
+  possible cause beside chance, and quotes that rate.
+
+**The all-clear says what was seen**, "No standing error seen in N holds",
+never that the I term is right: no corpus flight has a standing error, so the
+reading has never been seen catching one.
+
+**The null pairs were re-quoted**, because the prefix rule changes which holds
+are measured: over the span with the prefix rule as revised after the review,
+roll 21 pairs (p90 0.3218, max 0.3875), pitch 20 (0.8307, 1.2472), yaw 21
+(0.0621, 0.0825). `OBSERVED_NULL_PAIRS` now quotes 21/0.388, 20/1.25 and
+21/0.0825; every p90 is under its unchanged gate, and yaw's worst pair sits
+under its 0.1 gate too. (The first round measured 17/20/21 pairs, maxima
+0.3948, 1.2472 and 0.0997.)
+
+**The reference flight's findings changed on roll and pitch only**: the prefix
+rule gives it 3 roll and 2 pitch holds where it had 1 and 1, and both now read
+as a flip across the sweep (`I_TERM_VERDICT_UNSTABLE`) where they read as too
+few holds. Yaw keeps its 3 holds and reads as it did before Stage 5b, a flip
+across the sweep. The first round had lost one of those yaw holds to an input
+inside its settle second, and the collective guard then withheld the all-clear
+the other two read; with the hold back, the reading flips before the guard is
+reached.
 
 ## Candour about prior exposure
 

@@ -972,6 +972,21 @@ test('the manoeuvre brief quotes the gates that will actually judge it', () => {
   assert.equal(pidEvidence.HOLDS_FOR_A_FULL_READING,
     Math.max(EVIDENCE_LIMITS.minimumHolds, EVIDENCE_LIMITS.minimumHoldsForStandingError));
   assert.ok(hold.includes(`${pidEvidence.HOLDS_FOR_A_FULL_READING} such holds`), hold);
+
+  // STAGE 5b (4 October 2026). An input on another axis now ENDS a hold rather
+  // than voiding it, and a hover counts as a new hold only once this axis's own
+  // stick has moved out of the band it held — so the brief asks for what the
+  // detector rewards: still hovers with the pedals left alone, and a move on
+  // every stick between them. The band it quotes is the detector's own.
+  for (const axis of ['roll', 'pitch', 'yaw']) {
+    const brief = holdManoeuvre(axis).steps.join(' ');
+    assert.match(brief, /still hover/i, `${axis}: ${brief}`);
+    assert.match(brief, /pedals left alone/, `${axis}: ${brief}`);
+    assert.match(brief, /every stick/, `${axis}: ${brief}`);
+    assert.ok(brief.includes(`${EVIDENCE_LIMITS.holdSetpointBandDps}°/s`), `${axis}: ${brief}`);
+    assert.match(brief, /ends the hold/, `${axis}: ${brief}`);
+    assert.match(brief, /new hold/, `${axis}: ${brief}`);
+  }
 });
 
 test('hold capture separates never-flown from set-aside', () => {

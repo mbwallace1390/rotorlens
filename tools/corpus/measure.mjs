@@ -334,7 +334,7 @@ function toAnalysisSession(definition, decoded) {
   };
 }
 
-function measureAxis(session, scoped, axis) {
+function measureAxis(session, scoped, axis, holdLimits = undefined) {
   const result = emptyAxis();
 
   const signals = resolveAxisSignals(session, axis);
@@ -357,7 +357,7 @@ function measureAxis(session, scoped, axis) {
     return result;
   }
 
-  const hold = buildHoldEvidence(built.records, {axis, term: 'I'});
+  const hold = buildHoldEvidence(built.records, {axis, term: 'I'}, {limits: holdLimits});
   result.holdStatus = hold?.status ?? null;
 
   // HOLD COUNT IS COUNTED FROM THE SEGMENTS, not read from the summary.
@@ -391,9 +391,17 @@ function measureAxis(session, scoped, axis) {
  *   whole flight window, as every run before 4 October 2026 did; it exists so the
  *   figures quoted in `src/` from those runs can still be reproduced and checked,
  *   and nothing else should ask for it.
+ * @param {boolean} [options.offAxisInputEndsHold] true (the default, and what
+ *   the app does since Stage 5b, 4 October 2026): an input on another axis ends
+ *   a hold. `false` measures holds as every run before that did — the segment
+ *   ran on through the input and was refused whole — for the same reason and
+ *   with the same restriction as the option above.
  */
 export function createCorpusScan(options = {}) {
   const cutToGovernorSpan = options.cutToGovernorSpan !== false;
+  const holdLimits = options.offAxisInputEndsHold === false
+    ? {offAxisInputEndsHold: false}
+    : undefined;
   const groupByKey = new Map();
   const measurements = [];
   const fileFailures = [];
@@ -444,7 +452,7 @@ export function createCorpusScan(options = {}) {
     const produced = [];
     for (let index = 0; index < starts.length; index += 1) {
       const measurement = measureSession(bytes, starts, index, sourceFile, groupFor,
-        cutToGovernorSpan);
+        cutToGovernorSpan, holdLimits);
       measurements.push(measurement);
       produced.push(measurement);
       if (onSession) {
@@ -477,7 +485,8 @@ export function createCorpusScan(options = {}) {
  * are as good as any others. Catching everything in one block would throw all of
  * that away and report the donation as unreadable.
  */
-function measureSession(bytes, starts, index, sourceFile, groupFor, cutToGovernorSpan = true) {
+function measureSession(bytes, starts, index, sourceFile, groupFor, cutToGovernorSpan = true,
+  holdLimits = undefined) {
   const measurement = emptyMeasurement(sourceFile, index);
   const start = starts[index];
   const end = starts[index + 1] ?? bytes.length;
@@ -582,7 +591,7 @@ function measureSession(bytes, starts, index, sourceFile, groupFor, cutToGoverno
 
   for (const axis of AXES) {
     try {
-      measurement.axes[axis] = measureAxis(session, scoped, axis);
+      measurement.axes[axis] = measureAxis(session, scoped, axis, holdLimits);
     } catch (error) {
       // One axis failing does not cost the other two. The axis keeps its empty
       // shape and the session is still readable — which is the honest report,

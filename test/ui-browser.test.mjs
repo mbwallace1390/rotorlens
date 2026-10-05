@@ -3623,20 +3623,26 @@ test('the engine and shell run in a real browser', {
       // and the refusal prints each axis's own figures. Since 4 October 2026
       // the worst pairs and their counts are the governor span's, which is what
       // the holds are measured over: yaw's worst is 0.1115, so "at most 0.101"
-      // was a bound the measurement broke.
+      // was a bound the measurement broke. And since Stage 5b, the same day, an
+      // input on another axis ends a hold rather than voiding it, which changed
+      // the holds again: the pairs became 17, 20 and 21, yaw's worst 0.0997 —
+      // under its 0.1 floor, so the yaw sentence names one bound, not two. The
+      // review of that round changed the holds once more (an input inside a
+      // hold's settle second no longer ends it): 21, 20 and 21 pairs, worst
+      // pairs 0.388, 1.25 and 0.0825.
       const text = kept.shown[name].text;
       if (name === 'refused') {
         assert.match(text, /smaller than 0\.92°\/s on roll, 1\.39°\/s on pitch or 0\.1°\/s on yaw/,
           `${name} must print each axis's measured noise floor`);
-        assert.match(text, /at most 0\.81°\/s on roll \(8 pairs\), 1\.25°\/s on pitch \(12 pairs\) and 0\.112°\/s on yaw \(19 pairs\)/,
+        assert.match(text, /at most 0\.388°\/s on roll \(21 pairs\), 1\.25°\/s on pitch \(20 pairs\) and 0\.0825°\/s on yaw \(21 pairs\)/,
           `${name} must print each axis's worst observed case, not only the p90`);
       } else {
-        assert.match(text, /yaw differed on this measurement usually by less than 0\.1°\/s/,
+        assert.match(text, /A yaw change smaller than 0\.1°\/s cannot be told apart/,
           `${name} must print the measured noise floor beside its numbers`);
-        assert.match(text, /Across 19 pairs .*at most by 0\.112°\/s/,
+        assert.match(text, /Across 21 pairs .*yaw differed on this measurement by at most 0\.0825°\/s/,
           `${name} must print yaw's worst observed case, not only the p90`);
-        assert.doesNotMatch(text, /0\.101°\/s/,
-          `${name} quotes the window-era yaw maximum the span measurement exceeds`);
+        assert.doesNotMatch(text, /0\.101°\/s|0\.112°\/s/,
+          `${name} quotes a yaw maximum measured before holds were measured as they now are`);
         assert.doesNotMatch(text, /1\.39°\/s/,
           `${name} quotes another axis's worst case beside a yaw change`);
       }

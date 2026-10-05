@@ -854,10 +854,12 @@ test('the reference dumps reproduce the per-axis floors quoted in src/',
     && 'set ROTORLENS_CORPUS_LOGS to a semicolon-separated list of .bbl paths'},
   async () => {
     // The figures in src/ were measured over whole flight windows, before the
-    // 4 October 2026 governor cut. They are reproduced the way they were taken,
+    // 4 October 2026 governor cut and with the hold detector of that time, under
+    // which an input on another axis voided a hold rather than ending it (Stage
+    // 5b changed that the same day). They are reproduced the way they were taken,
     // so their provenance stays checkable...
     const files = process.env.ROTORLENS_CORPUS_LOGS.split(';').filter(Boolean);
-    const quoted = createCorpusScan({cutToGovernorSpan: false});
+    const quoted = createCorpusScan({cutToGovernorSpan: false, offAxisInputEndsHold: false});
     const spanned = createCorpusScan();
     for (const file of files) {
       const bytes = await bytesOf(file);
@@ -879,12 +881,15 @@ test('the reference dumps reproduce the per-axis floors quoted in src/',
         `${axis} p90 measured ${measured}, src/ quotes ${expected}`);
     }
 
-    // ...and over the governor span, which is what the app and the default
-    // report now measure, the gate still never opens and every shipped per-axis
-    // floor is at or above what the span measures, so none of them was made
-    // looser by the cut. Measured 4 October 2026: roll 0.8096 (8 pairs), pitch
-    // 0.3636 (12), yaw 0.0880 (19). Re-deriving the floors from these is a
-    // calibration decision, not part of the cut.
+    // ...and over the governor span with an input on another axis ending a hold,
+    // which is what the app and the default report now measure, the gate still
+    // never opens and every shipped per-axis floor is at or above what is
+    // measured, so neither change made one looser. Measured 4 October 2026 after
+    // the review of Stage 5b's first round: roll 0.3218 (21 pairs), pitch 0.8307
+    // (20), yaw 0.0621 (21); after that first round, roll 0.2685 (17), pitch
+    // 1.1000 (20), yaw 0.0680 (21); after the span cut alone, roll 0.8096 (8),
+    // pitch 0.3636 (12), yaw 0.0880 (19). Re-deriving the floors from these is a
+    // calibration decision, not part of any of these changes.
     const current = summarizeCorpus(spanned.measurements, spanned.fileFailures);
     assert.equal(auditAll(spanned.measurements).ok, true);
     assert.equal(current.holds.maximumHolds, SHIPPED_FIGURES.observedMaximumHolds);
@@ -916,6 +921,68 @@ test('the reference dumps reproduce the per-axis floors quoted in src/',
       assert.ok(quoted.observedMaximumDps - entry.delta.max <= 0.01 * quoted.observedMaximumDps,
         `${axis}: the quoted ${quoted.observedMaximumDps} is more than rounding above the `
         + `measured ${entry.delta.max}`);
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// The figures CLAUDE.md quotes (review of Stage 5b's first round)
+// ---------------------------------------------------------------------------
+
+/**
+ * The null-pair figures CLAUDE.md quotes, per axis, or null where its sentence
+ * does not carry them in the form "roll p90 P / max M (N pairs), pitch p90 P /
+ * max M (N), yaw p90 P / max M (N)".
+ */
+async function claudeNullPairs() {
+  const text = (await readFile(path.join(projectRoot, 'CLAUDE.md'), 'utf8')).replace(/\s+/g, ' ');
+  const number = '([0-9]+(?:\\.[0-9]+)?)';
+  const match = text.match(new RegExp(`null pairs read roll p90 ${number} / max ${number} `
+    + `\\((\\d+) pairs\\), pitch p90 ${number} / max ${number} \\((\\d+)\\), `
+    + `yaw p90 ${number} / max ${number} \\((\\d+)\\)`));
+  if (!match) {
+    return null;
+  }
+  const at = offset => ({p90: Number(match[offset]), maximumDps: Number(match[offset + 1]),
+    pairs: Number(match[offset + 2])});
+  return {roll: at(1), pitch: at(4), yaw: at(7)};
+}
+
+// CLAUDE.md is the owner's to edit. It was re-quoted with the Stage 5b null
+// pairs on 4 October 2026, so these two tests now pin it: a change to what the
+// app quotes, or to what the reference dumps measure, fails until CLAUDE.md
+// says the same.
+test('CLAUDE.md quotes the null-pair counts and worst pairs the app quotes',
+  async () => {
+    const quoted = await claudeNullPairs();
+    assert.ok(quoted, 'CLAUDE.md must quote the null pairs as "roll p90 P / max M (N pairs), '
+      + 'pitch p90 P / max M (N), yaw p90 P / max M (N)"');
+    for (const axis of AXES) {
+      const app = describeNoiseFloor(null, axis);
+      assert.equal(quoted[axis].pairs, app.nullPairCount, `${axis}: pair count`);
+      assert.equal(quoted[axis].maximumDps, app.observedMaximumDps, `${axis}: worst pair`);
+    }
+  });
+
+test('CLAUDE.md quotes the null-pair p90s the reference dumps measure',
+  {skip: !process.env.ROTORLENS_CORPUS_LOGS
+    && 'set ROTORLENS_CORPUS_LOGS to a semicolon-separated list of .bbl paths'},
+  async () => {
+    const quoted = await claudeNullPairs();
+    assert.ok(quoted, 'CLAUDE.md must quote the null pairs in the form the test above names');
+    const scan = createCorpusScan();
+    for (const file of process.env.ROTORLENS_CORPUS_LOGS.split(';').filter(Boolean)) {
+      scan.addLog(await bytesOf(file), path.basename(file));
+    }
+    const summary = summarizeCorpus(scan.measurements, scan.fileFailures);
+    for (const axis of AXES) {
+      const measured = summary.nullPairs[axis];
+      const p90 = quoted[axis].p90;
+      // Quoted to its own last digit: within half a unit of it.
+      const decimals = (String(p90).split('.')[1] ?? '').length;
+      assert.ok(Math.abs(measured.delta.p90 - p90) <= 0.5 * 10 ** -decimals + 1e-9,
+        `${axis}: CLAUDE.md quotes p90 ${p90}, the dumps measure ${measured.delta.p90}`);
+      assert.equal(quoted[axis].pairs, measured.pairCount, `${axis}: pair count`);
+      assert.ok(measured.delta.max <= quoted[axis].maximumDps, `${axis}: worst pair`);
     }
   });
 

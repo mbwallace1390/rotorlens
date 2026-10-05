@@ -199,6 +199,17 @@
     /** Off-axis command above this means the pilot was not holding one axis. */
     offAxisCommandLimitDps: 30,
 
+    /**
+     * Whether an input on another axis over `offAxisCommandLimitDps` ENDS a hold
+     * (true, since Stage 5b, 4 October 2026) — see `detectHoldSegments`. False
+     * restores the detector as it was before: the segment ran on through the
+     * input and `measureHold` refused the whole of it as HOLD_OFF_AXIS_INPUT. Kept
+     * only so figures measured that way — the per-axis floors quoted in
+     * src/analysis/flight-history.mjs — can still be reproduced
+     * (`createCorpusScan` in tools/corpus/measure.mjs); nothing in the app sets it.
+     */
+    offAxisInputEndsHold: true,
+
     /** Headspeed span over median above this makes governor effects masquerade as tune. */
     maximumHeadspeedVariationRatio: 0.05,
 
@@ -916,12 +927,70 @@
   }
 
   /**
+   * The other axis commanded hardest at one sample, and how hard, read exactly as
+   * `measureHold` reads it: a missing command counts as zero and a command that is
+   * not a number is skipped. The detector and the measurement must agree on what
+   * "an input on another axis" is, or a hold the detector closed in time could
+   * still be refused for one it did not see.
+   */
+  function offAxisCommandAt(record, axisIndex) {
+    const others = offAxisIndexes(axisIndex);
+    let peak = 0;
+    let axis = null;
+    for (const other of others) {
+      const value = Math.abs(record.setpoint?.[other] ?? 0);
+      if (value > peak) {
+        peak = value;
+        axis = other;
+      }
+    }
+    return {peak, axis};
+  }
+
+  /**
    * Finds spans where the command on `axisIndex` is steady long enough to expose
    * steady-state behavior.
    *
    * A hold ends as soon as the command leaves the band around the value it started
    * with — extending it through a command change would blend two different
    * operating points into one average.
+   *
+   * AN INPUT ON ANOTHER AXIS ENDS A HOLD, TOO (Stage 5b, 4 October 2026). Until
+   * then a segment ran on through one, and `measureHold` refused the whole of it
+   * as HOLD_OFF_AXIS_INPUT. On the 31 admissible real flights that threw away 37
+   * roll, 36 pitch and 15 yaw stretches over the governor span; on roll and pitch
+   * most were still hovers ended by a pedal input (median peak 123-129 deg/s), on
+   * yaw by a roll input (median 50 deg/s). The steady part BEFORE the input was a
+   * hold like any other, so the segment now ends at the sample before the first
+   * one over `offAxisCommandLimitDps` — the prefix rule — and is measured if it
+   * is still long enough. The limit itself, the band, its first-sample anchor,
+   * the settle and the minimum length are all unchanged.
+   *
+   * AND THE AXIS MUST MOVE BEFORE ANOTHER HOLD OPENS. After that input, no new
+   * segment may open until this axis's OWN command has left the band around the
+   * value it had at the moment of the input (`holdSetpointBandDps` either side),
+   * and no segment opens while another axis is still over the limit. Without the
+   * first half, a pedal blip in the middle of one hover would cut it into two
+   * holds, and a few blips into three — which is the count a standing error is
+   * read from (`minimumHoldsForStandingError`), reached without the pilot ever
+   * holding the aircraft a second time, and the hold-to-hold side test that count
+   * exists for would be testing one hover against itself. It also keeps the
+   * first stretch after the window opens dropped (CLIPPED_BY_WINDOW): a blip
+   * there does not turn the rest of that stretch, measured while the integrator
+   * is still winding up after liftoff, into a hold. The move may happen while the
+   * other input is still held — a coordinated turn — and counts once it has.
+   *
+   * Two qualifications, from the review of round one (4 October 2026). The
+   * segment at the first sample is open from that sample even if another axis is
+   * already over the limit there: it began before the records did, so the rules
+   * above apply to it as to any open segment, and records that begin during an
+   * input cannot slip the rest of the first stretch past CLIPPED_BY_WINDOW. And an
+   * input inside an open segment's settle (`holdSettleUs`), which `measureHold`
+   * discards, neither ends it nor arms the move — as before Stage 5b.
+   *
+   * Each segment says how it ended (`endedBy`): `off-axis-input` (with
+   * `endedByAxis`, the axis whose input it was), `command-left-band`,
+   * `command-not-finite`, or `end-of-records`.
    */
   function detectHoldSegments(records, axisIndex, options = {}) {
     const limits = {...EVIDENCE_LIMITS, ...options.limits};
@@ -933,8 +1002,11 @@
 
     let startIndex = null;
     let reference = null;
+    // Set at an input on another axis that ended an open segment: the value this
+    // axis had then, which its own command must leave before a hold may open.
+    let mustLeave = null;
 
-    const closeSegment = endIndex => {
+    const closeSegment = (endIndex, endedBy, endedByAxis = null) => {
       if (startIndex === null || endIndex <= startIndex) {
         return;
       }
@@ -950,7 +1022,9 @@
           // ends, and nothing here can tell. See CLIPPED_BY_WINDOW in
           // `buildHoldEvidence` for why that matters enough to drop the segment.
           clippedAtStart: startIndex === 0,
-          clippedAtEnd: endIndex === records.length - 1
+          clippedAtEnd: endIndex === records.length - 1,
+          endedBy,
+          endedByAxis: endedByAxis === null ? null : AXES[endedByAxis]
         });
       }
     };
@@ -959,9 +1033,68 @@
       const setpoint = records[index].setpoint?.[axisIndex];
 
       if (!Number.isFinite(setpoint)) {
-        closeSegment(index - 1);
+        closeSegment(index - 1, 'command-not-finite');
         startIndex = null;
         reference = null;
+        continue;
+      }
+
+      // THE WINDOW START IS AN OPEN SEGMENT (review of round one, 4 October 2026).
+      // Whatever the axis was doing at the first sample began before the records
+      // did, so a segment is open from there — clipped at its start — even with an
+      // input on another axis already under way. Without this, records that began
+      // during such an input had nothing open for the input to end, nothing asked
+      // this axis to move, and the rest of the first stretch opened after it as an
+      // unclipped hold, measured while the integrator may still be winding up
+      // after liftoff. The rules below then treat it like any other open segment.
+      if (index === 0) {
+        startIndex = 0;
+        reference = setpoint;
+      }
+
+      // The axis has made its own move since the input that ended its last hold.
+      if (mustLeave !== null && Math.abs(setpoint - mustLeave) > limits.holdSetpointBandDps) {
+        mustLeave = null;
+      }
+
+      const offAxis = offAxisCommandAt(records[index], axisIndex);
+      if (limits.offAxisInputEndsHold !== false && offAxis.peak > limits.offAxisCommandLimitDps) {
+        // AN INPUT INSIDE THE SETTLE IS NOT AN END (review of round one). Every
+        // hold's first `holdSettleUs` is discarded by `measureHold`, so an input
+        // there touches nothing that is measured — before Stage 5b it was ignored
+        // for exactly that reason — and ending the hold on it lost 3 of the 11
+        // corpus holds the prefix rule lost. It neither ends the segment nor asks
+        // the axis to move. An input still on once the settle is over is inside
+        // the measured window and ends the segment below, as any other does.
+        const inSettle = startIndex !== null
+          && records[index].timeUs - records[startIndex].timeUs < limits.holdSettleUs;
+        if (inSettle) {
+          if (Math.abs(setpoint - reference) > limits.holdSetpointBandDps) {
+            // The axis's own move ends the segment, still too short to be a hold;
+            // the next opens once the input is off, from wherever the axis is then,
+            // because it has already moved.
+            closeSegment(index - 1, 'command-left-band');
+            startIndex = null;
+            reference = null;
+          }
+          continue;
+        }
+        if (startIndex !== null) {
+          closeSegment(index - 1, 'off-axis-input', offAxis.axis);
+          // Only an input that ENDS a segment arms the rule. One that arrives
+          // after the axis has already moved, while nothing is open, does not ask
+          // it to move again.
+          if (mustLeave === null) {
+            mustLeave = setpoint;
+          }
+        }
+        startIndex = null;
+        reference = null;
+        continue;
+      }
+
+      if (mustLeave !== null) {
+        // Still inside the band it had when the input came: the same hover.
         continue;
       }
 
@@ -972,13 +1105,13 @@
       }
 
       if (Math.abs(setpoint - reference) > limits.holdSetpointBandDps) {
-        closeSegment(index - 1);
+        closeSegment(index - 1, 'command-left-band');
         startIndex = index;
         reference = setpoint;
       }
     }
 
-    closeSegment(records.length - 1);
+    closeSegment(records.length - 1, 'end-of-records');
     return segments;
   }
 
@@ -1019,16 +1152,20 @@
 
     // Explicit loop, not `Math.max(...window.map(...))`: a two-minute hover is a
     // hundred thousand samples and spreading them threw RangeError. See `extremes`.
-    const others = offAxisIndexes(axisIndex);
+    //
+    // KEPT AFTER STAGE 5b AS A GUARD, and said plainly how little now reaches it.
+    // `detectHoldSegments` ends a segment at the sample before any input on
+    // another axis over this same limit, read the same way (`offAxisCommandAt`),
+    // so no sample of a detected segment can trip it. The window below is taken
+    // by TIME rather than by index, though, and records whose timestamps run
+    // backwards can put a sample from outside the segment inside its time range;
+    // that is the one path left, a decoded log does not produce it, and a test
+    // builds it by hand to show the guard still fires.
     let offAxisPeak = 0;
     for (const record of window) {
-      const first = Math.abs(record.setpoint?.[others[0]] ?? 0);
-      const second = Math.abs(record.setpoint?.[others[1]] ?? 0);
-      if (first > offAxisPeak) {
-        offAxisPeak = first;
-      }
-      if (second > offAxisPeak) {
-        offAxisPeak = second;
+      const {peak} = offAxisCommandAt(record, axisIndex);
+      if (peak > offAxisPeak) {
+        offAxisPeak = peak;
       }
     }
     if (offAxisPeak > limits.offAxisCommandLimitDps) {
@@ -1120,6 +1257,17 @@
       measuredDurationUs,
       sampleCount: window.length,
 
+      /**
+       * How the steady stretch ended, from `detectHoldSegments`: an input on
+       * another axis (`off-axis-input`, with the axis in `endedByAxis`), the
+       * command leaving its band, a command that was not a number, or the end of
+       * the records. Reported so a viewer can mark where an input elsewhere cut a
+       * hold short rather than leave the pilot guessing why it is shorter than he
+       * flew it.
+       */
+      endedBy: segment.endedBy ?? null,
+      endedByAxis: segment.endedByAxis ?? null,
+
       // A hold at zero command is a heading or attitude hold; a hold at a sustained
       // rate is a constant-rate turn. Both test the I term, in different regimes.
       holdKind: Math.abs(setpointMedian) < limits.zeroHoldThresholdDps ? 'zero' : 'sustained',
@@ -1160,6 +1308,69 @@
       headspeedVariationRatio: round(headspeedVariationRatio, 4),
       batteryMedian: round(batteryMedian, 4),
       batteryVariationRatio: round(batteryVariationRatio, 4)
+    };
+  }
+
+  /** The two kinds of hold, as `measureHold` names them. */
+  const HOLD_KINDS = Object.freeze(['zero', 'sustained']);
+
+  /**
+   * The cross-hold summary of `holds`, or null when there are none.
+   *
+   * Every mean is weighted by measured duration. A hold is a sample of steady
+   * state, and a 16 s sample is not one observation of the same worth as a 0.41 s
+   * one — it is forty times the evidence. The unweighted mean is how a single
+   * 0.41 s window, whose slope was not distinguishable from zero, outvoted two
+   * long holds and carried an axis to "increase I".
+   *
+   * One function for the pooled summary and for each kind's (Stage 5b), so the
+   * two cannot be computed two ways.
+   */
+  function summarizeHolds(holds) {
+    if (holds.length === 0) {
+      return null;
+    }
+    const weights = holds.map(hold => hold.measuredDurationUs);
+    const across = (field, subset = holds) => round(
+      weightedMean(
+        subset.map(hold => hold[field]),
+        subset.map(hold => hold.measuredDurationUs)
+      ),
+      4
+    );
+
+    // Only holds whose drift stands above its own uncertainty. A slope that is not
+    // separable from zero contributes nothing rather than contributing noise.
+    const driftHolds = holds.filter(hold => hold.errorDriftMeasurable);
+    const worstError = extremes(holds.map(hold => hold.absoluteSteadyStateErrorDps));
+
+    return {
+      holdCount: holds.length,
+      zeroHoldCount: holds.filter(hold => hold.holdKind === 'zero').length,
+      sustainedHoldCount: holds.filter(hold => hold.holdKind === 'sustained').length,
+      totalMeasuredDurationUs: weights.reduce((total, weight) => total + weight, 0),
+
+      meanSteadyStateErrorDps: across('steadyStateErrorDps'),
+      meanAbsoluteSteadyStateErrorDps: across('absoluteSteadyStateErrorDps'),
+      worstAbsoluteSteadyStateErrorDps: worstError === null ? null : round(worstError.highest, 4),
+
+      /**
+       * Null when no hold's drift was separable from its own uncertainty.
+       *
+       * Null is the point. A number here is a claim that the error was going
+       * somewhere, and on flights where no window is long enough to support that
+       * claim the honest report is that the drift was not measured — not the mean
+       * of several slopes that each mean nothing.
+       */
+      meanErrorDriftDpsPerSecond:
+        driftHolds.length === 0 ? null : across('errorDriftDpsPerSecond', driftHolds),
+      driftMeasuredHoldCount: driftHolds.length,
+
+      meanErrorRippleRmsDps: across('errorRippleRmsDps'),
+      meanErrorCrossingRateHz: across('errorCrossingRateHz'),
+      meanErrorNoiseRmsDps: across('errorNoiseRmsDps'),
+      meanITermRms: across('iTermRms'),
+      meanITermDriftPerSecond: across('iTermDriftPerSecond')
     };
   }
 
@@ -1249,57 +1460,30 @@
       addCode(codes, rejection);
     }
 
-    // Every cross-hold mean below is weighted by measured duration. A hold is a
-    // sample of steady state, and a 16 s sample is not one observation of the same
-    // worth as a 0.41 s one — it is forty times the evidence. The unweighted mean
-    // is how a single 0.41 s window, whose slope was not distinguishable from
-    // zero, outvoted two long holds and carried an axis to "increase I".
-    const weights = holds.map(hold => hold.measuredDurationUs);
-    const across = (field, subset = holds) => round(
-      weightedMean(
-        subset.map(hold => hold[field]),
-        subset.map(hold => hold.measuredDurationUs)
-      ),
-      4
-    );
-
     // Only holds whose drift stands above its own uncertainty. A slope that is not
     // separable from zero contributes nothing rather than contributing noise.
-    const driftHolds = holds.filter(hold => hold.errorDriftMeasurable);
-    if (holds.length > 0 && driftHolds.length === 0) {
+    if (holds.length > 0 && !holds.some(hold => hold.errorDriftMeasurable)) {
       addCode(codes, 'DRIFT_NOT_SEPARABLE_FROM_ERROR');
     }
 
-    const worstError = extremes(holds.map(hold => hold.absoluteSteadyStateErrorDps));
+    const summary = summarizeHolds(holds);
 
-    const summary = holds.length === 0 ? null : {
-      holdCount: holds.length,
-      zeroHoldCount: holds.filter(hold => hold.holdKind === 'zero').length,
-      sustainedHoldCount: holds.filter(hold => hold.holdKind === 'sustained').length,
-      totalMeasuredDurationUs: weights.reduce((total, weight) => total + weight, 0),
-
-      meanSteadyStateErrorDps: across('steadyStateErrorDps'),
-      meanAbsoluteSteadyStateErrorDps: across('absoluteSteadyStateErrorDps'),
-      worstAbsoluteSteadyStateErrorDps: worstError === null ? null : round(worstError.highest, 4),
-
-      /**
-       * Null when no hold's drift was separable from its own uncertainty.
-       *
-       * Null is the point. A number here is a claim that the error was going
-       * somewhere, and on flights where no window is long enough to support that
-       * claim the honest report is that the drift was not measured — not the mean
-       * of several slopes that each mean nothing.
-       */
-      meanErrorDriftDpsPerSecond:
-        driftHolds.length === 0 ? null : across('errorDriftDpsPerSecond', driftHolds),
-      driftMeasuredHoldCount: driftHolds.length,
-
-      meanErrorRippleRmsDps: across('errorRippleRmsDps'),
-      meanErrorCrossingRateHz: across('errorCrossingRateHz'),
-      meanErrorNoiseRmsDps: across('errorNoiseRmsDps'),
-      meanITermRms: across('iTermRms'),
-      meanITermDriftPerSecond: across('iTermDriftPerSecond')
-    };
+    // EACH KIND OF HOLD SUMMARISED ON ITS OWN (Stage 5b). A hold at zero rate and
+    // a hold at a steady rate test the integrator in two different regimes, and
+    // `interpretHoldEvidence` and `compareHoldEvidence` now read each kind
+    // separately instead of refusing a flight that has both. The pooled `summary`
+    // above stays, unchanged, for every reader that takes one.
+    const kinds = {};
+    for (const holdKind of HOLD_KINDS) {
+      const ofKind = holds.filter(hold => hold.holdKind === holdKind);
+      kinds[holdKind] = Object.freeze({
+        holdCount: ofKind.length,
+        status: ofKind.length >= limits.minimumHolds
+          ? 'captured'
+          : (ofKind.length > 0 ? 'inconclusive' : 'absent'),
+        summary: summarizeHolds(ofKind)
+      });
+    }
 
     return Object.freeze({
       schemaVersion: PID_EVIDENCE_SCHEMA_VERSION,
@@ -1310,6 +1494,9 @@
       codes,
       holds,
       summary,
+      kinds: Object.freeze(kinds),
+      /** Holds that ended at an input on another axis rather than on their own. */
+      offAxisEndedHoldCount: holds.filter(hold => hold.endedBy === 'off-axis-input').length,
       rejectedHoldCounts: rejections,
       /** Each refused segment's extent and reason, in the order they were found. */
       rejectedHolds: Object.freeze(rejectedHolds),
@@ -1355,20 +1542,6 @@
     huntingRippleDps: 2
   });
 
-  /**
-   * Interprets hold evidence as an indication about the I term.
-   *
-   * Field names here deliberately avoid instruction words (`delta`, `direction`,
-   * `recommendation`). This is a measurement, and nothing downstream should be
-   * able to mistake it for something to write to an aircraft.
-   *
-   * Deliberately conservative: it reports `hold` unless the evidence separates the
-   * two failure modes cleanly. A standing error that never crosses zero is too
-   * little I; error that keeps crossing zero at a low rate is too much. Evidence
-   * showing both, or neither, is not a recommendation.
-   *
-   * The caller owns what to do with this. Nothing here writes to an aircraft.
-   */
   function holdKindOfSummary(summary) {
     const zero = summary?.zeroHoldCount;
     const sustained = summary?.sustainedHoldCount;
@@ -1384,9 +1557,93 @@
     return null;
   }
 
-  function interpretHoldEvidence(evidence, options = {}) {
-    const codes = [];
+  /**
+   * The evidence for each kind of hold in a capture, as captures of their own:
+   * `[{kind, holdCount, evidence}]`, one entry per kind with at least one hold.
+   * Null when a capture pools both kinds and carries no per-kind split — one
+   * built before Stage 5b — because then nothing can be read per kind.
+   */
+  function evidenceByKind(evidence) {
+    if (evidence.kinds && typeof evidence.kinds === 'object') {
+      const out = [];
+      for (const holdKind of HOLD_KINDS) {
+        const entry = evidence.kinds[holdKind];
+        if (!entry || !(entry.holdCount > 0) || !entry.summary) {
+          continue;
+        }
+        out.push({
+          kind: holdKind,
+          holdCount: entry.holdCount,
+          evidence: {
+            ...evidence,
+            status: entry.status,
+            holds: (evidence.holds ?? []).filter(hold => hold.holdKind === holdKind),
+            summary: entry.summary
+          }
+        });
+      }
+      return out;
+    }
+    const only = holdKindOfSummary(evidence.summary);
+    return only === null
+      ? null
+      : [{kind: only, holdCount: evidence.summary.holdCount ?? null, evidence}];
+  }
 
+  const CONFIDENCE_ORDER = Object.freeze(['none', 'low', 'medium', 'high']);
+
+  function lowerConfidence(left, right) {
+    return CONFIDENCE_ORDER.indexOf(left) <= CONFIDENCE_ORDER.indexOf(right) ? left : right;
+  }
+
+  /**
+   * Interprets hold evidence as an indication about the I term.
+   *
+   * Field names here deliberately avoid instruction words (`delta`, `direction`,
+   * `recommendation`). This is a measurement, and nothing downstream should be
+   * able to mistake it for something to write to an aircraft.
+   *
+   * Deliberately conservative: it reports `hold` unless the evidence separates the
+   * two failure modes cleanly. A standing error that never crosses zero is too
+   * little I; error that keeps crossing zero at a low rate is too much. Evidence
+   * showing both, or neither, is not a recommendation.
+   *
+   * EACH KIND OF HOLD IS READ ON ITS OWN (Stage 5b, 4 October 2026). Until then a
+   * flight with holds at zero rate AND holds at a steady rate was refused whole
+   * (HOLD_KIND_MISMATCH): a hover and a turn test the integrator in different
+   * regimes, and averaging them describes neither. Each kind with at least
+   * `minimumHolds` holds is now read by itself, by the same rules and thresholds
+   * as before — a standing error still needs three holds of THAT kind — and:
+   *
+   *   - one kind readable: its reading is the axis's. A kind with too few holds
+   *     to read is set aside and says so (HOLDS_OF_ONE_KIND_TOO_FEW_TO_READ);
+   *   - both readable and agreeing: one reading over both, at the lower of the two
+   *     confidences, carrying every code either raised;
+   *   - both readable and DISAGREEING: refused (I_TERM_HOLDS_KINDS_DISAGREE).
+   *     Something differs between hovering and turning that this flight cannot
+   *     name, and a caller must not turn it into a mechanical claim either. The
+   *     brief asked for this where both kinds have three holds; it is applied
+   *     wherever both can be read, because a kind read from two holds can still
+   *     say "decrease" (hunting is read from two holds, as before), and an
+   *     all-clear over the hovers beside turns that hunt is the
+   *     confident-and-wrong answer. The one exception is the completeness rule
+   *     itself: a kind whose only objection to the other's standing error is that
+   *     it had too few holds for one — on the same side — has contradicted
+   *     nothing, and the standing error is read
+   *     (OTHER_KIND_TOO_FEW_FOR_A_STANDING_ERROR);
+   *   - neither readable (one hold of each): nothing is read
+   *     (TOO_FEW_HOLDS_OF_EITHER_KIND).
+   *
+   * The result names the kind it was read from (`kind`: 'zero', 'sustained',
+   * 'both' or null) and carries each kind's own reading in `kinds`. A capture
+   * built before Stage 5b, which pools both kinds with no split, is still refused
+   * whole with HOLD_KIND_MISMATCH. No real flight in the 31-flight corpus has a
+   * steady-rate hold of 5 s or more, so the per-kind paths rest on synthetic
+   * wiring tests and add no threshold.
+   *
+   * The caller owns what to do with this. Nothing here writes to an aircraft.
+   */
+  function interpretHoldEvidence(evidence, options = {}) {
     if (!evidence || evidence.kind !== HOLD_EVIDENCE_KIND) {
       return Object.freeze({indication: 'hold', confidence: 'none', codes: ['EVIDENCE_KIND_MISMATCH']});
     }
@@ -1397,13 +1654,99 @@
         codes: evidence.codes ?? ['EVIDENCE_INCONCLUSIVE']
       });
     }
-    if (holdKindOfSummary(evidence.summary) === null) {
+
+    const byKind = evidenceByKind(evidence);
+    if (byKind === null) {
       return Object.freeze({
         indication: 'hold',
         confidence: 'none',
-        codes: Object.freeze([...new Set([...(evidence.codes ?? []), 'HOLD_KIND_MISMATCH'])])
+        codes: Object.freeze([...new Set([...(evidence.codes ?? []), 'HOLD_KIND_MISMATCH'])]),
+        kind: null,
+        kinds: null
       });
     }
+
+    const readable = byKind.filter(entry => entry.evidence.status === 'captured');
+    const kinds = {zero: null, sustained: null};
+    for (const entry of readable) {
+      kinds[entry.kind] = Object.freeze({
+        ...interpretOneKind(entry.evidence, options),
+        holdCount: entry.holdCount
+      });
+    }
+    const frozenKinds = Object.freeze(kinds);
+
+    if (readable.length === 0) {
+      return Object.freeze({
+        indication: 'hold',
+        confidence: 'none',
+        codes: Object.freeze([...new Set([...(evidence.codes ?? []), 'TOO_FEW_HOLDS_OF_EITHER_KIND'])]),
+        kind: null,
+        kinds: frozenKinds
+      });
+    }
+
+    const setAside = byKind.length > readable.length ? ['HOLDS_OF_ONE_KIND_TOO_FEW_TO_READ'] : [];
+    if (readable.length === 1) {
+      const only = kinds[readable[0].kind];
+      return Object.freeze({
+        indication: only.indication,
+        confidence: only.confidence,
+        codes: Object.freeze([...only.codes, ...setAside]),
+        kind: readable[0].kind,
+        kinds: frozenKinds
+      });
+    }
+
+    const [first, second] = readable.map(entry => kinds[entry.kind]);
+    if (first.indication === second.indication) {
+      return Object.freeze({
+        indication: first.indication,
+        confidence: lowerConfidence(first.confidence, second.confidence),
+        codes: Object.freeze([...new Set([...first.codes, ...second.codes])]),
+        kind: 'both',
+        kinds: frozenKinds
+      });
+    }
+    // ONE EXCEPTION, and it is the completeness rule rather than a new one. A
+    // standing error is read only from `minimumHoldsForStandingError` holds of a
+    // kind. When one kind reads it and the other's ONLY objection is that it had
+    // fewer — its own holds on the same side, each clear of its own movement, as
+    // TOO_FEW_HOLDS_FOR_A_STANDING_ERROR certifies — the second kind has not
+    // contradicted anything it can measure, and the first kind's reading stands.
+    const standing = readable.find(entry => kinds[entry.kind].indication === 'increase');
+    const other = readable.find(entry => entry !== standing);
+    if (standing && other) {
+      const sideOf = entry => Math.sign(entry.evidence.summary?.meanSteadyStateErrorDps ?? 0);
+      const otherReading = kinds[other.kind];
+      if (otherReading.indication === 'hold'
+          && otherReading.codes.includes('TOO_FEW_HOLDS_FOR_A_STANDING_ERROR')
+          && sideOf(other) !== 0 && sideOf(other) === sideOf(standing)) {
+        const reading = kinds[standing.kind];
+        return Object.freeze({
+          indication: reading.indication,
+          confidence: reading.confidence,
+          codes: Object.freeze([...reading.codes, 'OTHER_KIND_TOO_FEW_FOR_A_STANDING_ERROR']),
+          kind: standing.kind,
+          kinds: frozenKinds
+        });
+      }
+    }
+    return Object.freeze({
+      indication: 'hold',
+      confidence: 'none',
+      codes: Object.freeze([...new Set([...(evidence.codes ?? []), 'I_TERM_HOLDS_KINDS_DISAGREE'])]),
+      kind: null,
+      kinds: frozenKinds
+    });
+  }
+
+  /**
+   * The reading of holds that are all of one kind: what `interpretHoldEvidence`
+   * did for every capture until Stage 5b, unchanged.
+   */
+  function interpretOneKind(evidence, options) {
+    const codes = [];
 
     const {
       errorDpsThreshold = HOLD_READING_THRESHOLDS.errorDps,
@@ -1691,6 +2034,74 @@
     return null;
   }
 
+  const COMPARED_HOLD_METRICS = Object.freeze([
+    'meanAbsoluteSteadyStateErrorDps',
+    'worstAbsoluteSteadyStateErrorDps',
+    'meanErrorDriftDpsPerSecond',
+    'meanErrorRippleRmsDps',
+    'meanErrorCrossingRateHz',
+    'meanITermRms'
+  ]);
+
+  /**
+   * The change in each compared metric between two hold summaries, and the
+   * verdict on the steady-state error when `verdictAllowed`. The tolerance
+   * discipline every hold comparison uses, whatever it is comparing.
+   */
+  function compareSummaries(from, to, limits, verdictAllowed) {
+    const codes = [];
+    const changes = {};
+    for (const metric of COMPARED_HOLD_METRICS) {
+      const before = from?.[metric];
+      const after = to?.[metric];
+      if (!Number.isFinite(before) || !Number.isFinite(after)) {
+        changes[metric] = null;
+        continue;
+      }
+      const difference = after - before;
+      const relative = before === 0 ? null : difference / Math.abs(before);
+      changes[metric] = {
+        baseline: before,
+        test: after,
+        difference: round(difference, 4),
+        relative: round(relative, 4),
+        significant: Number.isFinite(relative)
+          ? Math.abs(relative) > limits.comparisonToleranceRatio
+          : null
+      };
+    }
+
+    const errorChange = changes.meanAbsoluteSteadyStateErrorDps;
+
+    // A RELATIVE TOLERANCE ALONE IS NOT A RESULT.
+    //
+    // See `holdErrorNoiseFloorDps`. On its own, `significant` fired on six of six
+    // real flight pairs where the pilot had changed nothing, because a 78%
+    // relative move in a metric whose value is 0.03 deg/s is 0.023 deg/s. The
+    // verdict now needs the move to clear the measured flight-to-flight floor as
+    // well, and when it does not, the code says so rather than the verdict
+    // silently reading like a tolerance miss.
+    const floorDps = limits.holdErrorNoiseFloorDps;
+    const clearsNoiseFloor = Number.isFinite(errorChange?.difference)
+      && Number.isFinite(floorDps)
+      && Math.abs(errorChange.difference) > floorDps;
+
+    if (errorChange) {
+      // Recorded on the change itself so a caller reading one metric sees the two
+      // gates separately rather than a single boolean it has to guess the meaning
+      // of. The object is rebuilt rather than mutated: `changes` is handed out.
+      changes.meanAbsoluteSteadyStateErrorDps = {...errorChange, clearsNoiseFloor};
+    }
+
+    let verdict = 'unchanged';
+    if (verdictAllowed && errorChange?.significant && clearsNoiseFloor) {
+      verdict = errorChange.difference < 0 ? 'improved' : 'worsened';
+    } else if (errorChange?.significant) {
+      codes.push('CHANGE_BELOW_MEASURED_NOISE_FLOOR');
+    }
+    return {changes, verdict, codes};
+  }
+
   /** Compares two hold captures. Same tolerance discipline as the stop comparison. */
   function compareHoldEvidence(baseline, test, options = {}) {
     const limits = {...EVIDENCE_LIMITS, ...options.limits};
@@ -1735,97 +2146,101 @@
       });
     }
 
-    const compared = [
-      'meanAbsoluteSteadyStateErrorDps',
-      'worstAbsoluteSteadyStateErrorDps',
-      'meanErrorDriftDpsPerSecond',
-      'meanErrorRippleRmsDps',
-      'meanErrorCrossingRateHz',
-      'meanITermRms'
-    ];
+    // WITHIN EACH KIND OF HOLD (Stage 5b, 4 October 2026). Comparing a heading
+    // hold against a constant-rate turn would be comparing two different tests and
+    // calling the difference a result, so until Stage 5b any capture with both
+    // kinds was refused whole. Each kind that BOTH sides captured (two holds or
+    // more of it on each) is now compared with itself. One kind compared: its
+    // verdict is the comparison's. Both compared and agreeing: that verdict. Both
+    // compared and moving opposite ways: no verdict
+    // (HOLD_COMPARISON_KINDS_DISAGREE). No kind on both sides, or a capture from
+    // before Stage 5b that pools both kinds with no split: HOLD_KIND_MISMATCH, as
+    // before. `changes` is over everything compared; each kind's own is in `kinds`.
+    const baselineKinds = evidenceByKind(baseline);
+    const testKinds = evidenceByKind(test);
+    const comparedKinds = baselineKinds === null || testKinds === null
+      ? []
+      : HOLD_KINDS.filter(holdKind =>
+        baselineKinds.some(entry => entry.kind === holdKind && entry.evidence.status === 'captured')
+        && testKinds.some(entry => entry.kind === holdKind && entry.evidence.status === 'captured'));
+    const kindOf = (list, holdKind) => list.find(entry => entry.kind === holdKind).evidence.summary;
 
-    const changes = {};
-    for (const metric of compared) {
-      const from = baseline.summary[metric];
-      const to = test.summary[metric];
-      if (!Number.isFinite(from) || !Number.isFinite(to)) {
-        changes[metric] = null;
-        continue;
-      }
-      const difference = to - from;
-      const relative = from === 0 ? null : difference / Math.abs(from);
-      changes[metric] = {
-        baseline: from,
-        test: to,
-        difference: round(difference, 4),
-        relative: round(relative, 4),
-        significant: Number.isFinite(relative)
-          ? Math.abs(relative) > limits.comparisonToleranceRatio
-          : null
-      };
+    const kinds = {zero: null, sustained: null};
+    for (const holdKind of comparedKinds) {
+      const from = kindOf(baselineKinds, holdKind);
+      const to = kindOf(testKinds, holdKind);
+      const one = compareSummaries(from, to, limits, true);
+      kinds[holdKind] = Object.freeze({
+        changes: one.changes,
+        verdict: one.verdict,
+        codes: Object.freeze(one.codes),
+        holdCounts: Object.freeze({baseline: from.holdCount, test: to.holdCount})
+      });
     }
 
-    // Comparing a heading hold against a constant-rate turn would be comparing two
-    // different tests and calling the difference a result.
-    const baselineKind = holdKindOfSummary(baseline.summary);
-    const testKind = holdKindOfSummary(test.summary);
-    if (baselineKind === null || testKind === null || baselineKind !== testKind) {
-      addCode(codes, 'HOLD_KIND_MISMATCH');
-    }
-
-    const errorChange = changes.meanAbsoluteSteadyStateErrorDps;
-
-    // A RELATIVE TOLERANCE ALONE IS NOT A RESULT.
-    //
-    // See `holdErrorNoiseFloorDps`. On its own, `significant` fired on six of six
-    // real flight pairs where the pilot had changed nothing, because a 78%
-    // relative move in a metric whose value is 0.03 deg/s is 0.023 deg/s. The
-    // verdict now needs the move to clear the measured flight-to-flight floor as
-    // well, and when it does not, the code says so rather than the verdict
-    // silently reading like a tolerance miss.
-    const floorDps = limits.holdErrorNoiseFloorDps;
-    const clearsNoiseFloor = Number.isFinite(errorChange?.difference)
-      && Number.isFinite(floorDps)
-      && Math.abs(errorChange.difference) > floorDps;
-
-    if (errorChange) {
-      // Recorded on the change itself so a caller reading one metric sees the two
-      // gates separately rather than a single boolean it has to guess the meaning
-      // of. The object is rebuilt rather than mutated: `changes` is handed out.
-      changes.meanAbsoluteSteadyStateErrorDps = {...errorChange, clearsNoiseFloor};
-    }
+    // What both sides cover: one kind's summaries, or the whole of each.
+    const single = comparedKinds.length === 1;
+    const pooled = compareSummaries(
+      single ? kindOf(baselineKinds, comparedKinds[0]) : baseline.summary,
+      single ? kindOf(testKinds, comparedKinds[0]) : test.summary,
+      limits, comparedKinds.length > 0
+    );
+    const changes = pooled.changes;
 
     let verdict = 'unchanged';
-    if (!codes.includes('HOLD_KIND_MISMATCH')
-        && errorChange?.significant && clearsNoiseFloor) {
-      verdict = errorChange.difference < 0 ? 'improved' : 'worsened';
-    } else if (errorChange?.significant) {
-      addCode(codes, 'CHANGE_BELOW_MEASURED_NOISE_FLOOR');
+    if (comparedKinds.length === 0) {
+      addCode(codes, 'HOLD_KIND_MISMATCH');
+      for (const code of pooled.codes) {
+        addCode(codes, code);
+      }
+    } else {
+      const verdicts = comparedKinds.map(holdKind => kinds[holdKind].verdict);
+      for (const holdKind of comparedKinds) {
+        for (const code of kinds[holdKind].codes) {
+          addCode(codes, code);
+        }
+      }
+      if (verdicts.every(value => value === verdicts[0])) {
+        verdict = verdicts[0];
+      } else {
+        addCode(codes, 'HOLD_COMPARISON_KINDS_DISAGREE');
+      }
     }
+    const status = codes.includes('HOLD_KIND_MISMATCH')
+      || codes.includes('HOLD_COMPARISON_KINDS_DISAGREE') ? 'inconclusive' : 'captured';
+
+    const countsOf = side => (single
+      ? kindOf(side === 'baseline' ? baselineKinds : testKinds, comparedKinds[0]).holdCount
+      : (side === 'baseline' ? baseline : test).summary?.holdCount ?? null);
 
     return Object.freeze({
       schemaVersion: PID_EVIDENCE_SCHEMA_VERSION,
       kind: HOLD_EVIDENCE_KIND,
       axis: baseline.axis,
-      status: codes.includes('HOLD_KIND_MISMATCH') ? 'inconclusive' : 'captured',
+      status,
       codes,
       changes,
       verdict,
 
+      /** The kinds of hold compared, each with itself. Empty when none could be. */
+      comparedKinds: Object.freeze(comparedKinds),
+      kinds: Object.freeze(kinds),
+
       /**
-       * How many hold segments each side's verdict rests on.
+       * How many hold segments each side's verdict rests on: of the one kind
+       * compared, or of the whole capture when both kinds were.
        *
        * Reported rather than gated on here — see `minimumComparisonHolds`. Without
        * this a caller cannot tell a verdict resting on one hold each side from one
        * resting on twenty, and in this corpus the former is the common case.
        */
       holdCounts: Object.freeze({
-        baseline: baseline.summary?.holdCount ?? null,
-        test: test.summary?.holdCount ?? null
+        baseline: countsOf('baseline'),
+        test: countsOf('test')
       }),
 
       /** The floor the verdict was measured against, carried with the verdict. */
-      noiseFloorDps: floorDps
+      noiseFloorDps: limits.holdErrorNoiseFloorDps
     });
   }
 
@@ -1857,6 +2272,7 @@
     describeDirectionalComparison: describeDirectionalComparison,
     compareDirectionalStopEvidence: compareDirectionalStopEvidence,
     detectHoldSegments: detectHoldSegments,
+    HOLD_KINDS: HOLD_KINDS,
     buildHoldEvidence: buildHoldEvidence,
     HOLD_READING_THRESHOLDS: HOLD_READING_THRESHOLDS,
     interpretHoldEvidence: interpretHoldEvidence,

@@ -75,6 +75,9 @@ import {
   unmatchedTone
 } from '../src/analysis/recommendations.mjs';
 
+// By namespace, for the reason given at pidEvidence below.
+import * as recommendationsModule from '../src/analysis/recommendations.mjs';
+import {coherenceNullLevel, welchCoherence} from '../src/analysis/low-frequency.mjs';
 import {decodeLog} from '../src/blackbox/decode.mjs';
 import {buildAnalysisRecords, detectStopEvents, STOP_DETECTION_DEFAULTS}
   from '../src/analysis/records.mjs';
@@ -291,7 +294,17 @@ function simulateHoldFlight({
   iTermStart = 0,
   // The firmware's own scaling of the logged P, I and D terms, which RotorLens
   // does not know. The loop runs on the unscaled terms; only the log is scaled.
-  loggedTermScale = 1
+  loggedTermScale = 1,
+  // A small stick input added to the command everywhere, `stick(t)` in deg/s:
+  // a pilot correcting a hover (Stage 5b). Small enough to stay inside one
+  // hold's band, so the holds are still holds.
+  stick = null,
+  // The collective, `collective(t)` in rcCommand units, logged as the records'
+  // collective, and the yaw torque each unit of it puts on the tail (Stage 5b):
+  // main-rotor torque that the tail must hold against, which the integrator
+  // carries when nothing else does.
+  collective = null,
+  collectiveTorquePerUnit = 0
 } = {}) {
   const plant = {
     dt: 0.001, delaySamples: 3, actuatorTau: 0.020, derivativeTau: 0.003,
@@ -341,6 +354,10 @@ function simulateHoldFlight({
         || (t >= splitAtS && t < splitAtS + splitPulseS)) {
       command = splitAmplitudeDps;
     }
+    if (stick) {
+      command += stick(t);
+    }
+    const collectiveNow = collective ? collective(t) : 0;
     const error = command - measured;
     integral += error * plant.dt;
     // The clamp is applied to the TERM, which is where a flight controller
@@ -369,7 +386,7 @@ function simulateHoldFlight({
       external += torque.dps2 * Math.sin(2 * Math.PI * torque.hz * t + (torque.phase ?? 0));
     }
     rate += (plant.controlAuthority * actuator - plant.damping * rate
-      + disturbanceDps2 + external + gust) * plant.dt;
+      + disturbanceDps2 + external + gust + collectiveTorquePerUnit * collectiveNow) * plant.dt;
 
     const noise = (random() - 0.5) * 2 * noiseDps;
     measured += (rate + noise * 0.25 - measured) * (plant.dt / plant.gyroTau);
@@ -385,7 +402,7 @@ function simulateHoldFlight({
       setpoint, gyro, raw,
       terms: [pTerm * loggedTermScale, iTerm * loggedTermScale, dTerm * loggedTermScale],
       headspeed: headspeedRpm,
-      collective: 0,
+      collective: collectiveNow,
       vbat: 24
     });
   }
@@ -1353,6 +1370,28 @@ function everyResult() {
     stops: [1, 12, 23, 34].map(atS => ({atS, amplitudeDps: 120, holdS: 0.3}))
   }).map(record => (record.timeUs > 14e6 && record.timeUs < 22e6
     ? {...record, headspeed: wobbling(record.timeUs / 1e6)} : record)), 'yaw'));
+  // And the roads added in Stage 5b (4 October 2026): one hold of each kind,
+  // hovers and turns that disagree, a wobble that follows the stick, and a yaw
+  // integrator carrying the collective. Written out here rather than by name,
+  // because the named fixtures are defined further down this file.
+  results.push(recommendFor(simulateHoldFlight({
+    gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: 400, durationS: 15,
+    commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 8, untilS: 14.5, dps: 150}]
+  }), 'yaw'));
+  results.push(recommendFor(simulateHoldFlight({
+    gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: 400, durationS: 40.9,
+    commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 7.9, untilS: 14.4, dps: 150},
+      {atS: 20.9, untilS: 27.4, dps: 150}, {atS: 33.9, untilS: 40.4, dps: 150}]
+  }), 'yaw'));
+  results.push(recommendFor(simulateHoldFlight({
+    gains: HOLD_SOFT, durationS: 28, stick: t => 6.5 * Math.sin(2 * Math.PI * 1.0 * t)
+  }), 'yaw'));
+  results.push(recommendFor(simulateHoldFlight({
+    gains: HOLD_NOMINAL, disturbanceDps2: 200, durationS: 60,
+    commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 16, untilS: 16.4, dps: 120},
+      {atS: 31, untilS: 31.4, dps: 120}, {atS: 46, untilS: 46.4, dps: 120}],
+    collective: t => 120 + 60 * Math.sin(2 * Math.PI * 0.04 * t), collectiveTorquePerUnit: 3
+  }), 'yaw'));
   return results;
 }
 
@@ -1402,7 +1441,8 @@ test('only an adjustment may name a direction, and every adjustment is earned', 
   for (const id of ['AXIS_DOES_NOT_ARREST', 'I_TERM_HOLDS_MIXED', 'HEADSPEED_READING_DROPPED_OUT',
     'I_TERM_SIGNATURES_CONFLICT', 'SLOW_WANDER_NOT_FROM_THE_I_TERM',
     'HEADSPEED_TOO_FEW_SEGMENTS_TO_JUDGE', 'HEADSPEED_MOVED_IN_SOME_SEGMENTS', 'I_TOO_LOW',
-    'I_TERM_NOT_JUDGED']) {
+    'I_TERM_NOT_JUDGED', 'I_TERM_HOLDS_KINDS_DISAGREE', 'HUNTING_FOLLOWS_THE_STICK',
+    'YAW_HOLD_MOVES_WITH_COLLECTIVE']) {
     assert.ok(seen.has(id), `${id} is not reached by everyResult(), so this guard does not read it`);
   }
 });
@@ -4758,13 +4798,18 @@ test('an error that swings outside the I-term band is not described as one that 
     assert.ok(!plain.codes.includes('SLOW_MOVEMENT_BELOW_I_TERM_BAND'));
   });
 
-test('a flight whose holds mix hover and steady turns is not given an I-term all-clear', () => {
+test('a flight whose holds mix hover and steady turns is read per kind, never cleared unjudged', () => {
   // The aircraft has NO integrator and a standing torque to hold against —
   // the fixture that earns "Raise yaw I" — and the pilot flew it the way
   // pilots fly: hovers, and two steady pirouettes. Zero-rate holds and
-  // steady-rate holds test the I term in different regimes, so the engine
-  // judges neither, which is right. Saying "nothing calls for an I-term
-  // change" about holds it never judged is not.
+  // steady-rate holds test the I term in different regimes. Until Stage 5b the
+  // engine judged neither, and before that it called the flight all-clear.
+  //
+  // UPDATED 4 October 2026 (Stage 5b). Each kind is now read on its own: the
+  // three hovers carry the standing error, and the two pirouettes sit off on the
+  // same side — too few for a standing error, and that is all they say. The
+  // hovers' reading stands, and this flight earns what the all-hover control
+  // below earns, "Raise yaw I", from the hovers.
   const lead = {atS: 1, amplitudeDps: 120, holdS: 0.3};
   const mixed = simulateHoldFlight({
     gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: 400, durationS: 60,
@@ -4772,42 +4817,63 @@ test('a flight whose holds mix hover and steady turns is not given an I-term all
   });
   const result = recommendFor(mixed, 'yaw');
   const ids = result.findings.map(entry => entry.id);
-  const summary = result.gates.holds.yaw.evidence.summary;
+  const hold = result.gates.holds.yaw;
+  const summary = hold.evidence.summary;
   assert.ok(summary.zeroHoldCount >= 2 && summary.sustainedHoldCount >= 2,
     `the fixture must mix the two kinds: ${summary.zeroHoldCount} zero, `
     + `${summary.sustainedHoldCount} sustained`);
-  assert.ok(result.gates.holds.yaw.codes.includes('HOLD_KIND_MISMATCH'));
+  assert.ok(!hold.codes.includes('HOLD_KIND_MISMATCH'), hold.codes.join(','));
+  assert.equal(hold.kind, 'zero');
+  assert.equal(hold.kinds.zero.indication, 'increase');
+  assert.ok(hold.kinds.sustained.codes.includes('TOO_FEW_HOLDS_FOR_A_STANDING_ERROR'));
+  assert.ok(hold.codes.includes('OTHER_KIND_TOO_FEW_FOR_A_STANDING_ERROR'), hold.codes.join(','));
 
   assert.ok(!ids.includes('I_TERM_WITHIN_TOLERANCE'),
     `an all-clear without a judgement: ${ids.join(', ')}`);
-  assert.deepEqual(adjustmentIds(result), []);
-  const said = result.findings.find(entry => entry.id === 'I_TERM_HOLDS_MIXED');
-  assert.ok(said, `the pilot must be told why, and what to fly: ${ids.join(', ')}`);
-  assert.equal(said.kind, 'next-flight');
-  assert.equal(said.confidence, 'low');
-  assert.equal(said.direction, null);
-  assert.equal(said.actNow, false);
-  assert.match(said.headline, /hover|zero rate|still/i);
-  assert.match(said.headline, /turn|pirouette|steady rate/i);
-  assert.doesNotMatch(`${said.headline} ${said.reasoning}`, /nothing .*calls for/i);
-  // What to fly: two or more of ONE kind, each long enough to measure.
-  assert.match(said.confirm, /\b2\b|two/i);
-  assert.match(said.confirm, /hover/i);
-  assert.match(said.confirm, /pirouette|turn/i);
-  assert.match(said.confirm, /5 s/);
-  assert.ok(said.basis.some(entry => /zero rate/.test(entry.label)
-    && entry.value === summary.zeroHoldCount), JSON.stringify(said.basis));
-  assert.ok(said.basis.some(entry => /steady rate/.test(entry.label)
-    && entry.value === summary.sustainedHoldCount));
+  assert.deepEqual(adjustmentIds(result), ['I_TOO_LOW']);
+  const said = result.findings.find(entry => entry.id === 'I_TOO_LOW');
+  assert.match(said.reasoning, /still hovers/, said.reasoning);
+  assert.match(said.reasoning, new RegExp(`in every one of the ${summary.zeroHoldCount} holds`),
+    said.reasoning);
 
   // CONTROL: the same aircraft, same schedule, with the pirouettes cut to short
-  // pulses so every hold is a hover, earns "Raise yaw I". That is what the mixed
-  // flight's all-clear was hiding.
+  // pulses so every hold is a hover, earns "Raise yaw I" the same way.
   const hovers = simulateHoldFlight({
     gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: 400, durationS: 60,
     stops: [lead, {atS: 13, amplitudeDps: 120, holdS: 0.3}, {atS: 37, amplitudeDps: -120, holdS: 0.3}]
   });
   assert.deepEqual(adjustmentIds(recommendFor(hovers, 'yaw')), ['I_TOO_LOW']);
+
+  // One hover and one turn: neither kind has the two holds a reading needs, so
+  // nothing is judged, and the pilot is told why and what to fly.
+  const oneOfEach = recommendFor(simulateHoldFlight({
+    gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: 400, durationS: 15,
+    commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 8, untilS: 14.5, dps: 150}]
+  }), 'yaw');
+  const oneIds = oneOfEach.findings.map(entry => entry.id);
+  const oneSummary = oneOfEach.gates.holds.yaw.evidence.summary;
+  assert.equal(oneSummary.zeroHoldCount, 1);
+  assert.equal(oneSummary.sustainedHoldCount, 1);
+  assert.ok(oneOfEach.gates.holds.yaw.codes.includes('TOO_FEW_HOLDS_OF_EITHER_KIND'));
+  assert.ok(!oneIds.includes('I_TERM_WITHIN_TOLERANCE'), oneIds.join(', '));
+  assert.deepEqual(adjustmentIds(oneOfEach), []);
+  const told = oneOfEach.findings.find(entry => entry.id === 'I_TERM_HOLDS_MIXED');
+  assert.ok(told, `the pilot must be told why, and what to fly: ${oneIds.join(', ')}`);
+  assert.equal(told.kind, 'next-flight');
+  assert.equal(told.confidence, 'low');
+  assert.equal(told.direction, null);
+  assert.equal(told.actNow, false);
+  assert.match(told.headline, /hover|zero rate|still/i);
+  assert.match(told.headline, /turn|pirouette|steady rate/i);
+  assert.doesNotMatch(`${told.headline} ${told.reasoning}`, /nothing .*calls for/i);
+  // What to fly: a full reading's worth of ONE kind, each long enough to measure.
+  assert.match(told.confirm, new RegExp(`Fly ${pidEvidence.HOLDS_FOR_A_FULL_READING} or more`));
+  assert.match(told.confirm, /hover/i);
+  assert.match(told.confirm, /pirouette|turn/i);
+  assert.match(told.confirm, /5 s/);
+  assert.ok(told.basis.some(entry => /zero rate/.test(entry.label) && entry.value === 1),
+    JSON.stringify(told.basis));
+  assert.ok(told.basis.some(entry => /steady rate/.test(entry.label) && entry.value === 1));
 });
 
 /* =========================================================================== */
@@ -4852,7 +4918,18 @@ const I_TERM_TROUBLE_CODES = Object.freeze([
   // cover hid, and the side a turn-following error was on.
   'STANDING_ERROR_WITH_UNMEASURED_BAND',
   'RATE_SHORT_OF_COMMAND_IN_EVERY_TURN',
-  'RATE_PAST_COMMAND_IN_EVERY_TURN'
+  'RATE_PAST_COMMAND_IN_EVERY_TURN',
+  // Stage 5b, 4 October 2026: kinds of hold read apart and disagreeing, or too
+  // few of either; a hunt that followed the stick or could not be checked
+  // against it; a yaw integrator carrying the collective or not checked for it;
+  // and a standing error read from one kind beside too few of the other.
+  'I_TERM_HOLDS_KINDS_DISAGREE',
+  'TOO_FEW_HOLDS_OF_EITHER_KIND',
+  'HUNTING_FOLLOWS_THE_STICK',
+  'STICK_COHERENCE_NOT_MEASURED',
+  'YAW_HOLD_MOVES_WITH_COLLECTIVE',
+  'COLLECTIVE_CORRELATION_NOT_MEASURED',
+  'OTHER_KIND_TOO_FEW_FOR_A_STANDING_ERROR'
 ]);
 
 /** The finding the I-term question produced on `axis`, whatever it was. */
@@ -5959,7 +6036,27 @@ test('the I-term all-clear never co-occurs with a sign of trouble in the holds',
     huntUnderNoise: r => ({gains: HOLD_SOFT, gustDps2: 2200, noiseDps: 100 + r() * 300}),
     wanderUnderFast: r => ({gains: HOLD_NOMINAL, externalTorqueDps2: 3000, externalTorqueHz: 0.2,
       externalTorquePhase: r() * 6.28,
-      extraTorques: [{dps2: 2000 + r() * 18000, hz: 3.5 + r() * 8.5}]})
+      extraTorques: [{dps2: 2000 + r() * 18000, hz: 3.5 + r() * 8.5}]}),
+    // Stage 5b, 4 October 2026: one hold of each kind; hovers that sit off and
+    // turns that do not; a wobble driven by the stick; and a yaw integrator
+    // carrying a moving collective. Each must keep the all-clear shut.
+    oneOfEach: r => ({gains: {...HOLD_NOMINAL, ki: r() < 0.5 ? 0 : 0.05},
+      disturbanceDps2: 200 + r() * 300, durationS: 15,
+      commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 8, untilS: 14.5, dps: 150}]}),
+    kindsDisagree: r => ({gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: 350 + r() * 150,
+      durationS: 40.9,
+      commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 7.9, untilS: 14.4, dps: 150},
+        {atS: 20.9, untilS: 27.4, dps: 150}, {atS: 33.9, untilS: 40.4, dps: 150}]}),
+    stickOnSoft: r => {
+      const amplitude = 6 + r();
+      const hz = 0.8 + r() * 0.4;
+      return {gains: HOLD_SOFT, durationS: 28, stick: t => amplitude * Math.sin(2 * Math.PI * hz * t)};
+    },
+    collectiveOnNominal: r => ({gains: HOLD_NOMINAL, disturbanceDps2: 200, durationS: 60,
+      commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 16, untilS: 16.4, dps: 120},
+        {atS: 31, untilS: 31.4, dps: 120}, {atS: 46, untilS: 46.4, dps: 120}],
+      collective: t => 120 + 60 * Math.sin(2 * Math.PI * 0.04 * t),
+      collectiveTorquePerUnit: 2.5 + r()})
   };
   const random = rng(4321);
   const violations = [];
@@ -6009,11 +6106,15 @@ test('the I-term all-clear never co-occurs with a sign of trouble in the holds',
   // Not vacuous: the all-clear was reached, and so was every kind of trouble
   // it must never sit on.
   assert.ok(cleared >= 6, `the all-clear must actually be reached, saw ${cleared}`);
+  // HOLD_KIND_MISMATCH left this list in Stage 5b: each kind of hold is read on
+  // its own now, and what replaced the all-or-nothing refusal is listed instead.
   for (const code of ['STEADY_STATE_ERROR_PRESENT', 'LOW_FREQUENCY_HUNTING',
     'CONFLICTING_HOLD_SIGNATURES', 'SLOW_MOVEMENT_BELOW_I_TERM_BAND',
     'I_TERM_DOES_NOT_OSCILLATE_WITH_THE_ERROR', 'I_TERM_TOO_SMALL_A_SHARE_OF_THE_OUTPUT',
-    'HOLD_KIND_MISMATCH', 'I_TERM_NOT_LOGGED', 'OSCILLATION_ABOVE_I_TERM_BAND',
-    'SLOW_RIPPLE_NOT_CLEAR_OF_NOISE', 'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR']) {
+    'I_TERM_NOT_LOGGED', 'OSCILLATION_ABOVE_I_TERM_BAND',
+    'SLOW_RIPPLE_NOT_CLEAR_OF_NOISE', 'TOO_FEW_HOLDS_FOR_A_STANDING_ERROR',
+    'TOO_FEW_HOLDS_OF_EITHER_KIND', 'I_TERM_HOLDS_KINDS_DISAGREE', 'HUNTING_FOLLOWS_THE_STICK',
+    'YAW_HOLD_MOVES_WITH_COLLECTIVE', 'OTHER_KIND_TOO_FEW_FOR_A_STANDING_ERROR']) {
     assert.ok(reached.has(code), `the sweep never reached ${code}, so it proves nothing about it`);
   }
 });
@@ -6727,9 +6828,21 @@ test('every count of holds the copy asks a pilot to fly is the count a full read
     ['no PID terms', 'I_TERM_NOT_LOGGED', simulateHoldFlight({gains: noI, disturbanceDps2: 400,
       ...THREE_HOLDS}).map(record => ({...record, terms: [0, 0, 0]}))],
     ['two holds', 'I_TERM_NOT_JUDGED', simulateHoldFlight({gains: noI, disturbanceDps2: 500, ...two})],
-    ['hovers and turns', 'I_TERM_HOLDS_MIXED', simulateHoldFlight({gains: noI, disturbanceDps2: 300,
-      durationS: 60, stops: [{atS: 1, amplitudeDps: 120, holdS: 0.3},
-        {atS: 13, amplitudeDps: 60, holdS: 11}, {atS: 37, amplitudeDps: -60, holdS: 11}]})],
+    // One of each kind since Stage 5b: each kind is read on its own, so this
+    // card now means neither had enough holds.
+    ['a hover and a turn', 'I_TERM_HOLDS_MIXED', simulateHoldFlight({gains: noI, disturbanceDps2: 300,
+      durationS: 15, commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 8, untilS: 14.5, dps: 150}]})],
+    ['hovers and turns that disagree', 'I_TERM_HOLDS_KINDS_DISAGREE', simulateHoldFlight({gains: noI,
+      disturbanceDps2: 400, durationS: 40.9,
+      commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 7.9, untilS: 14.4, dps: 150},
+        {atS: 20.9, untilS: 27.4, dps: 150}, {atS: 33.9, untilS: 40.4, dps: 150}]})],
+    ['a wobble that follows the stick', 'HUNTING_FOLLOWS_THE_STICK', simulateHoldFlight({
+      gains: HOLD_SOFT, durationS: 28, stick: t => 6.5 * Math.sin(2 * Math.PI * 1.0 * t)})],
+    ['an integrator carrying the collective', 'YAW_HOLD_MOVES_WITH_COLLECTIVE', simulateHoldFlight({
+      gains: HOLD_NOMINAL, disturbanceDps2: 200, durationS: 60,
+      commands: [{atS: 1, untilS: 1.4, dps: 120}, {atS: 16, untilS: 16.4, dps: 120},
+        {atS: 31, untilS: 31.4, dps: 120}, {atS: 46, untilS: 46.4, dps: 120}],
+      collective: t => 120 + 60 * Math.sin(2 * Math.PI * 0.04 * t), collectiveTorquePerUnit: 3})],
     ['a reading that flips', 'I_TERM_VERDICT_UNSTABLE',
       simulateHoldFlight({gains: HOLD_SOFT, gustDps2: 600})],
     // One hover, its head speed wandering: the hold is lost, and the governor
@@ -6740,7 +6853,8 @@ test('every count of holds the copy asks a pilot to fly is the count a full read
   ];
   const mustAsk = new Set(['HOLD_EVIDENCE_PROVISIONAL', 'I_TOO_LOW', 'I_TOO_HIGH',
     'I_TERM_SIGNATURES_CONFLICT', 'I_TERM_NOT_LOGGED', 'I_TERM_NOT_JUDGED', 'I_TERM_HOLDS_MIXED',
-    'I_TERM_VERDICT_UNSTABLE', 'NO_HOLD_EVIDENCE', 'HEADSPEED_TOO_FEW_SEGMENTS_TO_JUDGE']);
+    'I_TERM_VERDICT_UNSTABLE', 'NO_HOLD_EVIDENCE', 'HEADSPEED_TOO_FEW_SEGMENTS_TO_JUDGE',
+    'I_TERM_HOLDS_KINDS_DISAGREE', 'HUNTING_FOLLOWS_THE_STICK', 'YAW_HOLD_MOVES_WITH_COLLECTIVE']);
   const disagree = [];
   const asked = new Set();
   for (const [label, id, records] of flights) {
@@ -6812,4 +6926,694 @@ test('a fast shake over holds whose error changed side says to settle the shake 
     assert.match(said.reasoning, /one side in \d+ and on the other in \d+/, said.reasoning);
     assert.doesNotMatch(spokenText(said), /wandered slowly|slower than/i, spokenText(said));
   }
+});
+
+/* =========================================================================== */
+/* STAGE 5b, 4 October 2026: hover holds that survive ordinary flying, each   */
+/* kind of hold read on its own, and two guards on the I-term reading.        */
+/*                                                                             */
+/* Every fixture here proves WIRING. No threshold below is calibrated on      */
+/* them: the guards' cut-offs are statistical null levels computed from       */
+/* alpha and the evidence count (src/analysis/low-frequency.mjs), and the     */
+/* per-kind reading adds no threshold at all.                                 */
+/* =========================================================================== */
+
+test('the hold sweep carries the null levels and Welch segment lengths of the guards', () => {
+  assert.deepEqual([...HOLD_SWEEP.stickCoherenceAlpha], [0.01, 0.05]);
+  assert.deepEqual([...HOLD_SWEEP.welchSegmentUs], [2_560_000, 5_120_000]);
+  assert.deepEqual([...HOLD_SWEEP.collectiveCorrelationAlpha], [0.01, 0.05]);
+  // The I-term grid itself is unchanged.
+  assert.deepEqual([...HOLD_SWEEP.huntingSmoothingUs], [74_000, 100_000, 148_000, 222_000, 300_000]);
+  assert.deepEqual([...HOLD_SWEEP.huntingRippleDps], [1, 1.5, 2, 3, 4]);
+});
+
+/** A soft loop whose stick is moved at 1 Hz, 6.5 deg/s, through the whole flight. */
+const STICK_WOBBLE = Object.freeze({
+  gains: HOLD_SOFT, durationS: 28, stick: t => 6.5 * Math.sin(2 * Math.PI * 1.0 * t)
+});
+
+/** The soft loop hunting in gusty air, the stick moving a little at 0.2 Hz, off the hunt. */
+const STICK_ELSEWHERE = Object.freeze({
+  gains: HOLD_SOFT, gustDps2: 2200, stick: t => 2 * Math.sin(2 * Math.PI * 0.2 * t)
+});
+
+/** The same, flown as two holds of about 25 s. */
+const STICK_ELSEWHERE_LONG_HOLDS = Object.freeze({...STICK_ELSEWHERE, durationS: 52, splitAtS: 26});
+
+test('a wobble that follows the stick is the pilot, not the integrator', () => {
+  // The pilot moves the pedal a little and steadily during each hover; a soft
+  // loop barely follows, so the error swings with the stick. Everything the
+  // engine checked before Stage 5b says "the I term is hunting": the crossing
+  // rate is in band, the ripple clears every threshold, the I term crosses at
+  // the same rate and is most of the output's movement. The coherence between
+  // stick and error is what says it was the pilot.
+  const records = simulateHoldFlight(STICK_WOBBLE);
+  const hold = assessHoldIndication(records, 'yaw');
+  assert.equal(hold.shippedIndication, 'decrease', hold.codes.join(','));
+  assert.equal(hold.sweepStable, true,
+    `the fixture must survive the old sweep, or the guard is not what refuses it: ${hold.sweepIndicationsSeen}`);
+  assert.ok(!hold.codes.includes('I_TERM_DOES_NOT_OSCILLATE_WITH_THE_ERROR'), hold.codes.join(','));
+  assert.ok(!hold.codes.includes('I_TERM_TOO_SMALL_A_SHARE_OF_THE_OUTPUT'), hold.codes.join(','));
+
+  assert.ok(hold.codes.includes('HUNTING_FOLLOWS_THE_STICK'), hold.codes.join(','));
+  assert.equal(hold.indication, 'hold');
+  assert.equal(hold.confidence, 'none');
+  const points = hold.stickCoherence.points;
+  assert.equal(points.length, HOLD_SWEEP.stickCoherenceAlpha.length * HOLD_SWEEP.welchSegmentUs.length);
+  const voted = points.filter(point => point.verdict !== 'abstained');
+  assert.ok(voted.length > 0);
+  for (const point of voted) {
+    assert.ok(point.coherence > point.threshold, JSON.stringify(point));
+    assert.equal(point.verdict, 'follows-the-stick');
+  }
+
+  const result = recommendFor(records, 'yaw');
+  assert.deepEqual(adjustmentIds(result), []);
+  const said = result.findings.find(entry => entry.id === 'HUNTING_FOLLOWS_THE_STICK');
+  assert.ok(said, result.findings.map(entry => entry.id).join(', '));
+  assert.equal(said.kind, 'next-flight');
+  assert.equal(said.direction, null);
+  assert.match(said.headline, /stick|pedal/i);
+  assert.match(said.confirm, /pedals? (?:left )?alone|hands off|still/i);
+  assert.doesNotMatch(`${said.headline} ${said.reasoning}`, /I term is right|I is right/i);
+});
+
+test('an integrator that hunts on its own is still read, with the stick still or moving '
+  + 'at another frequency', () => {
+  // The control for the test above: the over-large integrator in gusty air,
+  // which earns "Lower I". With the stick still, nothing in it is coherent with
+  // the stick at all; with a slow stick input at a frequency the hunt is not
+  // at, the coherence at the hunt's frequency stays under its null.
+  const still = assessHoldIndication(simulateHoldFlight({gains: HOLD_SOFT, gustDps2: 2200}), 'yaw');
+  assert.equal(still.indication, 'decrease', still.codes.join(','));
+  assert.ok(!still.codes.includes('HUNTING_FOLLOWS_THE_STICK'));
+
+  // Two holds of about 25 s, not the default 10 and 15 (review of round one):
+  // at the default holds this hunt sits under the 2.56 s length's resolution,
+  // and at 5.12 s they give six segments, too few for a coherence under its
+  // chance level to say anything (STICK_COHERENCE_VOTE). The test below keeps
+  // the short flight.
+  const moving = assessHoldIndication(simulateHoldFlight(STICK_ELSEWHERE_LONG_HOLDS), 'yaw');
+  assert.equal(moving.indication, 'decrease', moving.codes.join(','));
+  assert.ok(moving.stickCoherence.points.some(point => point.state === 'measured'
+    && point.verdict === 'below-null'), JSON.stringify(moving.stickCoherence.points));
+});
+
+test('stick coherence that cannot be measured refuses a "Lower I" rather than passing it', () => {
+  // Holds too short for two Welch segments at every length tried: whether the
+  // wobble followed the stick could not be tested, and an untested guard does
+  // not pass a reading.
+  const records = simulateHoldFlight({gains: HOLD_SOFT, gustDps2: 2200});
+  const grid = {...HOLD_SWEEP, welchSegmentUs: [60_000_000]};
+  const hold = assessHoldIndication(records, 'yaw', {grid});
+  assert.equal(hold.shippedIndication, 'decrease');
+  assert.ok(hold.codes.includes('STICK_COHERENCE_NOT_MEASURED'), hold.codes.join(','));
+  assert.equal(hold.indication, 'hold');
+  const result = recommendFor(records, 'yaw', cleanAirframe(), {holdOptions: {grid}});
+  assert.deepEqual(adjustmentIds(result), []);
+  const said = result.findings.find(entry => entry.axis === 'yaw' && entry.id === 'I_TERM_NOT_JUDGED');
+  assert.ok(said, result.findings.map(entry => entry.id).join(', '));
+  assert.ok(said.codes.includes('STICK_COHERENCE_NOT_MEASURED'));
+});
+
+const STICK_COHERENCE_VOTE = recommendationsModule.STICK_COHERENCE_VOTE ?? {};
+
+test('the weakest stick-coherence vote that counts is derived from the corpus, not tuned', () => {
+  // Review of round one (4 October 2026). A vote whose chance level is high
+  // passes nearly anything: with two Welch segments it is 0.95 at alpha 0.05,
+  // and a failure to reject there was counted as "the wobble was not the
+  // stick". STICK_COHERENCE_VOTE.maximumNullLevel is where a vote stops being
+  // able to see the least stick coherence at which the guard found the stick
+  // on the corpus (0.29) with the conventional 80 % power. Checked two ways.
+  const {lowestCorpusStickCoherence: coherence, requiredPower, maximumNullLevel}
+    = STICK_COHERENCE_VOTE;
+  assert.deepEqual([coherence, requiredPower, maximumNullLevel], [0.29, 0.8, 0.2]);
+
+  // 1. The model the null formula itself assumes: n independent segments of
+  // complex Gaussian spectra with a true coherence of 0.29. At every alpha in
+  // the sweep, the first whole segment count whose null is at or under the
+  // limit detects that coherence at least 80 % of the time — the limit is never
+  // too loose. At alpha 0.05, the largest in the sweep and so the one whose
+  // votes need fewest segments, the last count over the limit detects it less
+  // than 80 % of the time — the limit is no stricter there than 80 % asks.
+  // (At alpha 0.01 it is a segment stricter; see the constant.)
+  const random = rng(4242);
+  const normal = () => Math.sqrt(-2 * Math.log(Math.max(random(), 1e-12)))
+    * Math.cos(2 * Math.PI * random());
+  const estimate = segments => {
+    const a = Math.sqrt(coherence);
+    const b = Math.sqrt(1 - coherence);
+    let sxx = 0;
+    let syy = 0;
+    let re = 0;
+    let im = 0;
+    for (let k = 0; k < segments; k += 1) {
+      const [xr, xi, nr, ni] = [normal(), normal(), normal(), normal()];
+      const [yr, yi] = [a * xr + b * nr, a * xi + b * ni];
+      sxx += xr * xr + xi * xi;
+      syy += yr * yr + yi * yi;
+      re += xr * yr + xi * yi;
+      im += xi * yr - xr * yi;
+    }
+    return (re * re + im * im) / (sxx * syy);
+  };
+  const power = (segments, alpha, draws = 20_000) => {
+    const level = 1 - alpha ** (1 / (segments - 1));
+    let seen = 0;
+    for (let draw = 0; draw < draws; draw += 1) {
+      if (estimate(segments) >= level) {
+        seen += 1;
+      }
+    }
+    return seen / draws;
+  };
+  for (const alpha of HOLD_SWEEP.stickCoherenceAlpha) {
+    let first = 2;
+    while (1 - alpha ** (1 / (first - 1)) > maximumNullLevel) {
+      first += 1;
+    }
+    const under = power(first, alpha);
+    assert.ok(under >= requiredPower, `alpha ${alpha}, ${first} segments: ${under}`);
+    if (alpha === Math.max(...HOLD_SWEEP.stickCoherenceAlpha)) {
+      const over = power(first - 1, alpha);
+      assert.ok(over < requiredPower, `alpha ${alpha}, ${first - 1} segments: ${over}`);
+    }
+  }
+
+  // 2. Through the estimator the guard uses, with half-overlapping Hann
+  // segments: white signals sharing a common part sized for a true coherence
+  // of 0.29, in two stretches long enough (eight segments each) that the alpha
+  // 0.05 null just clears the limit. At least about 80 % read at or over it.
+  const random77 = rng(77);
+  const draw = () => Math.sqrt(-2 * Math.log(Math.max(random77(), 1e-12)))
+    * Math.cos(2 * Math.PI * random77());
+  const noiseScale = Math.sqrt(1 / Math.sqrt(coherence) - 1);
+  let measured = 0;
+  let detected = 0;
+  let level = null;
+  for (let trial = 0; trial < 400; trial += 1) {
+    const stretches = [0, 1].map(() => {
+      const timesUs = [];
+      const x = [];
+      const y = [];
+      for (let index = 0; index < 50 * 11.6; index += 1) {
+        const common = draw();
+        timesUs.push(Math.round(index * 20_000));
+        x.push(common + noiseScale * draw());
+        y.push(common + noiseScale * draw());
+      }
+      return {timesUs, x, y};
+    });
+    const result = welchCoherence(stretches, {segmentUs: 2_560_000, frequencyHz: 1.0});
+    level = coherenceNullLevel(0.05, result.effectiveSegments);
+    measured += 1;
+    if (result.coherence >= level) {
+      detected += 1;
+    }
+  }
+  assert.ok(level <= maximumNullLevel && level > maximumNullLevel - 0.05, `null ${level}`);
+  assert.ok(detected / measured >= requiredPower - 0.05, `${detected} of ${measured}`);
+});
+
+test('a stick-coherence vote too weak to see the stick abstains, and refuses "Lower I" '
+  + 'when nothing stronger votes', () => {
+  // The integrator hunting on its own in gusty air, with the stick moving a
+  // little at another frequency. Flown as two holds of about 25 s, the 5.12 s
+  // length fits sixteen segments, enough for a coherence that stayed under its
+  // chance level to have shown the stick had it been there, and "Lower I"
+  // survives. Flown as the default 10 and 15 s holds it fits six, whose chance
+  // level is over the limit: not seeing the stick there is no evidence it was
+  // absent, so the vote abstains — and with the hunt under the 2.56 s length's
+  // resolution, nothing else votes and the reading is refused. Round one
+  // passed that flight.
+  const long = assessHoldIndication(simulateHoldFlight(STICK_ELSEWHERE_LONG_HOLDS), 'yaw');
+  assert.equal(long.indication, 'decrease', long.codes.join(','));
+  for (const point of long.stickCoherence.points) {
+    if (point.verdict === 'below-null') {
+      assert.ok(point.threshold <= STICK_COHERENCE_VOTE.maximumNullLevel, JSON.stringify(point));
+    }
+  }
+
+  const records = simulateHoldFlight(STICK_ELSEWHERE);
+  const weak = assessHoldIndication(records, 'yaw');
+  assert.equal(weak.shippedIndication, 'decrease');
+  assert.equal(weak.sweepStable, true, 'the sweep must not be what refuses it');
+  const measured = weak.stickCoherence.points.filter(point => point.state === 'measured');
+  assert.ok(measured.length > 0, JSON.stringify(weak.stickCoherence.points));
+  for (const point of measured) {
+    assert.ok(point.threshold > STICK_COHERENCE_VOTE.maximumNullLevel, JSON.stringify(point));
+    assert.ok(point.coherence < point.threshold, JSON.stringify(point));
+    assert.equal(point.verdict, 'abstained', JSON.stringify(point));
+    assert.equal(point.abstainedBecause, 'null-level-too-high');
+  }
+  assert.equal(weak.stickCoherence.state, 'not-measured');
+  assert.ok(weak.codes.includes('STICK_COHERENCE_NOT_MEASURED'), weak.codes.join(','));
+  assert.equal(weak.indication, 'hold');
+  const refused = recommendFor(records, 'yaw');
+  assert.deepEqual(adjustmentIds(refused), []);
+  // The card says how many segments a vote needs, from the constant: the
+  // fewest whose alpha-0.05 chance level is at or under the limit.
+  const needed = Math.ceil(1 + Math.log(0.05) / Math.log(1 - STICK_COHERENCE_VOTE.maximumNullLevel));
+  const notJudged = refused.findings.find(entry => entry.id === 'I_TERM_NOT_JUDGED');
+  assert.ok(notJudged, refused.findings.map(entry => entry.id).join(', '));
+  assert.match(notJudged.reasoning, new RegExp(`about ${needed} Welch segments`), notJudged.reasoning);
+  assert.doesNotMatch(notJudged.reasoning, /two or more stretches/, notJudged.reasoning);
+
+  // A detection from as few segments is a detection at its stated alpha, so it
+  // still refuses: only a failure to reject abstains.
+  const grid = {...HOLD_SWEEP, welchSegmentUs: [5_120_000]};
+  const following = assessHoldIndication(simulateHoldFlight(STICK_WOBBLE), 'yaw', {grid});
+  assert.ok(following.stickCoherence.points.some(point => point.verdict === 'follows-the-stick'
+    && point.threshold > STICK_COHERENCE_VOTE.maximumNullLevel),
+  JSON.stringify(following.stickCoherence.points));
+  assert.ok(following.codes.includes('HUNTING_FOLLOWS_THE_STICK'), following.codes.join(','));
+});
+
+test('"Lower I" says what the stick test measured, not that the wobble was not the stick', () => {
+  const result = recommendFor(simulateHoldFlight(STICK_ELSEWHERE_LONG_HOLDS), 'yaw');
+  const said = result.findings.find(entry => entry.id === 'I_TOO_HIGH');
+  assert.ok(said, result.findings.map(entry => entry.id).join(', '));
+  const stick = result.gates.holds.yaw.stickCoherence;
+  const voting = stick.points.filter(point => point.verdict === 'below-null');
+  assert.ok(voting.length > 0);
+  assert.doesNotMatch(spokenText(said), /did not follow the stick|was not the stick|not your own/i,
+    spokenText(said));
+  // The coherence, its chance level and the segments behind it, as numbers.
+  assert.match(said.reasoning, /coheren/i, said.reasoning);
+  assert.match(said.reasoning, /chance/i, said.reasoning);
+  assert.match(said.reasoning, /\d+ Welch segments/, said.reasoning);
+  for (const label of ['stick-to-error coherence at the wobble\'s frequency',
+    'coherence two unrelated signals reach by chance at that setting',
+    'Welch segments that coherence rests on']) {
+    const entry = said.basis.find(item => item.label === label);
+    assert.ok(entry && Number.isFinite(entry.value), `${label}: ${JSON.stringify(said.basis)}`);
+  }
+  // The closest a voting setting came to its chance level is the one quoted.
+  const closest = voting.reduce((best, point) =>
+    (best === null || point.coherence / point.threshold > best.coherence / best.threshold
+      ? point : best), null);
+  assert.equal(said.basis.find(item => item.label
+    === 'stick-to-error coherence at the wobble\'s frequency').value, closest.coherence);
+});
+
+/** The collective swinging slowly, 0.04 Hz either side of a hover setting, in rcCommand units. */
+const COLLECTIVE_SWING = t => 120 + 60 * Math.sin(2 * Math.PI * 0.04 * t);
+
+/** Four 15 s holds over a 60 s flight, split by brief pulses. */
+const FOUR_HOLDS = Object.freeze({
+  durationS: 60,
+  commands: Object.freeze([{atS: 1, untilS: 1.4, dps: 120}, {atS: 16, untilS: 16.4, dps: 120},
+    {atS: 31, untilS: 31.4, dps: 120}, {atS: 46, untilS: 46.4, dps: 120}])
+});
+
+test('a yaw integrator carrying the collective refuses a yaw I verdict', () => {
+  // Main-rotor torque moves with collective, and with too little collective
+  // precompensation the tail's integrator carries it. The yaw holds then read
+  // the integrator doing that work, not the I gain. The nominal loop keeps its
+  // error small throughout — and was given "nothing calls for an I-term
+  // change" before Stage 5b.
+  const coupled = simulateHoldFlight({gains: HOLD_NOMINAL, disturbanceDps2: 200, ...FOUR_HOLDS,
+    collective: COLLECTIVE_SWING, collectiveTorquePerUnit: 3});
+  const hold = assessHoldIndication(coupled, 'yaw');
+  assert.equal(hold.collectiveCorrelation.state, 'measured', JSON.stringify(hold.collectiveCorrelation));
+  for (const point of hold.collectiveCorrelation.points) {
+    assert.equal(point.significant, true, JSON.stringify(hold.collectiveCorrelation));
+  }
+  assert.ok(hold.codes.includes('YAW_HOLD_MOVES_WITH_COLLECTIVE'), hold.codes.join(','));
+  assert.equal(earnsITermAllClear(hold.codes), false);
+
+  const result = recommendFor(coupled, 'yaw');
+  const ids = result.findings.map(entry => entry.id);
+  assert.ok(!ids.includes('I_TERM_WITHIN_TOLERANCE'), ids.join(', '));
+  const said = result.findings.find(entry => entry.id === 'YAW_HOLD_MOVES_WITH_COLLECTIVE');
+  assert.ok(said, ids.join(', '));
+  assert.equal(said.kind, 'next-flight');
+  assert.equal(said.axis, 'yaw');
+  assert.match(said.reasoning, /collective/);
+  assert.ok(said.basis.some(entry => /collective/.test(entry.label) && Number.isFinite(entry.value)),
+    JSON.stringify(said.basis));
+  // Said as what was measured (review of round one): the I term moved with the
+  // collective, so it was not judged; the precompensation is one possible
+  // cause, as the candidates list it, not a finding; and "more than chance" is
+  // qualified by the rate this test was measured to fire at on unrelated slow
+  // signals, not the nominal alpha.
+  const rate = recommendationsModule.COLLECTIVE_GUARD_FALSE_ALARM ?? {};
+  assert.deepEqual([rate.alpha, rate.low, rate.high], [0.05, 0.1, 0.15]);
+  const spoken = spokenText(said);
+  assert.match(said.reasoning, /moved with the collective/, said.reasoning);
+  assert.match(said.reasoning, /not judged|neither a change nor an all-clear/, said.reasoning);
+  assert.match(said.reasoning, /One possible cause/, said.reasoning);
+  assert.match(said.reasoning, /10-15 %/, said.reasoning);
+  assert.match(said.reasoning, /alpha 0\.05/, said.reasoning);
+  assert.doesNotMatch(spoken, /where the collective precompensation does not cover that, the integrator does/,
+    spoken);
+  assert.doesNotMatch(spoken, /more than two unrelated signals that slow move together by chance/, spoken);
+  assert.ok(said.candidates.some(candidate => /precompensation/.test(candidate)));
+
+  // A "Lower I" on a lighter coupling — light enough that the integrator still
+  // swings with the error, so nothing before this guard refuses it — is
+  // refused by it.
+  const lowerI = simulateHoldFlight({gains: HOLD_SOFT, gustDps2: 2200, ...FOUR_HOLDS,
+    collective: COLLECTIVE_SWING, collectiveTorquePerUnit: 0.6});
+  const hunting = assessHoldIndication(lowerI, 'yaw');
+  assert.equal(hunting.shippedIndication, 'decrease');
+  assert.ok(!hunting.codes.includes('I_TERM_DOES_NOT_OSCILLATE_WITH_THE_ERROR'), hunting.codes.join(','));
+  assert.ok(hunting.codes.includes('YAW_HOLD_MOVES_WITH_COLLECTIVE'), hunting.codes.join(','));
+  assert.deepEqual(adjustmentIds(recommendFor(lowerI, 'yaw')), []);
+});
+
+test('the collective guard reads only the integrator, and only on yaw', () => {
+  // The same moving collective with NO torque on the tail: the integrator has
+  // nothing to carry, and the all-clear stands.
+  const free = recommendFor(simulateHoldFlight({gains: HOLD_NOMINAL, disturbanceDps2: 200,
+    ...FOUR_HOLDS, collective: COLLECTIVE_SWING, collectiveTorquePerUnit: 0}), 'yaw');
+  assert.ok(free.findings.some(entry => entry.id === 'I_TERM_WITHIN_TOLERANCE'),
+    free.findings.map(entry => entry.id).join(', '));
+  assert.equal(free.gates.holds.yaw.collectiveCorrelation.points.every(point => !point.significant),
+    true, JSON.stringify(free.gates.holds.yaw.collectiveCorrelation));
+
+  // No integrator at all: nothing can be carrying the collective, so a standing
+  // error with the collective moving is still read as one.
+  const none = recommendFor(simulateHoldFlight({gains: {...HOLD_NOMINAL, ki: 0},
+    disturbanceDps2: 400, ...THREE_HOLDS, collective: COLLECTIVE_SWING,
+    collectiveTorquePerUnit: 3}), 'yaw');
+  assert.equal(none.gates.holds.yaw.collectiveCorrelation.state, 'x-still');
+  assert.deepEqual(adjustmentIds(none), ['I_TOO_LOW'], none.findings.map(entry => entry.id).join(', '));
+
+  // Roll is not judged against the collective at all.
+  const roll = assessHoldIndication(simulateHoldFlight({axis: 'roll', gains: HOLD_NOMINAL,
+    disturbanceDps2: 200, ...FOUR_HOLDS, collective: COLLECTIVE_SWING,
+    collectiveTorquePerUnit: 3}), 'roll');
+  assert.equal(roll.collectiveCorrelation, null);
+  assert.ok(!roll.codes.includes('YAW_HOLD_MOVES_WITH_COLLECTIVE'));
+});
+
+/**
+ * Still hovers and steady turns at `turnDps`, alternating, `count` of each,
+ * 6.5 s apiece, after a lead-in pulse.
+ */
+function hoversAndTurns(count, turnDps = 150) {
+  const commands = [{atS: 1, untilS: 1.4, dps: 120}];
+  let atS = 1.4;
+  for (let at = 0; at < count; at += 1) {
+    atS += 6.5;
+    commands.push({atS, untilS: atS + 6.5, dps: turnDps});
+    atS += 6.5;
+  }
+  return {commands, durationS: atS + 0.5};
+}
+
+test('hovers and turns that disagree about the I term are refused, and not as a mechanical '
+  + 'claim where no bind reads', () => {
+  // No integrator, a standing torque: the hovers sit 4.7 deg/s off, a standing
+  // error read from three of them; the turns at 150 deg/s sit 1.2 deg/s off,
+  // under the standing-error size, read from three of them as nothing wrong.
+  // One integrator cannot be both. Something differs between hovering and
+  // turning that this flight cannot name. With no integrator there is nothing
+  // to wind or pin, so no bind reads on either kind or on the pooled holds; the
+  // test below is the one where one does.
+  const records = simulateHoldFlight({gains: {...HOLD_NOMINAL, ki: 0}, disturbanceDps2: 400,
+    ...hoversAndTurns(3)});
+  const hold = assessHoldIndication(records, 'yaw');
+  assert.equal(hold.evidence.kinds.zero.holdCount, 3, JSON.stringify(hold.evidence.kinds));
+  assert.equal(hold.evidence.kinds.sustained.holdCount, 3);
+  assert.equal(hold.kinds.zero.indication, 'increase', hold.kinds.zero.codes.join(','));
+  assert.equal(hold.kinds.sustained.indication, 'hold', hold.kinds.sustained.codes.join(','));
+  assert.ok(hold.codes.includes('I_TERM_HOLDS_KINDS_DISAGREE'), hold.codes.join(','));
+  assert.equal(hold.indication, 'hold');
+  assert.equal(hold.bind.suspected, false);
+
+  const result = recommendFor(records, 'yaw');
+  assert.deepEqual(adjustmentIds(result), []);
+  assert.ok(!result.findings.some(entry => entry.kind === 'blocker'),
+    result.findings.map(entry => `${entry.id}:${entry.kind}`).join(', '));
+  const said = result.findings.find(entry => entry.id === 'I_TERM_HOLDS_KINDS_DISAGREE');
+  assert.ok(said, result.findings.map(entry => entry.id).join(', '));
+  assert.equal(said.kind, 'next-flight');
+  assert.equal(said.direction, null);
+  assert.match(said.reasoning, /hover|still/i);
+  assert.match(said.reasoning, /turn/i);
+  assert.ok(said.basis.some(entry => /zero rate/.test(entry.label) && entry.value === 3));
+  assert.doesNotMatch(spokenText(said), /bind|linkage|servo/i, spokenText(said));
+});
+
+test('kinds that disagree do not switch a bind off', () => {
+  // REVERSED in the review of round one (4 October 2026). This test used to pin
+  // the opposite: that hovers and turns disagreeing switched the bind check off.
+  // That let a few clean turns remove a mechanical blocker the hovers carried,
+  // and a gain change through with it. Disagreement may stop the I-term
+  // reading; it never removes a mechanical blocker.
+  //
+  // Hand-built, so the integrator looks exactly like a bind: wound large and
+  // still growing, with the hovers sitting 8 deg/s off and the turns on the
+  // command. Read per kind the hovers say a standing error and the turns say
+  // nothing wrong, so the kinds disagree; the hovers on their own, and all the
+  // holds pooled as before Stage 5b, both read the bind.
+  const records = [];
+  let timeUs = 0;
+  const piece = (seconds, command, error) => {
+    for (let step = 0; step < seconds * 500; step += 1) {
+      const t = timeUs / 1e6;
+      records.push({timeUs, setpoint: [0, 0, command], gyro: [0, 0, command - error],
+        raw: [0, 0, command - error], terms: [8, 200 + 10 * t, 3], headspeed: 1800,
+        collective: 5, vbat: 24});
+      timeUs += 2000;
+    }
+  };
+  piece(0.4, 120, 0);
+  for (let at = 0; at < 3; at += 1) {
+    piece(6.5, 0, 8);
+    piece(6.5, 150, 0);
+  }
+  const hold = assessHoldIndication(records, 'yaw');
+  assert.ok(hold.codes.includes('I_TERM_HOLDS_KINDS_DISAGREE'), hold.codes.join(','));
+  assert.ok(hold.evidence.summary.meanAbsoluteSteadyStateErrorDps > BIND_LIMITS.errorDpsThreshold,
+    'pooled, the error must clear what a bind needs, or this proves nothing');
+  assert.equal(hold.bind.suspected, true, JSON.stringify(hold.bind));
+  assert.equal(hold.bind.pattern, 'winding');
+  assert.equal(hold.indication, 'hold');
+  const result = recommendFor(records, 'yaw');
+  const bind = result.findings.find(entry => entry.id === 'SUSPECTED_MECHANICAL_BIND');
+  assert.ok(bind, result.findings.map(entry => entry.id).join(', '));
+  assert.equal(bind.kind, 'blocker');
+  assert.deepEqual(adjustmentIds(result), []);
+  // With both kinds on the flight, the card says which holds it was read over
+  // and shows that set's own numbers, not the I-term reading's.
+  const readOver = bind.basis.find(entry => entry.label === 'holds the bind was read over');
+  assert.equal(readOver?.value, hold.bind.holdCount, JSON.stringify(bind.basis));
+  assert.ok(bind.basis.some(entry => entry.label === 'steady-state error over those holds'
+    && Math.abs(entry.value - hold.bind.meanAbsoluteSteadyStateErrorDps) < 0.01),
+  JSON.stringify(bind.basis));
+  assert.match(bind.reasoning, new RegExp(`read over the ${hold.bind.holdCount} `), bind.reasoning);
+
+  // Only the hovers carry it when they sit 5 deg/s off: pooled with the turns
+  // the error averages under the 3 deg/s a bind needs, so it is the hovers on
+  // their own that read it, and the card names them.
+  const fainter = records.map(record => (record.setpoint[2] === 0 && record.timeUs > 400_000
+    ? {...record, gyro: [0, 0, -5], raw: [0, 0, -5]} : record));
+  const hovers = assessHoldIndication(fainter, 'yaw');
+  assert.ok(hovers.evidence.summary.meanAbsoluteSteadyStateErrorDps < BIND_LIMITS.errorDpsThreshold,
+    'pooled, the error must be under what a bind needs, or this case is the one above');
+  assert.equal(hovers.bind.suspected, true, JSON.stringify(hovers.bind));
+  assert.equal(hovers.bind.readFrom, 'zero');
+  const named = recommendFor(fainter, 'yaw').findings
+    .find(entry => entry.id === 'SUSPECTED_MECHANICAL_BIND');
+  assert.ok(named);
+  assert.match(named.reasoning, /read over the 3 still holds/, named.reasoning);
+});
+
+test('a bind only the pooled holds read, as before Stage 5b, still blocks', () => {
+  // Review of round one. Hovers sitting 7 deg/s off on alternate sides, with
+  // the I term large and not moving — pinned — and three clean turns between
+  // them. Read on its own, each kind refuses a standing error (the hovers'
+  // error changes side, and the integrator held against neither side), and the
+  // two kinds agree on that. Before Stage 5b a capture of both kinds was read
+  // pooled, with no per-hold refusal under it, and read a pinned integrator
+  // over a standing error: a bind. Round one read the pooled holds with the
+  // kinds' refusals and dropped it. The pooled holds are read as before.
+  const records = [];
+  let timeUs = 0;
+  const piece = (seconds, command, error) => {
+    for (let step = 0; step < seconds * 500; step += 1) {
+      records.push({timeUs, setpoint: [0, 0, command], gyro: [0, 0, command - error],
+        raw: [0, 0, command - error], terms: [8, 400, 3], headspeed: 1800, collective: 5, vbat: 24});
+      timeUs += 2000;
+    }
+  };
+  piece(0.4, 120, 0);
+  for (const error of [7, -7, 7]) {
+    piece(6.5, 0, error);
+    piece(6.5, 150, 0.5);
+  }
+  const hold = assessHoldIndication(records, 'yaw');
+  assert.equal(hold.kind, 'both', `the kinds must agree, or this is the case above: ${hold.codes}`);
+  assert.ok(hold.kinds.zero.codes.includes('STANDING_ERROR_CHANGES_SIDE_BETWEEN_HOLDS'),
+    hold.kinds.zero.codes.join(','));
+  assert.equal(hold.bind.suspected, true, JSON.stringify(hold.bind));
+  assert.equal(hold.bind.pattern, 'pinned');
+  assert.equal(hold.bind.readFrom, 'all');
+  const result = recommendFor(records, 'yaw');
+  assert.ok(result.findings.some(entry => entry.id === 'SUSPECTED_MECHANICAL_BIND'
+    && entry.kind === 'blocker'), result.findings.map(entry => entry.id).join(', '));
+});
+
+/**
+ * Three hovers sitting `hoverErrorDps` off, with the yaw I term from `iTerm(t)`,
+ * alternating with three steady turns at `turnDps` sitting on the command,
+ * appended after `records`. 1 ms samples with a little gyro noise.
+ */
+function appendHoversAndTurns(records, {turnDps, hoverErrorDps = 6, iTerm, turns = 3}) {
+  const random = rng(99);
+  const out = [...records];
+  let timeUs = out[out.length - 1].timeUs + 1000;
+  const piece = (seconds, command, error) => {
+    for (let step = 0; step < seconds * 1000; step += 1) {
+      const gyro = command - error + (random() - 0.5) * 0.6;
+      out.push({timeUs, setpoint: [0, 0, command], gyro: [0, 0, gyro], raw: [0, 0, gyro],
+        terms: [8, iTerm(timeUs / 1e6), 3], headspeed: 1800, collective: 5, vbat: 24});
+      timeUs += 1000;
+    }
+  };
+  for (let at = 0; at < 3; at += 1) {
+    piece(6.5, 0, hoverErrorDps);
+    if (at < turns) {
+      piece(6.5, turnDps, 0.5);
+    }
+  }
+  return out;
+}
+
+test('clean turns added to bound hovers still block a gain change', () => {
+  // Review of round one. Stops that earn "Raise yaw P" on their own (the 6 %
+  // lagged-loop control above), then three hovers sitting 6 deg/s off with the
+  // integrator winding or pinned the way a bind makes it. Before Stage 5b that
+  // read SUSPECTED_MECHANICAL_BIND, and "Raise P" was withheld under it. Round
+  // one switched the bind check off when hovers and turns disagreed, so three
+  // clean turns flown after the hovers turned a blocker into a gain instruction.
+  const stops = laggedLoopFlight({shortfalls: [0.06, 0.06]});
+  assert.deepEqual(adjustmentIds(recommendFor(stops, 'yaw')), ['P_TOO_LOW'],
+    'the stops alone must earn "Raise P", or the withholding below proves nothing');
+  const integrators = [['winding', t => 200 + 10 * t], ['pinned', () => 400]];
+  for (const turnDps of [40, 60]) {
+    for (const [pattern, iTerm] of integrators) {
+      for (const turns of [3, 0]) {
+        const label = `${pattern} I, ${turns} clean ${turnDps} deg/s turns`;
+        const records = appendHoversAndTurns(stops, {turnDps, iTerm, turns});
+        const result = recommendFor(records, 'yaw');
+        const hold = result.gates.holds.yaw;
+        if (turns > 0) {
+          assert.ok(hold.codes.includes('I_TERM_HOLDS_KINDS_DISAGREE'),
+            `${label}: the kinds must disagree, or this is not the case: ${hold.codes}`);
+        }
+        assert.equal(hold.bind?.suspected, true, `${label}: ${JSON.stringify(hold.bind)}`);
+        assert.ok(result.findings.some(entry => entry.id === 'SUSPECTED_MECHANICAL_BIND'
+          && entry.kind === 'blocker'), `${label}: ${result.findings.map(entry => entry.id)}`);
+        assert.deepEqual(adjustmentIds(result), [], label);
+        assert.ok(result.withheld.some(entry => entry.findingId === 'P_TOO_LOW'
+          && entry.reason === 'BLOCKER_ABOVE'),
+        `${label}: ${JSON.stringify(result.withheld.map(entry => [entry.findingId, entry.reason]))}`);
+      }
+    }
+  }
+});
+
+test('a bind only the pooled holds read still blocks when the reading came from one kind', () => {
+  // Review of round two (4 October 2026). The stops earn "Raise yaw P" on their
+  // own. Then three hovers sitting 1 deg/s off, under what a bind needs, and
+  // one steady 40 deg/s turn sitting 14 deg/s off, with the integrator winding
+  // throughout; a short 40 deg/s input on the command keeps the last two hovers
+  // apart. The I-term reading comes from the three hovers; one turn is too few
+  // to read as a kind. Pooled, as before Stage 5b, the four holds sit over the
+  // bind's error threshold with the integrator winding: a bind. Only the pooled
+  // read that follows the kinds sees it, and without that read the blocker was
+  // lost and "Raise P" became the instruction.
+  const records = laggedLoopFlight({shortfalls: [0.06, 0.06]});
+  const random = rng(99);
+  let timeUs = records[records.length - 1].timeUs + 1000;
+  const piece = (seconds, command, error) => {
+    for (let step = 0; step < seconds * 1000; step += 1) {
+      const gyro = command - error + (random() - 0.5) * 0.6;
+      records.push({timeUs, setpoint: [0, 0, command], gyro: [0, 0, gyro], raw: [0, 0, gyro],
+        terms: [8, 200 + 10 * (timeUs / 1e6), 3], headspeed: 1800, collective: 5, vbat: 24});
+      timeUs += 1000;
+    }
+  };
+  piece(6.5, 0, 1);
+  piece(6.5, 40, 14);
+  piece(6.5, 0, 1);
+  piece(0.4, 40, 0);
+  piece(6.5, 0, 1);
+  const result = recommendFor(records, 'yaw');
+  const hold = result.gates.holds.yaw;
+  assert.equal(hold.kind, 'zero', `the reading must come from the hovers: ${hold.codes}`);
+  assert.ok(hold.evidence.kinds.zero.holdCount >= 3, JSON.stringify(hold.evidence.kinds));
+  assert.ok(hold.evidence.kinds.sustained.holdCount < hold.minimumHolds,
+    'the turns must be too few to read as a kind, or this is another case');
+  assert.ok(hold.judged.summary.meanAbsoluteSteadyStateErrorDps < BIND_LIMITS.errorDpsThreshold,
+    'the hovers on their own must not clear what a bind needs, or this is another case');
+  assert.ok(hold.evidence.summary.meanAbsoluteSteadyStateErrorDps > BIND_LIMITS.errorDpsThreshold,
+    'pooled, the error must clear what a bind needs, or this proves nothing');
+  assert.equal(hold.bind?.suspected, true, JSON.stringify(hold.bind));
+  assert.equal(hold.bind.readFrom, 'all');
+  assert.ok(result.findings.some(entry => entry.id === 'SUSPECTED_MECHANICAL_BIND'
+    && entry.kind === 'blocker'), result.findings.map(entry => entry.id).join(', '));
+  assert.deepEqual(adjustmentIds(result), []);
+  assert.ok(result.withheld.some(entry => entry.findingId === 'P_TOO_LOW'
+    && entry.reason === 'BLOCKER_ABOVE'),
+  JSON.stringify(result.withheld.map(entry => [entry.findingId, entry.reason])));
+});
+
+test('an all-clear read from one kind of hold says which, and what was set aside', () => {
+  // Three still hovers with nothing wrong and one steady turn: one hold of a
+  // kind is not a reading of it, so the all-clear is the hovers' alone, and the
+  // card says so rather than counting the turn among the holds it rests on.
+  const records = [];
+  let timeUs = 0;
+  const piece = (seconds, command, error) => {
+    for (let step = 0; step < seconds * 500; step += 1) {
+      records.push({timeUs, setpoint: [0, 0, command], gyro: [0, 0, command - error],
+        raw: [0, 0, command - error], terms: [8, 12, 3], headspeed: 1800, collective: 5, vbat: 24});
+      timeUs += 2000;
+    }
+  };
+  piece(0.4, 120, 0);
+  piece(6.5, 0, 0.4);
+  piece(6.5, 150, 0.4);
+  piece(6.5, 0, 0.4);
+  piece(0.4, 120, 0);
+  piece(6.5, 0, 0.4);
+  const result = recommendFor(records, 'yaw');
+  const said = result.findings.find(entry => entry.id === 'I_TERM_WITHIN_TOLERANCE');
+  assert.ok(said, result.findings.map(entry => entry.id).join(', '));
+  assert.equal(result.gates.holds.yaw.holdCount, 4);
+  assert.match(said.headline, /No standing error seen in 3 yaw holds \(still hovers/, said.headline);
+  assert.match(said.reasoning, /One hold of the other kind .* was too few to read on its own/,
+    said.reasoning);
+});
+
+test('a yaw reading with no collective logged is refused, not passed', () => {
+  // The collective guard could not be tested, so it does not pass the reading:
+  // the all-clear a nominal loop earns is withheld and the card says why.
+  const records = simulateHoldFlight({gains: HOLD_NOMINAL, disturbanceDps2: 200})
+    .map(record => ({...record, collective: Number.NaN}));
+  const hold = assessHoldIndication(records, 'yaw');
+  assert.ok(hold.codes.includes('COLLECTIVE_CORRELATION_NOT_MEASURED'), hold.codes.join(','));
+  const result = recommendFor(records, 'yaw');
+  const ids = result.findings.map(entry => entry.id);
+  assert.ok(!ids.includes('I_TERM_WITHIN_TOLERANCE'), ids.join(', '));
+  const said = result.findings.find(entry => entry.id === 'I_TERM_NOT_JUDGED' && entry.axis === 'yaw');
+  assert.ok(said, ids.join(', '));
+  assert.match(said.headline, /collective/);
+});
+
+test('the all-clear says what the holds showed, never that the I term is right', () => {
+  const result = recommendFor(simulateHoldFlight({gains: HOLD_NOMINAL, disturbanceDps2: 200}), 'yaw');
+  const said = result.findings.find(entry => entry.id === 'I_TERM_WITHIN_TOLERANCE');
+  assert.ok(said, result.findings.map(entry => entry.id).join(', '));
+  const holds = result.gates.holds.yaw.holdCount;
+  assert.match(said.headline, new RegExp(`[Nn]o standing error .*${holds} .*holds?`), said.headline);
+  assert.doesNotMatch(spokenText(said),
+    /I(?: term)? is right|right for this aircraft|calls for an I-term change/i, spokenText(said));
+  assert.ok(said.basis.some(entry => entry.label === 'holds the reading rests on'
+    && entry.value === holds), JSON.stringify(said.basis));
 });

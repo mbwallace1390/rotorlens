@@ -684,18 +684,30 @@ export function holdManoeuvre(axis) {
   // asked for `minimumHolds`, 2, after a standing error came to need 3.
   const needed = evidence.HOLDS_FOR_A_FULL_READING;
   const offAxis = limits.offAxisCommandLimitDps ?? 30;
+  const band = limits.holdSetpointBandDps ?? 15;
 
+  // Stage 5b (4 October 2026): an input on another axis now ENDS a hold, and
+  // only the steady part before it is measured; and a hover counts as a new
+  // hold only once this axis's own stick has moved more than the band from
+  // where it was. So the brief asks for still hovers with the pedals left
+  // alone, and a deliberate move on every stick between them.
   return Object.freeze({
     axis,
     title: `To capture hold evidence on ${axis}`,
     steps: Object.freeze([
       axis === 'yaw'
-        ? 'Hold a heading, or a steady pirouette rate, with the pedals still.'
-        : `Hold a steady ${axis} attitude, or a constant ${axis} rate, with the cyclic still.`,
+        ? 'Fly a still hover holding a heading, with the cyclic centred and the pedals left ' +
+          'alone — or hold a steady pirouette rate.'
+        : 'Fly a still hover, with the cyclic centred and the pedals left alone — or hold a ' +
+          `constant ${axis} rate.`,
       `Keep it for at least ${totalSeconds} s — the first ${settleSeconds} s is discarded so ` +
         `the previous input is not measured, leaving ${measureSeconds} s of steady state.`,
-      `Keep the other two axes under ${offAxis}°/s while you do it. A correction on ` +
-        'another axis moves this one too.',
+      `Keep the other two axes under ${offAxis}°/s while you do it. An input over that on ` +
+        'another axis ends the hold there, and only the steady part before it is measured.',
+      'Between hovers, make a deliberate move on every stick — slide sideways, swing the nose ' +
+        'round — then settle into the next one. A hover counts as a new hold only once ' +
+        `${axis === 'yaw' ? 'the pedals have' : `the ${axis} stick has`} moved more than ` +
+        `${band}°/s from where ${axis === 'yaw' ? 'they were' : 'it was'}.`,
       `Repeat until you have ${needed} such holds.`
     ]),
     note: 'This says what to fly so there is something to measure. It is not a change ' +

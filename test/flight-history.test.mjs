@@ -1098,7 +1098,25 @@ test('mixed heading and rate holds are not relabelled as one hold kind', () => {
 
   const comparison = compareFlightRecords(before, mixed);
   assert.equal(comparison.outcome, COMPARISON_OUTCOME.NOT_ENOUGH_EVIDENCE);
-  assert.ok(comparison.axes.yaw.hold.codes.includes('HOLD_KIND_MISMATCH'));
+  // Stage 5b: holds of each kind are read on their own, but a saved record
+  // keeps one set of numbers over all its holds. A side that mixed the two
+  // kinds therefore cannot be read as either, and says so rather than calling
+  // it the other kind.
+  assert.ok(comparison.axes.yaw.hold.codes.includes('HOLD_KINDS_MIXED_IN_RECORD'),
+    comparison.axes.yaw.hold.codes.join(','));
+  assert.ok(!comparison.axes.yaw.hold.codes.includes('HOLD_KIND_MISMATCH'));
+});
+
+test('a hold comparison is made within one kind of hold, and names it', () => {
+  // Stage 5b: the before/after compares a kind with itself. Hovers against
+  // hovers, turns against turns; the result says which.
+  for (const [kind, zeroHoldCount] of [['zero', 6], ['sustained', 0]]) {
+    const before = record({errorDps: 5, zeroHoldCount});
+    const after = {...record({headers: YAW_I_CHANGED, errorDps: 1, zeroHoldCount}), ordinal: 1};
+    const comparison = compareFlightRecords(before, after);
+    assert.equal(comparison.axes.yaw.hold.outcome, COMPARISON_OUTCOME.IMPROVED, kind);
+    assert.equal(comparison.axes.yaw.hold.measured.holdKind, kind);
+  }
 });
 
 test('inconclusive hold evidence on either side gives no verdict', () => {
@@ -1273,7 +1291,11 @@ test('the floor is reported with the comparison, so a pilot can see what it is',
     assert.ok(floor.sentence.includes(`${floor.perAxis[axis].observedMaximumDps}°/s on ${axis}`),
       `and ${axis}'s own worst pair`);
   }
-  assert.ok(!floor.sentence.includes(String(EVIDENCE_LIMITS.holdErrorNoiseFloorDps)),
+  // Matched as a whole number of degrees a second: in Stage 5b's first round (4
+  // October 2026) roll's worst pair was 0.395, whose digits begin with the
+  // pooled 0.39, and a worst pair may land there again.
+  const pooled = String(EVIDENCE_LIMITS.holdErrorNoiseFloorDps).replace('.', '\\.');
+  assert.doesNotMatch(floor.sentence, new RegExp(`(^|[^0-9.])${pooled}°/s`),
     'the pooled floor gates nothing the app compares, so it must not be quoted');
   assert.ok(floor.perAxis.yaw.observedMaximumDps < 0.2,
     'yaw must not be quoted another axis\'s worst case');

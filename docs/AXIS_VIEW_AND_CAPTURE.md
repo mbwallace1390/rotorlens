@@ -91,6 +91,16 @@ standing error needs before the I rung will read one
 asks a pilot to fly comes from that one constant, so the brief cannot ask for
 fewer than the recommendation will use.
 
+Since Stage 5b (4 October 2026) an input on another axis over
+`offAxisCommandLimitDps` ENDS a hold rather than voiding it — except inside the
+hold's `holdSettleUs` settle, which is discarded anyway — and a hover counts
+as a new hold only once the axis's own command has left the
+`holdSetpointBandDps` band around where it was. The hold brief says both — still
+hovers with the pedals left alone, and a deliberate move on every stick between
+them — with the band read from the same constant, and the I panel lists each
+hold that an input on another axis ended, with its seconds into the recording
+and which axis's input it was.
+
 Every refusal code becomes a sentence about the signal —
 `RELEASE_DWELL` reads "the command paused part-way back to centre instead of
 returning in one motion" — and an unrecognised code degrades to a humanised form

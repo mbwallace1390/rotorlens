@@ -86,6 +86,15 @@ heading held, or a steady turn — with the other two axes quiet (under 30°/s).
 Five seconds is the shortest hold the app accepts, and its first second is
 discarded, so aim for six to eight. That is what the I term is measured on.
 
+An input over 30°/s on another axis **ends** a hold: the steady part before it
+still counts if it was long enough, and the rest of that hover does not count
+as a new hold until the stick on this axis has moved more than 15°/s from where
+it was. The one exception is an input inside a hold's first second, which is
+discarded anyway: it does not end the hold. So between holds, make a deliberate
+move on every stick, then settle
+into the next one. Still hovers and steady turns are read separately (since
+4 October 2026), so a flight can carry both; each kind needs its own holds.
+
 Five is not a round number picked for the sake of it. Comparing one flight
 directly against the one before it needs five holds **on each side**, and in the
 reference corpus no flight has ever carried more than four on one axis (31
@@ -165,10 +174,11 @@ log. RotorLens will show what moved.
 It will also, very often, say the movement is too small to call — and that is
 the feature working. Two flights with nothing changed between them usually
 differ on the hold measurement by less than 0.92°/s on roll, 1.39°/s on pitch
-and 0.1°/s on yaw, and the worst such pairs measured differed by 0.81°/s on
-roll, 1.25°/s on pitch and 0.112°/s on yaw (re-measured 4 October 2026, over
-the seconds the governor was flying the rotor, which is where the holds are
-measured). The comparison prints the figure for the axis you changed beside the
+and 0.1°/s on yaw, and the worst such pairs measured differed by 0.388°/s on
+roll, 1.25°/s on pitch and 0.0825°/s on yaw (re-measured 4 October 2026, over
+the seconds the governor was flying the rotor and with an input on another axis
+ending a hold, which is how the holds are measured). The comparison prints the
+figure for the axis you changed beside the
 result, and when nothing was changed it quotes each axis's own floor (0.92°/s
 roll, 1.39°/s pitch, 0.1°/s yaw). A change smaller than that is
 weather, not tuning, and an app that called it an improvement would be lying to

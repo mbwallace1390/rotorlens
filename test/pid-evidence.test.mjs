@@ -432,6 +432,320 @@ test('a hold shorter than the minimum is ignored', () => {
   assert.deepEqual(detectHoldSegments(holdSamples({durationUs: 900_000}), YAW), []);
 });
 
+// ---------------------------------------------------------------------------
+// The prefix rule (Stage 5b, 4 October 2026)
+//
+// An input on another axis used to void a whole steady stretch: the segment ran
+// on through it and `measureHold` refused all of it as HOLD_OFF_AXIS_INPUT. On
+// the 31 real flights that refused 37 roll, 36 pitch and 15 yaw stretches, most
+// of them still hovers ended by a pedal or a roll input. The input now ENDS the
+// hold at the sample before it, and the axis has to make a move of its own
+// before another hold may open, so one hover can never be cut into several.
+// ---------------------------------------------------------------------------
+
+/**
+ * A flight assembled from pieces, on a 2 ms clock: each piece is
+ * `{seconds, roll, pitch, yaw}` in deg/s of command, held constant. The gyro
+ * follows the command exactly unless `errorDps` is given. Nothing here knows
+ * what the detector measures.
+ */
+function piecewiseFlight(pieces, {intervalUs = 2000, errorDps = 0} = {}) {
+  const records = [];
+  let timeUs = 0;
+  for (const piece of pieces) {
+    const count = Math.round((piece.seconds * 1_000_000) / intervalUs);
+    for (let step = 0; step < count; step += 1) {
+      const setpoint = [piece.roll ?? 0, piece.pitch ?? 0, piece.yaw ?? 0];
+      const gyro = setpoint.map(value => value - errorDps);
+      records.push({
+        timeUs, setpoint, gyro, raw: [...gyro], terms: [8, 12, 3],
+        headspeed: 2000, collective: 5, vbat: 25
+      });
+      timeUs += intervalUs;
+    }
+  }
+  return records;
+}
+
+const ROLL = 0;
+const PEDAL_BLIP = Object.freeze({seconds: 0.3, yaw: 60});
+
+test('an input on another axis ends a hold where it starts instead of voiding it', () => {
+  // Hover, a pedal blip six seconds in, six more seconds of the same hover, a
+  // deliberate roll move, and a second hover.
+  const records = piecewiseFlight([
+    {seconds: 0.2, roll: 90},
+    {seconds: 6},
+    PEDAL_BLIP,
+    {seconds: 6},
+    {seconds: 0.3, roll: 60},
+    {seconds: 8}
+  ]);
+
+  const segments = detectHoldSegments(records, ROLL);
+  assert.equal(segments.length, 2,
+    'the hover before the blip and the hover after the roll move are two holds');
+
+  const blipStartUs = Math.round(6.2 * 1e6);
+  const first = segments[0];
+  assert.equal(first.endedBy, 'off-axis-input');
+  assert.equal(first.endedByAxis, 'yaw');
+  assert.ok(records[first.endIndex].timeUs < blipStartUs,
+    'the hold ends at the sample BEFORE the input, not on it');
+  assert.ok(blipStartUs - records[first.endIndex].timeUs <= 2000,
+    'and at the last sample before it, so nothing steady is thrown away');
+  assert.ok(Math.abs(records[first.endIndex + 1].setpoint[YAW]) > 30);
+  assert.notEqual(segments[1].endedBy, 'off-axis-input');
+
+  const evidence = buildHoldEvidence(records, {axis: 'roll', term: 'I'});
+  assert.equal(evidence.holds.length, 2, evidence.codes.join(','));
+  assert.equal(evidence.status, 'captured');
+  assert.ok(!evidence.codes.includes('HOLD_OFF_AXIS_INPUT'), evidence.codes.join(','));
+  assert.equal(evidence.holds[0].endedBy, 'off-axis-input');
+  assert.equal(evidence.holds[0].endedByAxis, 'yaw');
+  assert.equal(evidence.holds[0].endTimeUs, records[first.endIndex].timeUs);
+  assert.equal(evidence.offAxisEndedHoldCount, 1);
+});
+
+test('the detector as it was before Stage 5b stays reachable, to reproduce figures taken with it', () => {
+  // The per-axis floors quoted in src/ were measured with the old rule, where an
+  // input on another axis ran through a segment and the whole of it was refused.
+  // `offAxisInputEndsHold: false` measures that way again, and only for that.
+  const records = piecewiseFlight([
+    {seconds: 0.2, roll: 90},
+    {seconds: 6},
+    PEDAL_BLIP,
+    {seconds: 6},
+    {seconds: 0.3, roll: 60},
+    {seconds: 8}
+  ]);
+  assert.equal(EVIDENCE_LIMITS.offAxisInputEndsHold, true);
+  const old = buildHoldEvidence(records, {axis: 'roll', term: 'I'},
+    {limits: {offAxisInputEndsHold: false}});
+  assert.equal(old.holds.length, 1);
+  assert.equal(old.rejectedHoldCounts.HOLD_OFF_AXIS_INPUT, 1);
+  assert.equal(buildHoldEvidence(records, {axis: 'roll', term: 'I'}).holds.length, 2);
+});
+
+test('the rest of a hover after an off-axis input is not a second hold', () => {
+  // The same hover with nothing between the blip and the end of the flight: the
+  // roll stick never moves again. Cutting one hover into several would reach
+  // three holds trivially and defeat the hold-to-hold side test the third hold
+  // exists for.
+  const records = piecewiseFlight([
+    {seconds: 0.2, roll: 90},
+    {seconds: 6},
+    PEDAL_BLIP,
+    {seconds: 12}
+  ]);
+  const segments = detectHoldSegments(records, ROLL);
+  assert.equal(segments.length, 1, JSON.stringify(segments));
+  assert.equal(segments[0].endedBy, 'off-axis-input');
+});
+
+test('the first stretch after the window opens stays dropped, blip or no blip', () => {
+  // The integrator is still winding up after liftoff (measured: median pitch
+  // axisI -1.6 at 1-2 s to -54 at 8-12 s), so the first steady stretch is never
+  // measured. An input on another axis must not turn what is left of it into a
+  // hold that the clipped-start rule no longer sees.
+  const records = piecewiseFlight([
+    {seconds: 6},
+    PEDAL_BLIP,
+    {seconds: 12}
+  ]);
+  const evidence = buildHoldEvidence(records, {axis: 'roll', term: 'I'});
+  assert.equal(evidence.holds.length, 0, JSON.stringify(evidence.holds.map(h => h.startTimeUs)));
+  assert.equal(evidence.clippedSegmentCount, 1);
+});
+
+test('the first stretch stays dropped when the records begin during an input on another axis', () => {
+  // Review of round one (4 October 2026). With the pedal already in at the first
+  // record, no segment was open for the input to end, so nothing asked the roll
+  // axis to move, and the steady stretch after the pedal opened above index 0:
+  // not clipped, and measured while the integrator may still be winding up
+  // after liftoff. The window start is an open segment like any other. A short
+  // pedal input sits inside its settle second and the stretch runs on, clipped,
+  // exactly as with no input at all; a longer one ends it, and the rest of the
+  // same stretch is not a new hold.
+  for (const pedalSeconds of [0.3, 1.5]) {
+    const records = piecewiseFlight([
+      {seconds: pedalSeconds, yaw: 60},
+      {seconds: 12},
+      {seconds: 0.3, roll: 60},
+      {seconds: 8}
+    ]);
+    const label = `pedal in for ${pedalSeconds} s at the first record`;
+    const evidence = buildHoldEvidence(records, {axis: 'roll', term: 'I'});
+    const moveUs = Math.round((pedalSeconds + 12) * 1e6);
+    assert.equal(evidence.holds.length, 1,
+      `${label}: ${JSON.stringify(evidence.holds.map(hold => hold.startTimeUs))}`);
+    assert.ok(evidence.holds[0].startTimeUs >= moveUs,
+      `${label}: only the hover after the roll move is measured`);
+    if (pedalSeconds < EVIDENCE_LIMITS.holdSettleUs / 1e6) {
+      assert.equal(evidence.clippedSegmentCount, 1, label);
+    }
+  }
+});
+
+test('an input on another axis inside a hold\'s settle second does not end the hold', () => {
+  // Review of round one. `measureHold` discards the first second of every hold,
+  // so an input there touches nothing that is measured, and before Stage 5b it
+  // was ignored for exactly that reason. Ending the hold on it lost 3 of the 11
+  // corpus holds the prefix rule lost.
+  const settleS = EVIDENCE_LIMITS.holdSettleUs / 1e6;
+  const records = piecewiseFlight([
+    {seconds: 0.2, roll: 90},
+    {seconds: 0.5},
+    PEDAL_BLIP,
+    {seconds: 8},
+    {seconds: 0.3, roll: 60},
+    {seconds: 8}
+  ]);
+  assert.ok(0.5 + PEDAL_BLIP.seconds < settleS, 'the blip must end inside the settle');
+  const segments = detectHoldSegments(records, ROLL);
+  assert.equal(segments.length, 2, JSON.stringify(segments));
+  assert.equal(records[segments[0].startIndex].timeUs, 200_000,
+    'the hover is one hold from where it opened, blip and all');
+  assert.equal(segments[0].endedBy, 'command-left-band');
+  const evidence = buildHoldEvidence(records, {axis: 'roll', term: 'I'});
+  assert.equal(evidence.holds.length, 2, evidence.codes.join(','));
+  assert.ok(!evidence.codes.includes('HOLD_OFF_AXIS_INPUT'), evidence.codes.join(','));
+  assert.ok(evidence.holds[0].measureStartTimeUs >= Math.round((0.5 + PEDAL_BLIP.seconds + 0.2) * 1e6),
+    'and nothing the blip touched is measured');
+
+  // The settle is the hold's own first second, not the flight's (review of
+  // round two). The same hover opening after a 6 s lead-in at another roll
+  // rate, so that it starts well after the first record, is still one hold
+  // from where it opened, blip and all.
+  const late = piecewiseFlight([
+    {seconds: 6, roll: -60},
+    {seconds: 0.2, roll: 90},
+    {seconds: 0.5},
+    PEDAL_BLIP,
+    {seconds: 8},
+    {seconds: 0.3, roll: 60},
+    {seconds: 8}
+  ]);
+  const lateSegments = detectHoldSegments(late, ROLL);
+  const lateHover = lateSegments.find(segment => late[segment.startIndex].timeUs === 6_200_000);
+  assert.ok(lateHover, `the hover must open where it settles: ${JSON.stringify(lateSegments)}`);
+  assert.equal(lateHover.endedBy, 'command-left-band', JSON.stringify(lateSegments));
+  const lateEvidence = buildHoldEvidence(late, {axis: 'roll', term: 'I'});
+  assert.deepEqual(lateEvidence.holds.map(hold => hold.startTimeUs), [6_200_000, 15_300_000],
+    lateEvidence.codes.join(','));
+  assert.ok(!lateEvidence.codes.includes('HOLD_OFF_AXIS_INPUT'), lateEvidence.codes.join(','));
+
+  // An input that starts in the settle and runs on past it is inside the
+  // measured window, so it ends the hold, and the rest of the hover is the same
+  // hover: one hold, the one after the roll move.
+  const longer = piecewiseFlight([
+    {seconds: 0.2, roll: 90},
+    {seconds: 0.5},
+    {seconds: 1.0, yaw: 60},
+    {seconds: 8},
+    {seconds: 0.3, roll: 60},
+    {seconds: 8}
+  ]);
+  const held = buildHoldEvidence(longer, {axis: 'roll', term: 'I'});
+  assert.equal(held.holds.length, 1, JSON.stringify(held.holds.map(hold => hold.startTimeUs)));
+  assert.ok(held.holds[0].startTimeUs >= Math.round(9.7 * 1e6));
+  assert.ok(!held.codes.includes('HOLD_OFF_AXIS_INPUT'), held.codes.join(','));
+
+  // And the axis's own move inside the settle, while the input is still on,
+  // ends that segment without opening another under the input, and without
+  // asking the axis to move again — it just has. The input runs on past where
+  // the settle would have ended; the next hold opens when it ends, where the
+  // axis now is.
+  const moved = piecewiseFlight([
+    {seconds: 0.2, roll: 90},
+    {seconds: 0.5},
+    {seconds: 0.2, yaw: 60},
+    {seconds: 1.0, yaw: 60, roll: 40},
+    {seconds: 8, roll: 40}
+  ]);
+  const movedSegments = detectHoldSegments(moved, ROLL);
+  assert.equal(movedSegments.length, 1, JSON.stringify(movedSegments));
+  assert.equal(moved[movedSegments[0].startIndex].timeUs, 1_900_000,
+    'it opens at the first sample after the input, not under it');
+
+  // The exemption ends exactly where measuring begins: an input at the first
+  // measured sample is inside the measured window, so it ends the hold rather
+  // than being measured through and refused.
+  const atEdge = piecewiseFlight([
+    {seconds: 0.2, roll: 90},
+    {seconds: settleS},
+    {seconds: 0.002, yaw: 60},
+    {seconds: 8}
+  ]);
+  assert.equal(atEdge[Math.round((0.2 + settleS) / 0.002)].setpoint[YAW], 60,
+    'the input must sit on the first measured sample, or this proves nothing');
+  const edge = buildHoldEvidence(atEdge, {axis: 'roll', term: 'I'});
+  assert.ok(!edge.codes.includes('HOLD_OFF_AXIS_INPUT'), edge.codes.join(','));
+  assert.equal(edge.holds.length, 0, JSON.stringify(edge.holds.map(hold => hold.startTimeUs)));
+});
+
+test('an axis that moved while the other input was still held opens its next hold when '
+  + 'that input ends', () => {
+  // A coordinated turn: the pedal goes in, the roll stick moves out and back
+  // while the pedal is still held, then both are centred. The roll axis has
+  // made its own move, so the hover that follows is a new hold even though the
+  // roll command came back to where it was before the pedal went in.
+  const records = piecewiseFlight([
+    {seconds: 0.2, roll: 90},
+    {seconds: 6},
+    {seconds: 0.8, yaw: 60},
+    {seconds: 0.5, yaw: 60, roll: 40},
+    {seconds: 0.7, yaw: 60},
+    {seconds: 8}
+  ]);
+  const segments = detectHoldSegments(records, ROLL);
+  assert.equal(segments.length, 2, JSON.stringify(segments));
+  assert.ok(records[segments[1].startIndex].timeUs >= Math.round(8.2 * 1e6),
+    'the second hold opens only once the pedal is centred');
+});
+
+test('a steady stretch on the axis is never opened while another axis is over the limit', () => {
+  // The other axes held over the limit the whole flight: nothing steady on this
+  // axis can be measured, and nothing is.
+  const records = piecewiseFlight([
+    {seconds: 0.2, roll: 90, yaw: 60},
+    {seconds: 9, yaw: 60},
+    {seconds: 0.3, roll: 60, yaw: 60},
+    {seconds: 9, yaw: 60}
+  ]);
+  assert.deepEqual(detectHoldSegments(records, ROLL), []);
+});
+
+test('an off-axis input inside a measured hold is still refused if the records allow one', () => {
+  // HOLD_OFF_AXIS_INPUT stays in `measureHold` as a guard, and this is the one
+  // shape that still reaches it: timestamps that run backwards, so a sample from
+  // OUTSIDE the segment (here, one with a pedal input) falls inside its time
+  // range. A decoded log never does this; hand-built records can.
+  const records = piecewiseFlight([
+    {seconds: 0.2, roll: 90},
+    {seconds: 8},
+    {seconds: 0.3, roll: 60},
+    {seconds: 8}
+  ]);
+  const second = detectHoldSegments(records, ROLL)[1];
+  const measureStartUs = records[second.startIndex].timeUs + EVIDENCE_LIMITS.holdSettleUs;
+  // In the array just before the second hover, stamped just after that hover's
+  // settle ends; the sample it would have collided with is removed so the
+  // timestamps inside the measured window still run forwards.
+  const intruder = {
+    ...records[second.startIndex - 1],
+    timeUs: measureStartUs + 500,
+    setpoint: [60, 0, 60]
+  };
+  const tampered = [...records.slice(0, second.startIndex - 1), intruder,
+    ...records.slice(second.startIndex).filter(record => record.timeUs !== measureStartUs)];
+  assert.equal(detectHoldSegments(tampered, ROLL).length, 2,
+    'the tampering must leave both hovers detected, or this proves nothing');
+  const evidence = buildHoldEvidence(tampered, {axis: 'roll', term: 'I'});
+  assert.equal(evidence.rejectedHoldCounts.HOLD_OFF_AXIS_INPUT, 1,
+    JSON.stringify(evidence.rejectedHoldCounts));
+});
+
 test('elapsed time across a sample gap is not counted as hold evidence', () => {
   const gapStartUs = LEAD_IN_US + EVIDENCE_LIMITS.holdSettleUs + 200_000;
   const gapEndUs = gapStartUs + 2_000_000;
@@ -665,12 +979,17 @@ test('an unstable governor invalidates the hold rather than reading as tune', ()
 });
 
 test('off-axis input disqualifies a hold', () => {
+  // Another axis over the limit for the whole flight. Until Stage 5b the
+  // segments ran on through it and were refused as HOLD_OFF_AXIS_INPUT; an input
+  // on another axis now ends a hold instead, so with one held throughout no hold
+  // is ever opened, and none is measured.
   const evidence = buildHoldEvidence(
     twoHolds({error: () => 6, offAxisDps: 60}),
     {axis: 'yaw', term: 'I'}
   );
 
-  assert.ok(evidence.codes.includes('HOLD_OFF_AXIS_INPUT'));
+  assert.equal(evidence.holds.length, 0);
+  assert.ok(evidence.codes.includes('INSUFFICIENT_HOLD_SEGMENTS'));
   assert.equal(evidence.status, 'inconclusive');
 });
 
@@ -823,8 +1142,11 @@ test('hold comparisons fail closed on axis, term, and mixed-kind mismatches', ()
   assert.equal(termMismatch.status, 'inconclusive');
   assert.ok(termMismatch.codes.includes('TERM_MISMATCH'));
 
+  // A capture built before Stage 5b carries one summary over both kinds and no
+  // per-kind split, so it cannot be read either way and is still refused whole.
+  const {kinds: _dropped, ...withoutKinds} = yawI;
   const mixed = {
-    ...yawI,
+    ...withoutKinds,
     summary: {...yawI.summary, zeroHoldCount: 1, sustainedHoldCount: 1}
   };
   const kindMismatch = compareHoldEvidence(yawI, mixed);
@@ -837,6 +1159,149 @@ test('hold comparisons fail closed on axis, term, and mixed-kind mismatches', ()
   assert.equal(interpreted.indication, 'hold');
   assert.equal(interpreted.confidence, 'none');
   assert.ok(interpreted.codes.includes('HOLD_KIND_MISMATCH'));
+});
+
+// ---------------------------------------------------------------------------
+// Each kind of hold read on its own (Stage 5b, 4 October 2026)
+//
+// A hold at zero rate (a hover, straight flight) and a hold at a steady rate (a
+// turn, a pirouette) test the integrator in two regimes. Until Stage 5b a
+// flight with both was refused whole (HOLD_KIND_MISMATCH). Each kind is now
+// read separately, with the same completeness as before: two holds of a kind
+// for a reading of it, three for a standing error. These fixtures prove the
+// WIRING only: no real flight in the corpus has a steady-rate hold of 5 s or
+// more, so nothing here is calibrated.
+// ---------------------------------------------------------------------------
+
+/** Holds of the given kinds, `z` at zero rate and `s` at 120 deg/s, 6 s each. */
+function holdsOfKinds(pattern, errorOf) {
+  const kinds = [...pattern];
+  return holdsOfLengths(kinds.map(() => 6), {
+    setpointsDps: kinds.map(kind => (kind === 's' ? 120 : 0)),
+    error: (flightSeconds, at, holdSeconds) => errorOf(kinds[at], at, holdSeconds),
+    intervalUs: 2000
+  });
+}
+
+test('a capture carries a summary for each kind of hold', () => {
+  const evidence = buildHoldEvidence(holdsOfKinds('zzzss', () => 1), {axis: 'yaw', term: 'I'});
+  assert.equal(evidence.holds.length, 5);
+  assert.equal(evidence.kinds.zero.holdCount, 3);
+  assert.equal(evidence.kinds.zero.status, 'captured');
+  assert.equal(evidence.kinds.sustained.holdCount, 2);
+  assert.equal(evidence.kinds.sustained.summary.holdCount, 2);
+  assert.equal(evidence.kinds.zero.summary.sustainedHoldCount, 0);
+  // The pooled summary is still there, for every reader that takes one.
+  assert.equal(evidence.summary.holdCount, 5);
+});
+
+test('each kind is judged on its own, and two kinds that agree give one reading', () => {
+  const agree = interpretHoldEvidence(buildHoldEvidence(
+    holdsOfKinds('zzzsss', () => 6), {axis: 'yaw', term: 'I'}));
+  assert.equal(agree.indication, 'increase', agree.codes.join(','));
+  assert.equal(agree.kind, 'both');
+  assert.equal(agree.kinds.zero.indication, 'increase');
+  assert.equal(agree.kinds.sustained.indication, 'increase');
+  assert.ok(!agree.codes.includes('HOLD_KIND_MISMATCH'), agree.codes.join(','));
+});
+
+test('two kinds that each have three holds and disagree are refused, never read', () => {
+  // A standing error in every hover and none in any turn. One integrator cannot
+  // be both; something else differs between the two regimes, and this flight
+  // cannot say what. Refused as a next flight, never as a mechanical claim.
+  const verdict = interpretHoldEvidence(buildHoldEvidence(
+    holdsOfKinds('zzzsss', kind => (kind === 'z' ? 6 : 0)), {axis: 'yaw', term: 'I'}));
+  assert.equal(verdict.indication, 'hold');
+  assert.equal(verdict.confidence, 'none');
+  assert.ok(verdict.codes.includes('I_TERM_HOLDS_KINDS_DISAGREE'), verdict.codes.join(','));
+  assert.equal(verdict.kind, null);
+  assert.equal(verdict.kinds.zero.indication, 'increase');
+  assert.equal(verdict.kinds.sustained.indication, 'hold');
+  assert.ok(!verdict.codes.includes('STEADY_STATE_ERROR_PRESENT'),
+    'the refused kind\'s reading must not leak into the axis reading');
+});
+
+test('a kind too short of holds for a standing error does not veto the other kind\'s', () => {
+  // Three hovers sitting 6 deg/s off, and two turns sitting off on the same
+  // side: the turns are too few to read a standing error from (three are
+  // needed), and that is ALL they say. The hovers' reading stands.
+  const same = interpretHoldEvidence(buildHoldEvidence(
+    holdsOfKinds('zzzss', () => 6), {axis: 'yaw', term: 'I'}));
+  assert.equal(same.indication, 'increase', same.codes.join(','));
+  assert.equal(same.kind, 'zero');
+  assert.ok(same.codes.includes('OTHER_KIND_TOO_FEW_FOR_A_STANDING_ERROR'), same.codes.join(','));
+
+  // The turns on the OTHER side are a contradiction, not a shortfall.
+  const opposite = interpretHoldEvidence(buildHoldEvidence(
+    holdsOfKinds('zzzss', kind => (kind === 'z' ? 6 : -6)), {axis: 'yaw', term: 'I'}));
+  assert.equal(opposite.indication, 'hold', opposite.codes.join(','));
+  assert.ok(opposite.codes.includes('I_TERM_HOLDS_KINDS_DISAGREE'), opposite.codes.join(','));
+
+  // And two turns that read nothing wrong contradict hovers that hunt: hunting
+  // is read from two holds, so its absence over two is a reading too.
+  const hunt = (kind, at, seconds) => (kind === 'z' ? 5 * Math.sin(2 * Math.PI * seconds) : 0.3);
+  const hunting = interpretHoldEvidence(buildHoldEvidence(holdsOfKinds('zzzss', hunt),
+    {axis: 'yaw', term: 'I'}));
+  assert.equal(hunting.kinds.zero.indication, 'decrease', hunting.kinds.zero.codes.join(','));
+  assert.equal(hunting.kinds.sustained.indication, 'hold');
+  assert.equal(hunting.indication, 'hold');
+  assert.ok(hunting.codes.includes('I_TERM_HOLDS_KINDS_DISAGREE'), hunting.codes.join(','));
+});
+
+test('a kind with too few holds is set aside and the other kind is still read', () => {
+  const verdict = interpretHoldEvidence(buildHoldEvidence(
+    holdsOfKinds('zzzs', kind => (kind === 'z' ? 0.4 : 6)), {axis: 'yaw', term: 'I'}));
+  assert.equal(verdict.indication, 'hold');
+  assert.equal(verdict.kind, 'zero');
+  assert.ok(verdict.codes.includes('HOLD_EVIDENCE_WITHIN_TOLERANCE'), verdict.codes.join(','));
+  assert.ok(verdict.codes.includes('HOLDS_OF_ONE_KIND_TOO_FEW_TO_READ'), verdict.codes.join(','));
+  assert.equal(verdict.kinds.sustained, null, 'one hold of a kind is not a reading of it');
+
+  // ...and with a standing error in the three hovers, it is read as one.
+  const standing = interpretHoldEvidence(buildHoldEvidence(
+    holdsOfKinds('zzzs', kind => (kind === 'z' ? 6 : 0)), {axis: 'yaw', term: 'I'}));
+  assert.equal(standing.indication, 'increase', standing.codes.join(','));
+  assert.equal(standing.kind, 'zero');
+});
+
+test('one hold of each kind is read as neither', () => {
+  const verdict = interpretHoldEvidence(buildHoldEvidence(
+    holdsOfKinds('zs', () => 6), {axis: 'yaw', term: 'I'}));
+  assert.equal(verdict.indication, 'hold');
+  assert.equal(verdict.confidence, 'none');
+  assert.ok(verdict.codes.includes('TOO_FEW_HOLDS_OF_EITHER_KIND'), verdict.codes.join(','));
+  assert.ok(!verdict.codes.includes('HOLD_KIND_MISMATCH'), verdict.codes.join(','));
+});
+
+test('a comparison is made within each kind of hold', () => {
+  // Hovers and turns before, hovers only after. The hovers are the same test on
+  // both sides, so they are compared; the turns have nothing to be compared with.
+  const before = buildHoldEvidence(holdsOfKinds('zzzss', () => 8), {axis: 'yaw', term: 'I'});
+  const after = buildHoldEvidence(holdsOfKinds('zzz', () => 2), {axis: 'yaw', term: 'I'});
+  const comparison = compareHoldEvidence(before, after);
+  assert.equal(comparison.status, 'captured', comparison.codes.join(','));
+  assert.equal(comparison.verdict, 'improved');
+  assert.deepEqual([...comparison.comparedKinds], ['zero']);
+  assert.deepEqual({...comparison.holdCounts}, {baseline: 3, test: 3});
+  assert.equal(comparison.kinds.zero.verdict, 'improved');
+  assert.equal(comparison.kinds.sustained, null);
+
+  // Both kinds on both sides, moving opposite ways: no verdict.
+  const mixedBefore = buildHoldEvidence(holdsOfKinds('zzss', () => 8), {axis: 'yaw', term: 'I'});
+  const split = buildHoldEvidence(holdsOfKinds('zzss', kind => (kind === 'z' ? 2 : 14)),
+    {axis: 'yaw', term: 'I'});
+  const disagree = compareHoldEvidence(mixedBefore, split);
+  assert.equal(disagree.status, 'inconclusive');
+  assert.ok(disagree.codes.includes('HOLD_COMPARISON_KINDS_DISAGREE'), disagree.codes.join(','));
+  assert.equal(disagree.verdict, 'unchanged');
+  assert.equal(disagree.kinds.zero.verdict, 'improved');
+  assert.equal(disagree.kinds.sustained.verdict, 'worsened');
+
+  // ...and moving the same way: one verdict over both.
+  const both = compareHoldEvidence(mixedBefore,
+    buildHoldEvidence(holdsOfKinds('zzss', () => 2), {axis: 'yaw', term: 'I'}));
+  assert.equal(both.verdict, 'improved', both.codes.join(','));
+  assert.deepEqual([...both.comparedKinds], ['zero', 'sustained']);
 });
 
 test('an invalid axis is rejected without throwing', () => {

@@ -3094,7 +3094,38 @@ test('the plain copy added on 3 October renders as a sentence, never a code', {
       kind: 'next-flight',
       codes: ['HOLD_VERDICT_FLIPS_ACROSS_SWEEP', 'GAIN_STEP_WAITS_ON_HEADSPEED'],
       words: /flipped depending on how it was measured.*likely to flip again.*head speed.*before any gain/,
-      never: /one change between|one step|I gain|vibration/}
+      never: /one change between|one step|I gain|vibration/},
+    // Stage 5b, 4 October 2026: the all-clear says what was not seen and in how
+    // many holds, never that the I term is right; and the new refusals.
+    {id: 'I_TERM_WITHIN_TOLERANCE', axes: ['roll', 'pitch', 'yaw'], rung: 'gain-I',
+      kind: 'observation',
+      codes: ['HOLD_EVIDENCE_WITHIN_TOLERANCE'],
+      basis: [{label: 'holds the reading rests on', value: 3, unit: 'count',
+        source: 'interpretHoldEvidence'}],
+      words: /^No standing error was seen in the 3 times you held your \w+ steady\.$/,
+      never: /calls for an I change|is right/},
+    {id: 'I_TERM_HOLDS_KINDS_DISAGREE', axes: ['yaw'], rung: 'evidence', kind: 'next-flight',
+      codes: ['I_TERM_HOLDS_KINDS_DISAGREE'],
+      words: /still and holding it in a steady turn told different stories.*not an all-clear/,
+      never: /bind|linkage|servo/},
+    {id: 'I_TERM_HOLDS_MIXED', axes: ['roll'], rung: 'evidence', kind: 'next-flight',
+      codes: ['TOO_FEW_HOLDS_OF_EITHER_KIND'],
+      words: /too few of either.*judged on its own.*not an all-clear/},
+    {id: 'HUNTING_FOLLOWS_THE_STICK', axes: ['roll', 'yaw'], rung: 'gain-I', kind: 'next-flight',
+      codes: ['LOW_FREQUENCY_HUNTING', 'HUNTING_FOLLOWS_THE_STICK'],
+      words: /moved with your own stick inputs.*left alone.*not an all-clear/},
+    // Review of round one: what was measured, the precompensation as one
+    // possible cause, and the test's measured false-alarm rate.
+    {id: 'YAW_HOLD_MOVES_WITH_COLLECTIVE', axes: ['yaw'], rung: 'gain-I', kind: 'next-flight',
+      codes: ['YAW_HOLD_MOVES_WITH_COLLECTIVE'],
+      words: /moved with the collective during these holds, so the I term was not judged.*One possible cause.*by chance.*10-15 %.*collective held steady.*not an all-clear/,
+      never: /busy following|carrying the main-rotor torque that|mix did not/},
+    {id: 'I_TERM_NOT_JUDGED', axes: ['pitch'], rung: 'gain-I', kind: 'next-flight',
+      codes: ['LOW_FREQUENCY_HUNTING', 'STICK_COHERENCE_NOT_MEASURED'],
+      words: /check whether the wobble was your own corrections.*not an all-clear/},
+    {id: 'I_TERM_NOT_JUDGED', axes: ['yaw'], rung: 'gain-I', kind: 'next-flight',
+      codes: ['HOLD_EVIDENCE_WITHIN_TOLERANCE', 'COLLECTIVE_CORRELATION_NOT_MEASURED'],
+      words: /following the collective during these holds could not be checked.*not an all-clear/}
   ];
   for (const {id, codes} of cases) {
     assert.ok(engine.includes(`id: '${id}'`), `the engine no longer builds ${id}`);
@@ -3129,7 +3160,7 @@ test('the plain copy added on 3 October renders as a sentence, never a code', {
       return JSON.stringify(out);
     })()`);
 
-    assert.equal(rendered.length, 13, 'every branch must be rendered on every axis it carries');
+    assert.equal(rendered.length, 23, 'every branch must be rendered on every axis it carries');
     const thing = {roll: 'roll', pitch: 'pitch', yaw: 'tail'};
     for (const {id, index, axis, plain} of rendered) {
       const label = `${id} on ${axis ?? 'no axis'}`;
@@ -3150,6 +3181,51 @@ test('the plain copy added on 3 October renders as a sentence, never a code', {
           `${label}: the sentence does not name the ${thing[axis]}: ${plain}`);
       }
     }
+    assert.deepEqual(pageErrors, []);
+  });
+});
+
+test('the I panel marks where an input on another axis ended a hold', {
+  skip: browserSkip
+}, async () => {
+  // Stage 5b, 4 October 2026: such an input used to void the whole steady
+  // stretch; it now ends the hold, and the steady part before it is measured.
+  // The panel says which holds ended that way, by which axis, and when, so a
+  // hold shorter than the pilot flew it says why. Built through the real
+  // engine from a hover with a pedal blip in it.
+  await withViewer({}, async ({evaluate, pageErrors}) => {
+    const said = await evaluate(`(async () => {
+      const app = await import('/ui/app.mjs');
+      const {buildHoldEvidence} = await import('/src/analysis/pid-evidence.mjs');
+      const records = [];
+      let timeUs = 0;
+      for (const [seconds, roll, yaw] of [[0.2, 90, 0], [6, 0, 0], [0.3, 0, 60], [6, 0, 0],
+        [0.3, 60, 0], [8, 0, 0]]) {
+        for (let step = 0; step < seconds * 500; step += 1) {
+          records.push({timeUs, setpoint: [roll, 0, yaw], gyro: [roll, 0, yaw],
+            raw: [roll, 0, yaw], terms: [8, 12, 3], headspeed: 2000, collective: 5, vbat: 25});
+          timeUs += 2000;
+        }
+      }
+      const evidence = buildHoldEvidence(records, {axis: 'roll', term: 'I'});
+      const box = document.createElement('div');
+      box.innerHTML = app.renderHoldEvidence('roll', evidence);
+      const heading = [...box.querySelectorAll('h3')]
+        .find(entry => /ended by an input on another axis/.test(entry.textContent));
+      const list = heading?.nextElementSibling;
+      return JSON.stringify({
+        holds: evidence.holds.length,
+        heading: heading ? heading.textContent : null,
+        items: list ? [...list.querySelectorAll('li')].map(item =>
+          item.textContent.replace(/\\s+/g, ' ').trim()) : []
+      });
+    })()`);
+    assert.equal(said.holds, 2, JSON.stringify(said));
+    assert.ok(said.heading, JSON.stringify(said));
+    assert.equal(said.items.length, 1, JSON.stringify(said));
+    // The hover opened at 0.2 s and the pedal went in at 6.2 s.
+    assert.match(said.items[0], /^0\.2–6\.2 s — ended by a yaw input; the steady part before it was measured\.$/,
+      said.items[0]);
     assert.deepEqual(pageErrors, []);
   });
 });
